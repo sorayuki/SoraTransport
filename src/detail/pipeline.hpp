@@ -31,7 +31,6 @@ public:
 private:
 	struct State;
 	void close();
-	void unmap_current_view();
 	std::string path_for_error() const;
 
 	BufferPool& pool_;
