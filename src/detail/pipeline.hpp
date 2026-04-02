@@ -25,13 +25,12 @@ public:
 	FileReader(FileReader&& other);
 	FileReader& operator=(FileReader&& other);
 	void open();
-	DataChunk read_next_chunk(std::uint64_t length);
+	DataChunk read_next_chunk();
 	std::uint64_t offset() const;
 	bool eof() const;
 	bool is_open() const;
 
 private:
-	std::vector<char> buffer_;
 	struct State;
 	void close();
 	std::string path_for_error() const;

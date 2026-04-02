@@ -206,7 +206,7 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file)
 
 		auto& reader = *opened_file.reader;
 		while (!reader.eof()) {
-			auto chunk = reader.read_next_chunk(chunk_size_);
+			auto chunk = reader.read_next_chunk();
 			if (chunk.length == 0) {
 				archive_entry_free(entry);
 				throw std::runtime_error("unexpected end of file while packing");

@@ -49,7 +49,7 @@ std::uint64_t read_file_and_discard(
 	const soratransport::FileMeta& meta) {
 	std::uint64_t total_bytes = 0;
 	while (!reader.eof()) {
-		auto chunk = reader.read_next_chunk(kReadChunkSize);
+		auto chunk = reader.read_next_chunk();
 		if (chunk.length == 0 && !reader.eof()) {
 			throw std::runtime_error("Failed to read file data");
 		}
