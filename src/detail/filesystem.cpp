@@ -136,9 +136,10 @@ struct FileReader::State {
 	std::uint64_t next_issue_offset = 0;
 	std::size_t chunk_size = 0;
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	std::array<ReadSlot, 2> slots;
-	int pending_slot = -1;
-	int next_slot_to_issue = 0;
+	std::array<ReadSlot, 4> slots;
+	std::size_t next_slot_to_issue = 0;
+	std::size_t next_slot_to_consume = 0;
+	std::size_t in_flight_reads = 0;
 };
 
 namespace {
@@ -296,62 +297,20 @@ void FileReader::open() {
 	}
 	state_->offset = 0;
 	state_->next_issue_offset = 0;
-	state_->pending_slot = -1;
 	state_->next_slot_to_issue = 0;
+	state_->next_slot_to_consume = 0;
+	state_->in_flight_reads = 0;
 
 	if (state_->size == 0) {
 		return;
 	}
 
-	auto& slot = state_->slots[state_->next_slot_to_issue];
-	slot.offset = 0;
-	slot.requested_length = static_cast<std::size_t>(std::min<std::uint64_t>(state_->chunk_size, state_->size));
-	slot.buffer = pool_.acquire(slot.requested_length);
-	slot.overlapped = {};
-	slot.overlapped.Offset = 0;
-	slot.overlapped.OffsetHigh = 0;
-	slot.overlapped.hEvent = slot.event_handle;
-	::ResetEvent(slot.event_handle);
-
-	DWORD bytes_read = 0;
-	const auto ok = ::ReadFile(
-		state_->handle,
-		slot.buffer.get(),
-		static_cast<DWORD>(slot.requested_length),
-		&bytes_read,
-		&slot.overlapped);
-
-	if (!ok) {
-		const auto error = ::GetLastError();
-		if (error != ERROR_IO_PENDING) {
-			slot.buffer.reset();
-			slot.requested_length = 0;
-			slot.offset = 0;
-			throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
-		}
-	}
-
-	slot.in_flight = true;
-	state_->pending_slot = state_->next_slot_to_issue;
-	state_->next_slot_to_issue = 1 - state_->next_slot_to_issue;
-	state_->next_issue_offset = slot.requested_length;
-}
-
-DataChunk FileReader::read_next_chunk() {
-	if (!state_) {
-		throw std::runtime_error("file reader is closed");
-	}
-	if (state_->handle == INVALID_HANDLE_VALUE) {
-		throw std::runtime_error("file reader is not open: " + path_for_error());
-	}
-
 	auto issue_next_read = [&]() -> bool {
-		if (state_->next_issue_offset >= state_->size) {
+		if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
 			return false;
 		}
 
-		auto slot_index = state_->next_slot_to_issue;
-		auto& slot = state_->slots[slot_index];
+		auto& slot = state_->slots[state_->next_slot_to_issue];
 		if (slot.in_flight) {
 			throw std::runtime_error("file reader read slot is still in flight");
 		}
@@ -389,9 +348,70 @@ DataChunk FileReader::read_next_chunk() {
 		}
 
 		slot.in_flight = true;
-		state_->pending_slot = slot_index;
-		state_->next_slot_to_issue = 1 - slot_index;
+		state_->next_slot_to_issue = (state_->next_slot_to_issue + 1) % state_->slots.size();
 		state_->next_issue_offset += slot.requested_length;
+		++state_->in_flight_reads;
+		return true;
+	};
+
+	while (issue_next_read()) {
+	}
+}
+
+DataChunk FileReader::read_next_chunk() {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->handle == INVALID_HANDLE_VALUE) {
+		throw std::runtime_error("file reader is not open: " + path_for_error());
+	}
+
+	auto issue_next_read = [&]() -> bool {
+		if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
+			return false;
+		}
+
+		auto& slot = state_->slots[state_->next_slot_to_issue];
+		if (slot.in_flight) {
+			throw std::runtime_error("file reader read slot is still in flight");
+		}
+		if (slot.buffer) {
+			throw std::runtime_error("file reader read slot buffer is still owned by a consumer");
+		}
+
+		slot.offset = state_->next_issue_offset;
+		slot.requested_length = static_cast<std::size_t>(std::min<std::uint64_t>(
+			state_->chunk_size,
+			state_->size - state_->next_issue_offset));
+		slot.buffer = pool_.acquire(slot.requested_length);
+		slot.overlapped = {};
+		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
+		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
+		slot.overlapped.hEvent = slot.event_handle;
+		::ResetEvent(slot.event_handle);
+
+		DWORD bytes_read = 0;
+		const auto ok = ::ReadFile(
+			state_->handle,
+			slot.buffer.get(),
+			static_cast<DWORD>(slot.requested_length),
+			&bytes_read,
+			&slot.overlapped);
+
+		if (!ok) {
+			const auto error = ::GetLastError();
+			if (error != ERROR_IO_PENDING) {
+				slot.buffer.reset();
+				slot.requested_length = 0;
+				slot.offset = 0;
+				throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
+			}
+		}
+
+		slot.in_flight = true;
+		state_->next_slot_to_issue = (state_->next_slot_to_issue + 1) % state_->slots.size();
+		state_->next_issue_offset += slot.requested_length;
+		++state_->in_flight_reads;
 		return true;
 	};
 
@@ -400,12 +420,14 @@ DataChunk FileReader::read_next_chunk() {
 		return DataChunk{pool_.acquire(0), 0, current_offset, true};
 	}
 
-	if (state_->pending_slot < 0) {
+	if (state_->in_flight_reads == 0) {
 		issue_next_read();
 	}
 
-	auto slot_index = state_->pending_slot;
-	auto& slot = state_->slots[slot_index];
+	auto& slot = state_->slots[state_->next_slot_to_consume];
+	if (!slot.in_flight) {
+		throw std::runtime_error("file reader consume slot is not in flight");
+	}
 	DWORD bytes_read = 0;
 	if (!::GetOverlappedResult(state_->handle, &slot.overlapped, &bytes_read, TRUE)) {
 		const auto error = ::GetLastError();
@@ -416,7 +438,8 @@ DataChunk FileReader::read_next_chunk() {
 		throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
 	}
 	slot.in_flight = false;
-	state_->pending_slot = -1;
+	state_->next_slot_to_consume = (state_->next_slot_to_consume + 1) % state_->slots.size();
+	--state_->in_flight_reads;
 
 	if (bytes_read != slot.requested_length) {
 		slot.buffer.reset();
