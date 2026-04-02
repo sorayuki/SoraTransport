@@ -22,10 +22,10 @@ public:
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
-	FileReader(FileReader&& other) noexcept;
-	FileReader& operator=(FileReader&& other) noexcept;
+	FileReader(FileReader&& other);
+	FileReader& operator=(FileReader&& other);
 	void open();
-	DataChunk read_next_chunk(std::size_t length);
+	DataChunk read_next_chunk(std::uint64_t length);
 	std::uint64_t offset() const;
 	bool eof() const;
 	bool is_open() const;

@@ -52,7 +52,7 @@ boost::asio::awaitable<void> send_directory_task(
 	try {
 		auto socket = co_await connect_socket_async(std::move(host), port);
 		SocketByteSink sink(std::move(socket));
-		const auto config = make_runtime_config();
+		auto config = make_runtime_config();
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
@@ -121,7 +121,7 @@ boost::asio::awaitable<void> receive_directory_task(
 	try {
 		auto socket = co_await accept_socket_async(port);
 		SocketByteSource source(std::move(socket));
-		const auto config = make_runtime_config();
+		auto config = make_runtime_config();
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
@@ -161,7 +161,7 @@ boost::asio::awaitable<void> receive_directory_task(
 } // namespace
 
 void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode) {
-	const auto config = make_runtime_config();
+	auto config = make_runtime_config();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
@@ -224,7 +224,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 }
 
 void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode) {
-	const auto config = make_runtime_config();
+	auto config = make_runtime_config();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);

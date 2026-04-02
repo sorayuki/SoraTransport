@@ -171,7 +171,7 @@ int TarPacker::archive_close_callback(struct archive*, void*) {
 
 
 void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file) const {
-	const auto& meta = opened_file.meta;
+		auto& meta = opened_file.meta;
 	auto* entry = archive_entry_new();
 	if (entry == nullptr) {
 		throw std::runtime_error("failed to allocate archive entry");
@@ -180,13 +180,13 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file)
 	archive_entry_set_pathname(entry, meta.relative_path_in_tar.c_str());
 	archive_entry_set_perm(entry, permissions_to_mode(meta.status.permissions()));
 
-	const auto status_type = meta.status.type();
+	auto status_type = meta.status.type();
 	if (status_type == std::filesystem::file_type::directory || meta.relative_path_in_tar == ".") {
 		archive_entry_set_filetype(entry, AE_IFDIR);
 		archive_entry_set_size(entry, 0);
 	} else if (status_type == std::filesystem::file_type::regular) {
 		archive_entry_set_filetype(entry, AE_IFREG);
-		archive_entry_set_size(entry, static_cast<la_int64_t>(meta.size));
+		archive_entry_set_size(entry, meta.size);
 	} else {
 		archive_entry_free(entry);
 		return;
@@ -212,8 +212,8 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file)
 				throw std::runtime_error("unexpected end of file while packing");
 			}
 
-			const auto bytes_written = archive_write_data(writer, chunk.data.get(), chunk.length);
-			if (bytes_written < 0 || static_cast<std::size_t>(bytes_written) != chunk.length) {
+			auto bytes_written = archive_write_data(writer, chunk.data.get(), chunk.length);
+			if (bytes_written < 0 || bytes_written != chunk.length) {
 				archive_entry_free(entry);
 				throw_archive_error(writer, "failed to write file payload into tar");
 			}

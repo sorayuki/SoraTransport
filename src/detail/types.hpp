@@ -32,7 +32,7 @@ struct DataChunk {
 struct FileMeta {
 	std::filesystem::path full_path;
 	std::filesystem::file_status status;
-	std::uintmax_t size = 0;
+	std::uint64_t size = 0;
 	std::string relative_path_in_tar;
 };
 

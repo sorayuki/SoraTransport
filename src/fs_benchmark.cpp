@@ -17,12 +17,7 @@ constexpr std::size_t kReadChunkSize = 1024 * 1024;
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
-	std::string result;
-	result.reserve(utf8.size());
-	for (char8_t ch : utf8) {
-		result.push_back(static_cast<char>(ch));
-	}
-	return result;
+	return {utf8.begin(), utf8.end()};
 }
 
 struct Options {
@@ -70,8 +65,8 @@ std::uint64_t read_file_and_discard(
 
 int main(int argc, char** argv) {
 	try {
-		const Options options = parse_options(argc, argv);
-		const std::filesystem::path& root = options.root;
+		auto options = parse_options(argc, argv);
+		auto& root = options.root;
 
 		std::error_code ec;
 		if (!std::filesystem::exists(root, ec) || ec) {
@@ -84,13 +79,13 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 
-		const auto config = soratransport::make_runtime_config();
+		auto config = soratransport::make_runtime_config();
 		soratransport::RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		soratransport::BufferPool pool;
 		soratransport::DirScanner scanner(executors);
 		soratransport::BoundedQueue<soratransport::FileMeta> meta_queue(kMetaQueueDepth);
 		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(kOpenedQueueDepth);
-		soratransport::FileReaderOpener opener(pool, executors, config.reader_threads);
+		soratransport::FileReaderOpener opener(pool, executors, config.reader_threads, kReadChunkSize);
 
 		std::exception_ptr scanner_error;
 		std::exception_ptr opener_error;
@@ -149,8 +144,8 @@ int main(int argc, char** argv) {
 			opener_thread->join();
 		}
 
-		const auto end = std::chrono::steady_clock::now();
-		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+		auto end = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
 		if (scanner_error) {
 			std::rethrow_exception(scanner_error);

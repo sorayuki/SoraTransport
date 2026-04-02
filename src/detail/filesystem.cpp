@@ -11,22 +11,12 @@ namespace {
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
-	std::string result;
-	result.reserve(utf8.size());
-	for (char8_t ch : utf8) {
-		result.push_back(static_cast<char>(ch));
-	}
-	return result;
+	return {utf8.begin(), utf8.end()};
 }
 
 std::string path_to_generic_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.lexically_normal().generic_u8string();
-	std::string result;
-	result.reserve(utf8.size());
-	for (char8_t ch : utf8) {
-		result.push_back(static_cast<char>(ch));
-	}
-	return result;
+	return {utf8.begin(), utf8.end()};
 }
 
 class ConcurrentDirectoryWorkQueue {
@@ -156,18 +146,18 @@ void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMe
 }
 
 FileReader::FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size)
-	: pool_(pool), state_(std::make_unique<State>(path, size)), buffer_(std::max<std::size_t>(1, buffer_size)) {
-	state_->input.rdbuf()->pubsetbuf(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+	: pool_(pool), state_(std::make_unique<State>(path, size)), buffer_(buffer_size ? buffer_size : 1) {
+	state_->input.rdbuf()->pubsetbuf(buffer_.data(), buffer_.size());
 }
 
 FileReader::~FileReader() {
 	close();
 }
 
-FileReader::FileReader(FileReader&& other) noexcept
+FileReader::FileReader(FileReader&& other)
 	: pool_(other.pool_), state_(std::move(other.state_)), buffer_(std::move(other.buffer_)) {}
 
-FileReader& FileReader::operator=(FileReader&& other) noexcept {
+FileReader& FileReader::operator=(FileReader&& other) {
 	if (this != &other) {
 		close();
 		state_ = std::move(other.state_);
@@ -207,7 +197,7 @@ void FileReader::open() {
 	state_->offset = 0;
 }
 
-DataChunk FileReader::read_next_chunk(std::size_t length) {
+DataChunk FileReader::read_next_chunk(std::uint64_t length) {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
 	}
@@ -215,16 +205,15 @@ DataChunk FileReader::read_next_chunk(std::size_t length) {
 		throw std::runtime_error("file reader is not open: " + path_for_error());
 	}
 
-	const auto current_offset = state_->offset;
-	const auto remaining = state_->size - current_offset;
-	const auto read_length = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, length));
+	auto current_offset = state_->offset;
+	auto read_length = std::min(state_->size - current_offset, length);
 	auto data = pool_.acquire(read_length);
 	if (read_length == 0) {
 		return DataChunk{std::move(data), 0, current_offset, true};
 	}
 
-	state_->input.read(reinterpret_cast<char*>(data.get()), static_cast<std::streamsize>(read_length));
-	const auto bytes_read = static_cast<std::size_t>(state_->input.gcount());
+	state_->input.read(reinterpret_cast<char*>(data.get()), read_length);
+	std::uint64_t bytes_read = state_->input.gcount();
 	if (bytes_read == 0 && state_->input.bad()) {
 		throw std::runtime_error("failed to read input file: " + path_for_error());
 	}
@@ -261,7 +250,7 @@ void FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<Opened
 			OpenedFileReader opened_file;
 			opened_file.meta = std::move(meta);
 			if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
-				FileReader reader(pool_, opened_file.meta.full_path, static_cast<std::uint64_t>(opened_file.meta.size), buffer_size_);
+				auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_);
 				reader.open();
 				opened_file.reader.emplace(std::move(reader));
 			}
