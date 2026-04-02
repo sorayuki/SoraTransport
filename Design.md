@@ -8,7 +8,7 @@
 
 1.1 模块流转图 (Data Flow)
 【发送端 (Sender) / 打包端 (Packer)】
-
+```
 Plaintext
 [文件系统] 
    │
@@ -30,6 +30,7 @@ Plaintext
    ▼ [Bounded Channel: NetQueue]
    │
 (5) NetSender (Boost.Asio TCP/RDMA) -> 发送至局域网
+```
 注：单独编译 fasttar 工具时，可按需组装两种本地模式：
 - 无压缩模式：组装 (1)->(2)->(3)，并将 (2) 的输出直接通过 FileWriter 写入本地 .tar 文件。
 - 压缩模式：组装 (1)->(2)->(3)->(4)，将 ZstdCompressor 的输出写入本地 .tar.zst 文件；解包时对称地先解压再喂给 TarUnpacker。
@@ -43,7 +44,7 @@ Plaintext
 大小分级：提供 4KB (小文件/元数据) 和 16MB (大文件块) 两个级别的 Slab Pool。
 
 结构体定义：
-
+```
 C++
 struct DataChunk {
     std::shared_ptr<uint8_t> data; // 指向 BufferPool 的智能指针，自带 custom deleter
@@ -58,11 +59,12 @@ struct FileMeta {
     uintmax_t size;
     std::string relative_path_in_tar;
 };
+```
 2.1 目录扫描模块 (DirScanner)
 功能：多线程递归遍历目录，极速获取文件元数据（通过 std::filesystem::directory_iterator 或系统底层的 getdents64 封装）。
 
 设计细节：使用基于工作窃取（Work-Stealing）的线程池。主协程遇到子目录时，将其作为独立 Task 抛入线程池，文件元数据通过 boost::asio::experimental::concurrent_channel 发送给下游。
-
+```
 C++
 class IDirScanner {
 public:
@@ -72,6 +74,7 @@ public:
         std::filesystem::path root_dir, 
         boost::asio::experimental::concurrent_channel<void(boost::system::error_code, FileMeta)>& out_queue) = 0;
 };
+```
 2.2 极速文件读取模块 (FileReader)
 功能：榨干 SSD I/O 性能。针对 10GB 大文件，使用分块内存映射 (Chunked mmap) 技术。
 
@@ -82,7 +85,7 @@ public:
 平台特性下沉：封装一个跨平台的 Prefetcher。在 Windows 上调用 PrefetchVirtualMemory；在 Linux 上调用 posix_madvise(MADV_WILLNEED)。虽然优先使用 Boost，但 Boost 尚未提供直接的 Prefetch 语义，因此在这里使用条件编译隔离宏调用，这是达到“尽可能快”所必须的妥协。
 
 每次映射 16MB 或 64MB。
-
+```
 C++
 class IFileReader {
 public:
@@ -93,6 +96,7 @@ public:
         uint64_t offset, 
         size_t length) = 0;
 };
+```
 2.3 归档打包引擎 (TarPacker)
 功能：这是解决并发读取与 libarchive 单线程顺序写入冲突的核心引擎。
 
@@ -107,7 +111,7 @@ public:
 多线程 I/O 乱序读取，单线程顺序组装：允许 FileReader 并发读取大文件的多个块，但 TarPacker 内部使用一个滑动窗口（Sliding Window / Reorder Buffer），严格按 offset 顺序调用 archive_write_data。
 
 libarchive 的输出通过 archive_write_open_memory 或注册 write_callback，将打包好的 TarChunk 压入下游通道。
-
+```
 C++
 class ITarPacker {
 public:
@@ -117,6 +121,7 @@ public:
         std::shared_ptr<IFileReader> reader,
         boost::asio::experimental::concurrent_channel<void(boost::system::error_code, DataChunk)>& out_tar) = 0;
 };
+```
 2.4 流式压缩模块 (ZstdCompressor / Decompressor)
 功能：集成 libzstd。
 
