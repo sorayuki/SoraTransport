@@ -137,3 +137,12 @@ target_link_libraries(fasttar
 		soratransport_core
 )
 
+add_executable(fs_benchmark
+	src/fs_benchmark.cpp
+)
+
+target_link_libraries(fs_benchmark
+	PRIVATE
+		soratransport_core
+)
+

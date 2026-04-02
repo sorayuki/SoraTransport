@@ -89,7 +89,6 @@ TarPacker::TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t 
 	: pool_(pool), executors_(executors), chunk_size_(chunk_size), read_concurrency_(std::max<std::size_t>(1, read_concurrency)) {}
 
 void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& out_tar) {
-	FileReader reader(pool_, executors_);
 	TarWriteContext context{&out_tar, nullptr, &pool_, 0};
 
 	auto* writer = archive_write_new();
@@ -106,7 +105,7 @@ void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& o
 		}
 
 		while (auto meta = in_meta.pop()) {
-			add_entry(writer, *meta, reader);
+			add_entry(writer, *meta);
 		}
 
 		if (archive_write_close(writer) != ARCHIVE_OK) {
@@ -122,7 +121,6 @@ void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& o
 }
 
 void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, ConcurrentDataChunkChannel& out_tar) {
-	FileReader reader(pool_, executors_);
 	TarWriteContext context{nullptr, &out_tar, &pool_, 0};
 
 	auto* writer = archive_write_new();
@@ -139,7 +137,7 @@ void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, ConcurrentDataChunkChannel
 		}
 
 		while (auto meta = in_meta.pop()) {
-			add_entry(writer, *meta, reader);
+			add_entry(writer, *meta);
 		}
 
 		if (archive_write_close(writer) != ARCHIVE_OK) {
@@ -171,7 +169,7 @@ int TarPacker::archive_close_callback(struct archive*, void*) {
 	return ARCHIVE_OK;
 }
 
-void TarPacker::add_entry(struct archive* writer, const FileMeta& meta, const FileReader& reader) const {
+void TarPacker::add_entry(struct archive* writer, const FileMeta& meta) const {
 	auto* entry = archive_entry_new();
 	if (entry == nullptr) {
 		throw std::runtime_error("failed to allocate archive entry");
@@ -199,44 +197,18 @@ void TarPacker::add_entry(struct archive* writer, const FileMeta& meta, const Fi
 	}
 
 	if (status_type == std::filesystem::file_type::regular) {
-		std::map<std::uint64_t, std::future<DataChunk>> pending_reads;
-		std::uint64_t next_submit_offset = 0;
-		std::uint64_t next_write_offset = 0;
-
-		auto submit_read = [&](std::uint64_t offset) {
-			const auto length = static_cast<std::size_t>(std::min<std::uintmax_t>(chunk_size_, meta.size - offset));
-			pending_reads.emplace(offset, reader.read_chunk_async(meta.full_path, offset, length));
-		};
-
-		while (next_submit_offset < meta.size && pending_reads.size() < read_concurrency_) {
-			submit_read(next_submit_offset);
-			next_submit_offset += static_cast<std::uint64_t>(std::min<std::uintmax_t>(chunk_size_, meta.size - next_submit_offset));
-		}
-
-		while (!pending_reads.empty()) {
-			auto pending = pending_reads.find(next_write_offset);
-			if (pending == pending_reads.end()) {
-				archive_entry_free(entry);
-				throw std::runtime_error("reorder buffer lost file chunk ordering");
-			}
-
-			auto chunk = pending->second.get();
-			pending_reads.erase(pending);
+		FileReader reader(pool_, meta.full_path);
+		while (!reader.eof()) {
+			auto chunk = reader.read_next_chunk(chunk_size_);
 			if (chunk.length == 0) {
 				archive_entry_free(entry);
-				throw std::runtime_error("unexpected end of file while packing: " + meta.full_path.string());
+				throw std::runtime_error("unexpected end of file while packing");
 			}
 
 			const auto bytes_written = archive_write_data(writer, chunk.data.get(), chunk.length);
 			if (bytes_written < 0 || static_cast<std::size_t>(bytes_written) != chunk.length) {
 				archive_entry_free(entry);
 				throw_archive_error(writer, "failed to write file payload into tar");
-			}
-			next_write_offset += chunk.length;
-
-			while (next_submit_offset < meta.size && pending_reads.size() < read_concurrency_) {
-				submit_read(next_submit_offset);
-				next_submit_offset += static_cast<std::uint64_t>(std::min<std::uintmax_t>(chunk_size_, meta.size - next_submit_offset));
 			}
 		}
 	}
