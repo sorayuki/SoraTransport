@@ -18,17 +18,20 @@ private:
 
 class FileReader {
 public:
-	FileReader(BufferPool& pool, const std::filesystem::path& path);
+	FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size);
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
 	FileReader(FileReader&& other) noexcept;
 	FileReader& operator=(FileReader&& other) noexcept;
+	void open();
 	DataChunk read_next_chunk(std::size_t length);
 	std::uint64_t offset() const;
 	bool eof() const;
+	bool is_open() const;
 
 private:
+	std::vector<char> buffer_;
 	struct State;
 	void close();
 	std::string path_for_error() const;
@@ -37,16 +40,33 @@ private:
 	std::unique_ptr<State> state_;
 };
 
+struct OpenedFileReader {
+	FileMeta meta;
+	std::optional<FileReader> reader;
+};
+
+class FileReaderOpener {
+public:
+	FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size);
+	void open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
+
+private:
+	BufferPool& pool_;
+	RuntimeExecutors& executors_;
+	std::size_t open_concurrency_;
+	std::size_t buffer_size_;
+};
+
 class TarPacker {
 public:
 	TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency);
-	void pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& out_tar);
-	void pack(BoundedQueue<FileMeta>& in_meta, ConcurrentDataChunkChannel& out_tar);
+	void pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar);
+	void pack(BoundedQueue<OpenedFileReader>& in_meta, ConcurrentDataChunkChannel& out_tar);
 
 private:
 	static la_ssize_t archive_write_callback(struct archive*, void* client_data, const void* buffer, size_t length);
 	static int archive_close_callback(struct archive*, void* client_data);
-	void add_entry(struct archive* writer, const FileMeta& meta) const;
+	void add_entry(struct archive* writer, OpenedFileReader& opened_file) const;
 
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;

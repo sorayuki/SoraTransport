@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 
 namespace soratransport {
@@ -67,7 +68,8 @@ private:
 } // namespace
 
 struct FileReader::State {
-	explicit State(std::filesystem::path input_path) : path(std::move(input_path)) {}
+	State(std::filesystem::path input_path, std::uint64_t input_size)
+		: path(std::move(input_path)), size(input_size) {}
 
 	std::filesystem::path path;
 	std::uint64_t offset = 0;
@@ -153,18 +155,9 @@ void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMe
 	out_queue.close();
 }
 
-FileReader::FileReader(BufferPool& pool, const std::filesystem::path& path)
-	: pool_(pool), state_(std::make_unique<State>(path)) {
-	std::error_code ec;
-	state_->size = std::filesystem::file_size(state_->path, ec);
-	if (ec) {
-		throw std::runtime_error("failed to get input file size: " + path_for_error());
-	}
-
-	state_->input.open(state_->path, std::ios::binary);
-	if (!state_->input) {
-		throw std::runtime_error("failed to open input file: " + path_for_error());
-	}
+FileReader::FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size)
+	: pool_(pool), state_(std::make_unique<State>(path, size)), buffer_(std::max<std::size_t>(1, buffer_size)) {
+	state_->input.rdbuf()->pubsetbuf(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
 }
 
 FileReader::~FileReader() {
@@ -172,12 +165,13 @@ FileReader::~FileReader() {
 }
 
 FileReader::FileReader(FileReader&& other) noexcept
-	: pool_(other.pool_), state_(std::move(other.state_)) {}
+	: pool_(other.pool_), state_(std::move(other.state_)), buffer_(std::move(other.buffer_)) {}
 
 FileReader& FileReader::operator=(FileReader&& other) noexcept {
 	if (this != &other) {
 		close();
 		state_ = std::move(other.state_);
+		buffer_ = std::move(other.buffer_);
 	}
 	return *this;
 }
@@ -198,9 +192,27 @@ std::string FileReader::path_for_error() const {
 	return state_ == nullptr ? std::string() : path_to_utf8_string(state_->path);
 }
 
+void FileReader::open() {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->input.is_open()) {
+		return;
+	}
+
+	state_->input.open(state_->path, std::ios::binary);
+	if (!state_->input) {
+		throw std::runtime_error("failed to open input file: " + path_for_error());
+	}
+	state_->offset = 0;
+}
+
 DataChunk FileReader::read_next_chunk(std::size_t length) {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
+	}
+	if (!state_->input.is_open()) {
+		throw std::runtime_error("file reader is not open: " + path_for_error());
 	}
 
 	const auto current_offset = state_->offset;
@@ -229,6 +241,60 @@ std::uint64_t FileReader::offset() const {
 
 bool FileReader::eof() const {
 	return state_ == nullptr || state_->offset >= state_->size;
+}
+
+bool FileReader::is_open() const {
+	return state_ != nullptr && state_->input.is_open();
+}
+
+FileReaderOpener::FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size)
+	: pool_(pool), executors_(executors), open_concurrency_(std::max<std::size_t>(1, open_concurrency)), buffer_size_(std::max<std::size_t>(1, buffer_size)) {}
+
+void FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
+	std::map<std::size_t, std::future<OpenedFileReader>> pending;
+	std::size_t next_submit = 0;
+	std::size_t next_emit = 0;
+	bool input_closed = false;
+
+	auto submit = [&](FileMeta meta) {
+		pending.emplace(next_submit++, executors_.post_reader([this, meta = std::move(meta)]() mutable {
+			OpenedFileReader opened_file;
+			opened_file.meta = std::move(meta);
+			if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
+				FileReader reader(pool_, opened_file.meta.full_path, static_cast<std::uint64_t>(opened_file.meta.size), buffer_size_);
+				reader.open();
+				opened_file.reader.emplace(std::move(reader));
+			}
+			return opened_file;
+		}));
+	};
+
+	try {
+		while (!input_closed || !pending.empty()) {
+			while (!input_closed && pending.size() < open_concurrency_) {
+				auto meta = in_meta.pop();
+				if (!meta) {
+					input_closed = true;
+					break;
+				}
+				submit(std::move(*meta));
+			}
+
+			auto current = pending.find(next_emit);
+			if (current == pending.end()) {
+				continue;
+			}
+
+			auto opened_file = current->second.get();
+			pending.erase(current);
+			out_opened.push(std::move(opened_file));
+			++next_emit;
+		}
+		out_opened.close();
+	} catch (...) {
+		out_opened.close();
+		throw;
+	}
 }
 
 } // namespace soratransport

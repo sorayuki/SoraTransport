@@ -88,7 +88,7 @@ std::optional<DataChunk> receive_chunk_blocking(ConcurrentDataChunkChannel& chan
 TarPacker::TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency)
 	: pool_(pool), executors_(executors), chunk_size_(chunk_size), read_concurrency_(std::max<std::size_t>(1, read_concurrency)) {}
 
-void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& out_tar) {
+void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar) {
 	TarWriteContext context{&out_tar, nullptr, &pool_, 0};
 
 	auto* writer = archive_write_new();
@@ -120,7 +120,7 @@ void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, BoundedQueue<DataChunk>& o
 	}
 }
 
-void TarPacker::pack(BoundedQueue<FileMeta>& in_meta, ConcurrentDataChunkChannel& out_tar) {
+void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, ConcurrentDataChunkChannel& out_tar) {
 	TarWriteContext context{nullptr, &out_tar, &pool_, 0};
 
 	auto* writer = archive_write_new();
@@ -169,7 +169,9 @@ int TarPacker::archive_close_callback(struct archive*, void*) {
 	return ARCHIVE_OK;
 }
 
-void TarPacker::add_entry(struct archive* writer, const FileMeta& meta) const {
+
+void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file) const {
+	const auto& meta = opened_file.meta;
 	auto* entry = archive_entry_new();
 	if (entry == nullptr) {
 		throw std::runtime_error("failed to allocate archive entry");
@@ -197,7 +199,12 @@ void TarPacker::add_entry(struct archive* writer, const FileMeta& meta) const {
 	}
 
 	if (status_type == std::filesystem::file_type::regular) {
-		FileReader reader(pool_, meta.full_path);
+		if (!opened_file.reader.has_value() || !opened_file.reader->is_open()) {
+			archive_entry_free(entry);
+			throw std::runtime_error("file reader was not opened before pack stage");
+		}
+
+		auto& reader = *opened_file.reader;
 		while (!reader.eof()) {
 			auto chunk = reader.read_next_chunk(chunk_size_);
 			if (chunk.length == 0) {

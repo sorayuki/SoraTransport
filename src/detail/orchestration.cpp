@@ -16,6 +16,7 @@ namespace {
 
 constexpr std::size_t kPipelineChunkSize = 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 1024;
+constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
 
 void join_and_capture(std::jthread& thread, PipelineState& state) {
@@ -56,8 +57,10 @@ boost::asio::awaitable<void> send_directory_task(
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
 		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
+		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 		ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
 		DirScanner scanner(executors);
+		FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
 		TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 		PipelineState state;
 
@@ -72,14 +75,24 @@ boost::asio::awaitable<void> send_directory_task(
 
 		std::jthread packer_thread([&] {
 			try {
-				packer.pack(meta_queue, tar_queue);
+				opener.open(meta_queue, opened_queue);
+			} catch (...) {
+				state.fail(std::current_exception());
+				meta_queue.close();
+				opened_queue.close();
+			}
+		});
+
+		std::jthread sender_thread([&] {
+			try {
+				packer.pack(opened_queue, tar_queue);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
 			}
 		});
 
-		std::jthread sender_thread([&] {
+		std::jthread compressor_thread([&] {
 			try {
 				ZstdCompressor compressor(pool, executors, kDefaultCompressionLevel);
 				compressor.compress(tar_queue, sink);
@@ -92,6 +105,7 @@ boost::asio::awaitable<void> send_directory_task(
 		join_and_capture(scanner_thread, state);
 		join_and_capture(packer_thread, state);
 		join_and_capture(sender_thread, state);
+		join_and_capture(compressor_thread, state);
 		state.rethrow_if_failed();
 	} catch (...) {
 		*task_error = std::current_exception();
@@ -151,8 +165,10 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
+	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 	ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
 	DirScanner scanner(executors);
+	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 	PipelineState state;
 
@@ -168,14 +184,24 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 
 	std::jthread packer_thread([&] {
 		try {
-			packer.pack(meta_queue, tar_queue);
+			opener.open(meta_queue, opened_queue);
+		} catch (...) {
+			state.fail(std::current_exception());
+			meta_queue.close();
+			opened_queue.close();
+		}
+	});
+
+	std::jthread writer_thread([&] {
+		try {
+			packer.pack(opened_queue, tar_queue);
 		} catch (...) {
 			state.fail(std::current_exception());
 			tar_queue.close();
 		}
 	});
 
-	std::jthread writer_thread([&] {
+	std::jthread sink_thread([&] {
 		try {
 			if (mode == CompressionMode::Zstd) {
 				ZstdCompressor compressor(pool, executors, kDefaultCompressionLevel);
@@ -193,6 +219,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	join_and_capture(scanner_thread, state);
 	join_and_capture(packer_thread, state);
 	join_and_capture(writer_thread, state);
+	join_and_capture(sink_thread, state);
 	state.rethrow_if_failed();
 }
 
