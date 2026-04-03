@@ -1,13 +1,18 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <malloc.h>
 #include <stdexcept>
 
 namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kSmallBufferSize = 4 * 1024;
+constexpr std::size_t kBufferAlignment = 4 * 1024;
+constexpr std::size_t kSmallBufferSize = 64 * 1024;
+constexpr std::size_t kMediumBufferSize = 256 * 1024;
+constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
+constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
 constexpr std::size_t kMinTarQueueDepth = 16;
 constexpr std::size_t kMinReadConcurrencyDepth = 4;
@@ -82,12 +87,12 @@ std::size_t RuntimeExecutors::compression_threads() const {
 	return compression_threads_;
 }
 
-BufferPool::BufferPool() : buckets_{kSmallBufferSize, kLargeBufferSize} {}
+BufferPool::BufferPool() : buckets_{kSmallBufferSize, kMediumBufferSize, kPipelineBufferSize, kLargePipelineBufferSize, kLargeBufferSize} {}
 
 BufferPool::~BufferPool() {
 	for (auto& [bucket_size, free_list] : free_lists_) {
 		for (auto* pointer : free_list) {
-			delete[] pointer;
+			_aligned_free(pointer);
 		}
 	}
 }
@@ -104,7 +109,10 @@ std::shared_ptr<uint8_t> BufferPool::acquire(std::size_t requested_size) {
 		}
 	}
 	if (buffer == nullptr) {
-		buffer = new uint8_t[bucket_size];
+		buffer = static_cast<uint8_t*>(_aligned_malloc(bucket_size, kBufferAlignment));
+		if (buffer == nullptr) {
+			throw std::bad_alloc();
+		}
 	}
 	return {buffer, [this, bucket_size](uint8_t* pointer) { recycle(bucket_size, pointer); }};
 }

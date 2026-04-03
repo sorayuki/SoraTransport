@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
-constexpr std::size_t kReadChunkSize = 1024 * 1024;
+constexpr std::size_t kReadChunkSize = 4 * 1024 * 1024;
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();

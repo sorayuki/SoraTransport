@@ -16,7 +16,7 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
@@ -162,7 +162,7 @@ asio::awaitable<void> receive_directory_task(
 
 } // namespace
 
-void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode) {
+void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode) {
 	auto config = make_runtime_config();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
@@ -170,11 +170,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	DirScanner scanner(executors);
-	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
+	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize, file_io_mode);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 	PipelineState state;
 
-	FileByteSink sink(output_file);
+	FileByteSink sink(output_file, file_io_mode);
 	std::jthread scanner_thread([&] {
 		try {
 			scanner.scan(source_dir, meta_queue);
@@ -225,14 +225,14 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	state.rethrow_if_failed();
 }
 
-void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode) {
+void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode) {
 	auto config = make_runtime_config();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	PipelineState state;
 	TarUnpacker unpacker(destination_dir);
-	FileByteSource source(input_file);
+	FileByteSource source(input_file, file_io_mode);
 
 	std::jthread input_thread([&] {
 		try {

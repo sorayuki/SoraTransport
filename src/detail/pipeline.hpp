@@ -18,7 +18,7 @@ private:
 
 class FileReader {
 public:
-	FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size);
+	FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size, FileIoMode io_mode = FileIoMode::Buffered);
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
@@ -46,7 +46,7 @@ struct OpenedFileReader {
 
 class FileReaderOpener {
 public:
-	FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size);
+	FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size, FileIoMode io_mode = FileIoMode::Buffered);
 	void open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 
 private:
@@ -54,6 +54,7 @@ private:
 	RuntimeExecutors& executors_;
 	std::size_t open_concurrency_;
 	std::size_t buffer_size_;
+	FileIoMode io_mode_;
 };
 
 class TarPacker {

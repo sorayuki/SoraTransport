@@ -12,6 +12,15 @@ namespace soratransport {
 
 namespace {
 
+std::uint64_t round_down(std::uint64_t value, std::size_t alignment) {
+	return value - (value % alignment);
+}
+
+std::size_t make_direct_request_size(std::size_t preferred_size) {
+	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, kFileIoAlignment));
+	return std::max<std::size_t>(kFileIoAlignment, aligned_size);
+}
+
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
 	return {utf8.begin(), utf8.end()};
@@ -127,15 +136,18 @@ struct FileReader::State {
 		}
 	};
 
-	State(std::filesystem::path input_path, std::uint64_t input_size)
-		: path(std::move(input_path)), size(input_size) {}
+	State(std::filesystem::path input_path, std::uint64_t input_size, FileIoMode input_mode)
+		: path(std::move(input_path)), size(input_size), io_mode(input_mode) {}
 
 	std::filesystem::path path;
 	std::uint64_t offset = 0;
 	std::uint64_t size = 0;
+	std::uint64_t aligned_data_end = 0;
 	std::uint64_t next_issue_offset = 0;
 	std::size_t chunk_size = 0;
 	HANDLE handle = INVALID_HANDLE_VALUE;
+	FileIoMode io_mode = FileIoMode::Buffered;
+	bool tail_read_complete = false;
 	std::array<ReadSlot, 4> slots;
 	std::size_t next_slot_to_issue = 0;
 	std::size_t next_slot_to_consume = 0;
@@ -228,8 +240,8 @@ void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMe
 	out_queue.close();
 }
 
-FileReader::FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size)
-	: pool_(pool), state_(std::make_unique<State>(path, size)) {
+FileReader::FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size, FileIoMode io_mode)
+	: pool_(pool), state_(std::make_unique<State>(path, size, io_mode)) {
 	state_->chunk_size = std::max<std::size_t>(1, buffer_size);
 }
 
@@ -283,6 +295,9 @@ void FileReader::open() {
 	if (state_->handle != INVALID_HANDLE_VALUE) {
 		return;
 	}
+	const auto flags = state_->io_mode == FileIoMode::Direct
+		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING
+		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
 
 	state_->handle = ::CreateFileW(
 		state_->path.c_str(),
@@ -290,23 +305,25 @@ void FileReader::open() {
 		FILE_SHARE_READ,
 		nullptr,
 		OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED,
+		flags,
 		nullptr);
 	if (state_->handle == INVALID_HANDLE_VALUE) {
 		throw make_win32_error("failed to open input file: " + path_for_error());
 	}
 	state_->offset = 0;
+	state_->aligned_data_end = state_->io_mode == FileIoMode::Direct ? round_down(state_->size, kFileIoAlignment) : state_->size;
 	state_->next_issue_offset = 0;
 	state_->next_slot_to_issue = 0;
 	state_->next_slot_to_consume = 0;
 	state_->in_flight_reads = 0;
+	state_->tail_read_complete = false;
 
 	if (state_->size == 0) {
 		return;
 	}
 
 	auto issue_next_read = [&]() -> bool {
-		if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
+		if (state_->next_issue_offset >= state_->aligned_data_end || state_->in_flight_reads >= state_->slots.size()) {
 			return false;
 		}
 
@@ -319,9 +336,12 @@ void FileReader::open() {
 		}
 
 		slot.offset = state_->next_issue_offset;
-		slot.requested_length = static_cast<std::size_t>(std::min<std::uint64_t>(
+		const auto request_limit = static_cast<std::size_t>(std::min<std::uint64_t>(
 			state_->chunk_size,
-			state_->size - state_->next_issue_offset));
+			state_->aligned_data_end - state_->next_issue_offset));
+		slot.requested_length = state_->io_mode == FileIoMode::Direct
+			? make_direct_request_size(request_limit)
+			: request_limit;
 		slot.buffer = pool_.acquire(slot.requested_length);
 		slot.overlapped = {};
 		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
@@ -367,7 +387,7 @@ DataChunk FileReader::read_next_chunk() {
 	}
 
 	auto issue_next_read = [&]() -> bool {
-		if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
+		if (state_->next_issue_offset >= state_->aligned_data_end || state_->in_flight_reads >= state_->slots.size()) {
 			return false;
 		}
 
@@ -380,9 +400,12 @@ DataChunk FileReader::read_next_chunk() {
 		}
 
 		slot.offset = state_->next_issue_offset;
-		slot.requested_length = static_cast<std::size_t>(std::min<std::uint64_t>(
+		const auto request_limit = static_cast<std::size_t>(std::min<std::uint64_t>(
 			state_->chunk_size,
-			state_->size - state_->next_issue_offset));
+			state_->aligned_data_end - state_->next_issue_offset));
+		slot.requested_length = state_->io_mode == FileIoMode::Direct
+			? make_direct_request_size(request_limit)
+			: request_limit;
 		slot.buffer = pool_.acquire(slot.requested_length);
 		slot.overlapped = {};
 		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
@@ -422,6 +445,45 @@ DataChunk FileReader::read_next_chunk() {
 
 	if (state_->in_flight_reads == 0) {
 		issue_next_read();
+	}
+	if (state_->in_flight_reads == 0) {
+		if (state_->offset < state_->size && !state_->tail_read_complete) {
+			const auto tail_request_size = kFileIoAlignment;
+			auto buffer = pool_.acquire(tail_request_size);
+			OVERLAPPED overlapped{};
+			overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			if (overlapped.hEvent == nullptr) {
+				throw make_win32_error("failed to create tail read event for input file: " + path_for_error());
+			}
+			overlapped.Offset = static_cast<DWORD>(state_->offset & 0xffffffffull);
+			overlapped.OffsetHigh = static_cast<DWORD>((state_->offset >> 32) & 0xffffffffull);
+			DWORD bytes_read = 0;
+			const auto ok = ::ReadFile(
+				state_->handle,
+				buffer.get(),
+				static_cast<DWORD>(tail_request_size),
+				nullptr,
+				&overlapped);
+			if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+				const auto error = ::GetLastError();
+				::CloseHandle(overlapped.hEvent);
+				throw std::runtime_error("failed to read input tail block: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
+			}
+			if (!::GetOverlappedResult(state_->handle, &overlapped, &bytes_read, TRUE)) {
+				const auto error = ::GetLastError();
+				::CloseHandle(overlapped.hEvent);
+				throw std::runtime_error("failed to complete input tail block read: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
+			}
+			::CloseHandle(overlapped.hEvent);
+			if (bytes_read == 0) {
+				throw std::runtime_error("unexpected empty tail read from input file: " + path_for_error());
+			}
+			const auto read_offset = state_->offset;
+			state_->offset += bytes_read;
+			state_->tail_read_complete = true;
+			return DataChunk{std::move(buffer), bytes_read, read_offset, true};
+		}
+		return DataChunk{pool_.acquire(0), 0, current_offset, true};
 	}
 
 	auto& slot = state_->slots[state_->next_slot_to_consume];
@@ -473,8 +535,8 @@ bool FileReader::is_open() const {
 	return state_ != nullptr && state_->handle != INVALID_HANDLE_VALUE;
 }
 
-FileReaderOpener::FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size)
-	: pool_(pool), executors_(executors), open_concurrency_(std::max<std::size_t>(1, open_concurrency)), buffer_size_(std::max<std::size_t>(1, buffer_size)) {}
+FileReaderOpener::FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size, FileIoMode io_mode)
+	: pool_(pool), executors_(executors), open_concurrency_(std::max<std::size_t>(1, open_concurrency)), buffer_size_(std::max<std::size_t>(1, buffer_size)), io_mode_(io_mode) {}
 
 void FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
 	std::map<std::size_t, std::future<OpenedFileReader>> pending;
@@ -487,7 +549,7 @@ void FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<Opened
 			OpenedFileReader opened_file;
 			opened_file.meta = std::move(meta);
 			if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
-				auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_);
+				auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
 				reader.open();
 				opened_file.reader.emplace(std::move(reader));
 			}

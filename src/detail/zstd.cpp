@@ -9,7 +9,7 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 
 } // namespace
 
@@ -80,15 +80,15 @@ void ZstdDecompressor::decompress(IByteSource& source, BoundedQueue<DataChunk>& 
 		throw std::runtime_error("failed to create zstd decompression context");
 	}
 
-	std::vector<uint8_t> input_storage(ZSTD_DStreamInSize());
+	auto input_storage = pool_.acquire(ZSTD_DStreamInSize());
 	std::uint64_t offset = 0;
 	bool eof = false;
-	ZSTD_inBuffer input{input_storage.data(), 0, 0};
+	ZSTD_inBuffer input{input_storage.get(), 0, 0};
 
 	try {
 		while (!eof || input.pos < input.size) {
 			if (input.pos == input.size && !eof) {
-				input.size = source.read(input_storage.data(), input_storage.size());
+				input.size = source.read(input_storage.get(), ZSTD_DStreamInSize());
 				input.pos = 0;
 				eof = input.size == 0;
 				if (eof && input.size == 0) {
