@@ -16,7 +16,7 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 8 * 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
@@ -50,19 +50,21 @@ asio::awaitable<void> send_directory_task(
 	const std::filesystem::path source_dir,
 	std::string host,
 	std::uint16_t port,
+	RuntimeOptions options,
 	std::exception_ptr* task_error) {
 	try {
 		auto socket = co_await connect_socket_async(std::move(host), port);
 		SocketByteSink sink(std::move(socket));
-		auto config = make_runtime_config();
+		auto config = make_runtime_config(options);
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
+		auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
 		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 		DirScanner scanner(executors);
-		FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
+		FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kPipelineChunkSize);
 		TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 		PipelineState state;
 
@@ -162,15 +164,16 @@ asio::awaitable<void> receive_directory_task(
 
 } // namespace
 
-void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode) {
-	auto config = make_runtime_config();
+void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
+	auto config = make_runtime_config(options);
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
+	auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	DirScanner scanner(executors);
-	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize, file_io_mode);
+	FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kPipelineChunkSize, file_io_mode);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 	PipelineState state;
 
@@ -225,8 +228,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	state.rethrow_if_failed();
 }
 
-void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode) {
-	auto config = make_runtime_config();
+void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
+	auto config = make_runtime_config(options);
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
@@ -263,10 +266,10 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	state.rethrow_if_failed();
 }
 
-void send_directory(const std::filesystem::path& source_dir, std::string_view host, std::uint16_t port) {
+void send_directory(const std::filesystem::path& source_dir, std::string_view host, std::uint16_t port, RuntimeOptions options) {
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, send_directory_task(source_dir, std::string(host), port, &task_error), asio::detached);
+	asio::co_spawn(io_context, send_directory_task(source_dir, std::string(host), port, options, &task_error), asio::detached);
 	io_context.run();
 	if (task_error) {
 		std::rethrow_exception(task_error);

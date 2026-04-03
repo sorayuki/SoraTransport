@@ -16,6 +16,7 @@ constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
 constexpr std::size_t kMinTarQueueDepth = 16;
 constexpr std::size_t kMinReadConcurrencyDepth = 4;
+constexpr std::size_t kTargetInFlightReadBytes = 256 * 1024 * 1024;
 
 std::size_t hardware_threads() {
 	const auto detected = std::thread::hardware_concurrency();
@@ -24,7 +25,7 @@ std::size_t hardware_threads() {
 
 } // namespace
 
-RuntimeConfig make_runtime_config() {
+RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	const auto threads = hardware_threads();
 	RuntimeConfig config;
 	config.scanner_threads = std::clamp<std::size_t>(threads / 2, 4, 12);
@@ -32,6 +33,7 @@ RuntimeConfig make_runtime_config() {
 	config.compression_threads = std::clamp<std::size_t>(threads / 2, 2, 8);
 	config.read_concurrency = std::clamp<std::size_t>(config.reader_threads * 2, 8, 48);
 	config.tar_queue_depth = std::clamp<std::size_t>(config.read_concurrency * 2, 32, 128);
+	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
 	return config;
 }
 

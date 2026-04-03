@@ -7,6 +7,10 @@
 
 namespace soratransport {
 
+struct RuntimeOptions {
+	std::optional<std::size_t> max_in_flight_read_bytes;
+};
+
 class DirScanner {
 public:
 	explicit DirScanner(RuntimeExecutors& executors);
@@ -16,9 +20,30 @@ private:
 	RuntimeExecutors& executors_;
 };
 
+class InFlightReadBudget {
+public:
+	explicit InFlightReadBudget(std::size_t max_bytes);
+	void acquire(std::size_t bytes);
+	bool try_acquire(std::size_t bytes);
+	void release(std::size_t bytes);
+	std::size_t max_bytes() const;
+
+private:
+	std::size_t max_bytes_;
+	std::size_t used_bytes_ = 0;
+	mutable std::mutex mutex_;
+	std::condition_variable cv_;
+};
+
 class FileReader {
 public:
-	FileReader(BufferPool& pool, const std::filesystem::path& path, std::uint64_t size, std::size_t buffer_size, FileIoMode io_mode = FileIoMode::Buffered);
+	FileReader(
+		BufferPool& pool,
+		std::shared_ptr<InFlightReadBudget> read_budget,
+		const std::filesystem::path& path,
+		std::uint64_t size,
+		std::size_t buffer_size,
+		FileIoMode io_mode = FileIoMode::Buffered);
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
@@ -36,6 +61,7 @@ private:
 	std::string path_for_error() const;
 
 	BufferPool& pool_;
+	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::unique_ptr<State> state_;
 };
 
@@ -46,13 +72,20 @@ struct OpenedFileReader {
 
 class FileReaderOpener {
 public:
-	FileReaderOpener(BufferPool& pool, RuntimeExecutors& executors, std::size_t open_concurrency, std::size_t buffer_size, FileIoMode io_mode = FileIoMode::Buffered);
+	FileReaderOpener(
+		BufferPool& pool,
+		RuntimeExecutors& executors,
+		std::size_t submit_concurrency,
+		std::shared_ptr<InFlightReadBudget> read_budget,
+		std::size_t buffer_size,
+		FileIoMode io_mode = FileIoMode::Buffered);
 	void open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 
 private:
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;
-	std::size_t open_concurrency_;
+	std::size_t submit_concurrency_;
+	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::size_t buffer_size_;
 	FileIoMode io_mode_;
 };

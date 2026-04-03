@@ -18,6 +18,18 @@ std::uint16_t parse_port(std::string_view text) {
 	return static_cast<std::uint16_t>(value);
 }
 
+std::size_t parse_mebibytes(std::string_view text, std::string_view option_name) {
+	const auto value = std::stoull(std::string(text));
+	if (value < 64) {
+		throw std::runtime_error(std::string(option_name) + " must be at least 64 MiB");
+	}
+	const auto max_mib = std::numeric_limits<std::size_t>::max() / (1024ull * 1024ull);
+	if (value > max_mib) {
+		throw std::runtime_error(std::string(option_name) + " is too large");
+	}
+	return static_cast<std::size_t>(value) * 1024ull * 1024ull;
+}
+
 bool ends_with(std::string_view value, std::string_view suffix) {
 	return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
@@ -52,6 +64,7 @@ FileIoMode parse_file_io_mode_option(std::string_view option) {
 struct PackUnpackOptions {
 	FileIoMode file_io_mode = FileIoMode::Buffered;
 	std::optional<CompressionMode> compression_mode;
+	RuntimeOptions runtime_options;
 	std::vector<std::string_view> positional;
 };
 
@@ -65,6 +78,36 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 		}
 		if (allow_compression_mode && (argument == "--zstd" || argument == "--no-compress")) {
 			options.compression_mode = parse_fasttar_mode_option(argument);
+			continue;
+		}
+		if (argument == "--max-inflight-read-mb") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error("--max-inflight-read-mb requires a value");
+			}
+			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
+			continue;
+		}
+		options.positional.push_back(argument);
+	}
+	return options;
+}
+
+struct SendOptions {
+	RuntimeOptions runtime_options;
+	std::vector<std::string_view> positional;
+};
+
+SendOptions parse_send_options(int argc, char** argv, int first_arg) {
+	SendOptions options;
+	for (int index = first_arg; index < argc; ++index) {
+		const std::string_view argument = argv[index];
+		if (argument == "--max-inflight-read-mb") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error("--max-inflight-read-mb requires a value");
+			}
+			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
 			continue;
 		}
 		options.positional.push_back(argument);
@@ -85,17 +128,17 @@ void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode
 void print_soratransport_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  soratransport pack [--direct-io|--buffered-io] <source-dir> <output.tar.zst>\n"
-		<< "  soratransport unpack [--direct-io|--buffered-io] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport send <source-dir> <host> <port>\n"
+		<< "  soratransport pack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] <source-dir> <output.tar.zst>\n"
+		<< "  soratransport unpack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] <input.tar.zst> <destination-dir>\n"
+		<< "  soratransport send [--max-inflight-read-mb <MiB>] <source-dir> <host> <port>\n"
 		<< "  soratransport receive <port> <destination-dir>\n";
 }
 
 void print_fasttar_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  fasttar pack [--direct-io|--buffered-io] [--zstd|--no-compress] <source-dir> <output.tar|output.tar.zst>\n"
-		<< "  fasttar unpack [--direct-io|--buffered-io] [--zstd|--no-compress] <input.tar|input.tar.zst> <destination-dir>\n";
+		<< "  fasttar pack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] <source-dir> <output.tar|output.tar.zst>\n"
+		<< "  fasttar unpack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] <input.tar|input.tar.zst> <destination-dir>\n";
 }
 
 } // namespace
@@ -114,7 +157,7 @@ int run_soratransport_cli(int argc, char** argv) {
 				print_soratransport_usage();
 				return 1;
 			}
-			pack_directory_to_file(options.positional[0], options.positional[1], CompressionMode::Zstd, options.file_io_mode);
+			pack_directory_to_file(options.positional[0], options.positional[1], CompressionMode::Zstd, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
 		if (command == "unpack") {
@@ -123,15 +166,16 @@ int run_soratransport_cli(int argc, char** argv) {
 				print_soratransport_usage();
 				return 1;
 			}
-			unpack_file_to_directory(options.positional[0], options.positional[1], CompressionMode::Zstd, options.file_io_mode);
+			unpack_file_to_directory(options.positional[0], options.positional[1], CompressionMode::Zstd, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
 		if (command == "send") {
-			if (argc != 5) {
+			auto options = parse_send_options(argc, argv, 2);
+			if (options.positional.size() != 3) {
 				print_soratransport_usage();
 				return 1;
 			}
-			send_directory(argv[2], argv[3], parse_port(argv[4]));
+			send_directory(options.positional[0], options.positional[1], parse_port(options.positional[2]), options.runtime_options);
 			return 0;
 		}
 		if (command == "receive") {
@@ -172,7 +216,7 @@ int run_fasttar_cli(int argc, char** argv) {
 				? *options.compression_mode
 				: infer_fasttar_mode_from_path(output_path);
 			validate_fasttar_path_mode(output_path, mode, "pack");
-			pack_directory_to_file(source_dir, output_path, mode, options.file_io_mode);
+			pack_directory_to_file(source_dir, output_path, mode, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
 		if (command == "unpack") {
@@ -188,7 +232,7 @@ int run_fasttar_cli(int argc, char** argv) {
 				? *options.compression_mode
 				: infer_fasttar_mode_from_path(input_path);
 			validate_fasttar_path_mode(input_path, mode, "unpack");
-			unpack_file_to_directory(input_path, destination_dir, mode, options.file_io_mode);
+			unpack_file_to_directory(input_path, destination_dir, mode, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
 
