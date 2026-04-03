@@ -75,11 +75,20 @@ public:
 		not_empty_.notify_all();
 	}
 
+	std::size_t size() const {
+		std::lock_guard lock(mutex_);
+		return queue_.size();
+	}
+
+	std::size_t capacity() const {
+		return capacity_;
+	}
+
 private:
 	std::size_t capacity_;
 	std::queue<T> queue_;
 	bool closed_ = false;
-	std::mutex mutex_;
+	mutable std::mutex mutex_;
 	std::condition_variable not_empty_;
 	std::condition_variable not_full_;
 };

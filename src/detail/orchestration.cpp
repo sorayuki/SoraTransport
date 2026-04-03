@@ -8,6 +8,11 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace asio = boost::asio;
@@ -17,9 +22,85 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kPipelineChunkSize = 8 * 1024 * 1024;
-constexpr std::size_t kMetaQueueDepth = 1024;
+constexpr std::size_t kMetaQueueDepth = 256;
 constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
+
+std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
+	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+	double value = static_cast<double>(bytes);
+	std::size_t unit_index = 0;
+	while (value >= 1024.0 && unit_index + 1 < std::size(units)) {
+		value /= 1024.0;
+		++unit_index;
+	}
+
+	std::ostringstream out;
+	out << std::fixed << std::setprecision(value >= 100.0 ? 0 : 1) << value << ' ' << units[unit_index] << suffix;
+	return out.str();
+}
+
+std::string format_rate(std::uint64_t bytes_per_second) {
+	return format_scaled_bytes(bytes_per_second, "/s");
+}
+
+std::string queue_usage(std::string_view name, std::size_t size, std::size_t capacity) {
+	std::ostringstream out;
+	out << name << ':' << size << '/' << capacity;
+	if (capacity > 0) {
+		const auto ratio = static_cast<double>(size) * 100.0 / static_cast<double>(capacity);
+		out << '(' << std::fixed << std::setprecision(0) << ratio << "%)";
+	}
+	return out.str();
+}
+
+void print_pack_progress_legend() {
+	std::cerr
+		<< "progress legend (pack):\n"
+		<< "  rate: uncompressed tar stream throughput per second\n"
+		<< "  q{s/o o/t t/s}: queue usage current/capacity(percent)\n"
+		<< "    s/o = scanner -> opener\n"
+		<< "    o/t = opener -> tar packer\n"
+		<< "    t/s = tar -> sink(compressor/file writer)\n"
+		<< "  rb: in-flight file read budget used/limit\n";
+}
+
+void print_unpack_progress_legend() {
+	std::cerr
+		<< "progress legend (unpack):\n"
+		<< "  rate: uncompressed tar stream throughput per second\n"
+		<< "  q{s/u}: queue usage current/capacity(percent), s/u = source -> unpacker\n";
+}
+
+void clear_progress_line() {
+	std::cerr << "\r\x1b[2K";
+}
+
+void print_progress_line(const std::string& line) {
+	clear_progress_line();
+	std::cerr << line << std::flush;
+}
+
+void finalize_progress_line() {
+	std::cerr << '\n' << std::flush;
+}
+
+std::jthread start_progress_thread(std::function<std::string(std::uint64_t)> build_line, std::atomic<std::uint64_t>& processed_bytes) {
+	return std::jthread([build_line = std::move(build_line), &processed_bytes](std::stop_token stop_token) {
+		using namespace std::chrono_literals;
+		std::uint64_t previous = processed_bytes.load(std::memory_order_relaxed);
+		while (!stop_token.stop_requested()) {
+			std::this_thread::sleep_for(1s);
+			if (stop_token.stop_requested()) {
+				break;
+			}
+			const auto current = processed_bytes.load(std::memory_order_relaxed);
+			const auto delta = current - previous;
+			previous = current;
+			print_progress_line(build_line(delta));
+		}
+	});
+}
 
 void join_and_capture(std::jthread& thread, PipelineState& state) {
 	try {
@@ -176,8 +257,23 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kPipelineChunkSize, file_io_mode);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 	PipelineState state;
+	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
+	print_pack_progress_legend();
 
-	FileByteSink sink(output_file, file_io_mode);
+	auto progress_thread = start_progress_thread(
+		[&](std::uint64_t bytes_per_second) {
+			std::ostringstream out;
+			out << "[pack] " << format_rate(bytes_per_second)
+				<< " q{" << queue_usage("s/o", meta_queue.size(), meta_queue.capacity())
+				<< ' ' << queue_usage("o/t", opened_queue.size(), opened_queue.capacity())
+				<< ' ' << queue_usage("t/s", tar_queue.size(), tar_queue.capacity()) << '}'
+				<< " rb=" << format_scaled_bytes(read_budget->used_bytes(), "")
+				<< '/' << format_scaled_bytes(read_budget->max_bytes(), "");
+			return out.str();
+		},
+		uncompressed_bytes_processed);
+
+	FileByteSink sink(output_file, file_io_mode, config.max_in_flight_write_ops);
 	std::jthread scanner_thread([&] {
 		try {
 			scanner.scan(source_dir, meta_queue);
@@ -199,7 +295,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 
 	std::jthread writer_thread([&] {
 		try {
-			packer.pack(opened_queue, tar_queue);
+			packer.pack(opened_queue, tar_queue, &uncompressed_bytes_processed);
 		} catch (...) {
 			state.fail(std::current_exception());
 			tar_queue.close();
@@ -225,6 +321,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	join_and_capture(packer_thread, state);
 	join_and_capture(writer_thread, state);
 	join_and_capture(sink_thread, state);
+	progress_thread.request_stop();
+	if (progress_thread.joinable()) {
+		progress_thread.join();
+	}
+	finalize_progress_line();
 	state.rethrow_if_failed();
 }
 
@@ -236,6 +337,17 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	PipelineState state;
 	TarUnpacker unpacker(destination_dir);
 	FileByteSource source(input_file, file_io_mode);
+	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
+	print_unpack_progress_legend();
+
+	auto progress_thread = start_progress_thread(
+		[&](std::uint64_t bytes_per_second) {
+			std::ostringstream out;
+			out << "[unpack] " << format_rate(bytes_per_second)
+				<< " q{" << queue_usage("s/u", tar_queue.size(), tar_queue.capacity()) << '}';
+			return out.str();
+		},
+		uncompressed_bytes_processed);
 
 	std::jthread input_thread([&] {
 		try {
@@ -254,7 +366,7 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 
 	std::jthread unpacker_thread([&] {
 		try {
-			unpacker.unpack(tar_queue);
+			unpacker.unpack(tar_queue, &uncompressed_bytes_processed);
 		} catch (...) {
 			state.fail(std::current_exception());
 			tar_queue.close();
@@ -263,6 +375,11 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 
 	join_and_capture(input_thread, state);
 	join_and_capture(unpacker_thread, state);
+	progress_thread.request_stop();
+	if (progress_thread.joinable()) {
+		progress_thread.join();
+	}
+	finalize_progress_line();
 	state.rethrow_if_failed();
 }
 

@@ -13,12 +13,14 @@ struct TarWriteContext {
 	BoundedQueue<DataChunk>* out_tar = nullptr;
 	BufferPool* pool = nullptr;
 	std::uint64_t offset = 0;
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr;
 };
 
 struct TarReadContext {
 	BoundedQueue<DataChunk>* in_tar = nullptr;
 	std::optional<DataChunk> current_chunk;
 	std::uint64_t offset = 0;
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr;
 };
 
 int permissions_to_mode(std::filesystem::perms permissions) {
@@ -50,8 +52,8 @@ std::filesystem::path normalize_relative_path(const std::filesystem::path& input
 TarPacker::TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency)
 	: pool_(pool), executors_(executors), chunk_size_(chunk_size), read_concurrency_(std::max<std::size_t>(1, read_concurrency)) {}
 
-void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar) {
-	TarWriteContext context{&out_tar, &pool_, 0};
+void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter) {
+	TarWriteContext context{&out_tar, &pool_, 0, uncompressed_bytes_counter};
 
 	auto* writer = archive_write_new();
 	if (writer == nullptr) {
@@ -87,6 +89,9 @@ la_ssize_t TarPacker::archive_write_callback(struct archive*, void* client_data,
 	auto owned_buffer = context->pool->acquire(length);
 	std::memcpy(owned_buffer.get(), buffer, length);
 	context->out_tar->push(DataChunk{std::move(owned_buffer), length, context->offset, false});
+	if (context->uncompressed_bytes_counter != nullptr) {
+		context->uncompressed_bytes_counter->fetch_add(length, std::memory_order_relaxed);
+	}
 	context->offset += length;
 	return static_cast<la_ssize_t>(length);
 }
@@ -153,8 +158,8 @@ TarUnpacker::TarUnpacker(const std::filesystem::path& destination_root) : destin
 	std::filesystem::create_directories(destination_root_);
 }
 
-void TarUnpacker::unpack(BoundedQueue<DataChunk>& in_tar) {
-	TarReadContext context{&in_tar, std::nullopt, 0};
+void TarUnpacker::unpack(BoundedQueue<DataChunk>& in_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter) {
+	TarReadContext context{&in_tar, std::nullopt, 0, uncompressed_bytes_counter};
 	auto* reader = archive_read_new();
 	auto* disk_writer = archive_write_disk_new();
 	if (reader == nullptr) {
@@ -232,6 +237,9 @@ la_ssize_t TarUnpacker::archive_read_callback(struct archive*, void* client_data
 		return 0;
 	}
 	*buffer = context->current_chunk->data.get();
+	if (context->uncompressed_bytes_counter != nullptr) {
+		context->uncompressed_bytes_counter->fetch_add(context->current_chunk->length, std::memory_order_relaxed);
+	}
 	context->offset += context->current_chunk->length;
 	return static_cast<la_ssize_t>(context->current_chunk->length);
 }

@@ -13,6 +13,7 @@ struct RuntimeConfig {
 	std::size_t tar_queue_depth = 16;
 	std::size_t read_concurrency = 4;
 	std::size_t max_in_flight_read_bytes = 256 * 1024 * 1024;
+	std::size_t max_in_flight_write_ops = 1;
 };
 
 RuntimeConfig make_runtime_config(RuntimeOptions options = {});

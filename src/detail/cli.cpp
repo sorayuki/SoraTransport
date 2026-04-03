@@ -30,6 +30,17 @@ std::size_t parse_mebibytes(std::string_view text, std::string_view option_name)
 	return static_cast<std::size_t>(value) * 1024ull * 1024ull;
 }
 
+std::size_t parse_positive_count(std::string_view text, std::string_view option_name) {
+	const auto value = std::stoull(std::string(text));
+	if (value == 0) {
+		throw std::runtime_error(std::string(option_name) + " must be at least 1");
+	}
+	if (value > std::numeric_limits<std::size_t>::max()) {
+		throw std::runtime_error(std::string(option_name) + " is too large");
+	}
+	return static_cast<std::size_t>(value);
+}
+
 bool ends_with(std::string_view value, std::string_view suffix) {
 	return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
@@ -88,6 +99,14 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
 			continue;
 		}
+		if (argument == "--max-inflight-write-ops") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error("--max-inflight-write-ops requires a value");
+			}
+			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], "--max-inflight-write-ops");
+			continue;
+		}
 		options.positional.push_back(argument);
 	}
 	return options;
@@ -110,6 +129,14 @@ SendOptions parse_send_options(int argc, char** argv, int first_arg) {
 			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
 			continue;
 		}
+		if (argument == "--max-inflight-write-ops") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error("--max-inflight-write-ops requires a value");
+			}
+			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], "--max-inflight-write-ops");
+			continue;
+		}
 		options.positional.push_back(argument);
 	}
 	return options;
@@ -128,17 +155,17 @@ void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode
 void print_soratransport_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  soratransport pack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] <source-dir> <output.tar.zst>\n"
-		<< "  soratransport unpack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport send [--max-inflight-read-mb <MiB>] <source-dir> <host> <port>\n"
+		<< "  soratransport pack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <output.tar.zst>\n"
+		<< "  soratransport unpack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <input.tar.zst> <destination-dir>\n"
+		<< "  soratransport send [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <host> <port>\n"
 		<< "  soratransport receive <port> <destination-dir>\n";
 }
 
 void print_fasttar_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  fasttar pack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] <source-dir> <output.tar|output.tar.zst>\n"
-		<< "  fasttar unpack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] <input.tar|input.tar.zst> <destination-dir>\n";
+		<< "  fasttar pack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <output.tar|output.tar.zst>\n"
+		<< "  fasttar unpack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <input.tar|input.tar.zst> <destination-dir>\n";
 }
 
 } // namespace

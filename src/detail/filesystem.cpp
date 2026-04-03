@@ -127,6 +127,11 @@ std::size_t InFlightReadBudget::max_bytes() const {
 	return max_bytes_;
 }
 
+std::size_t InFlightReadBudget::used_bytes() const {
+	std::lock_guard lock(mutex_);
+	return used_bytes_;
+}
+
 struct FileReader::State {
 	struct ReadSlot {
 		std::shared_ptr<uint8_t> buffer;
@@ -404,84 +409,6 @@ void FileReader::open() {
 
 	if (state_->size == 0) {
 		return;
-	}
-
-	auto issue_next_read = [&](bool wait_for_budget) -> bool {
-		if (state_->next_issue_offset >= state_->aligned_data_end || state_->in_flight_reads >= state_->slots.size()) {
-			return false;
-		}
-
-		auto& slot = state_->slots[state_->next_slot_to_issue];
-		if (slot.in_flight) {
-			throw std::runtime_error("file reader read slot is still in flight");
-		}
-		if (slot.buffer) {
-			throw std::runtime_error("file reader read slot buffer is still owned by a consumer");
-		}
-
-		slot.offset = state_->next_issue_offset;
-		const auto request_limit = static_cast<std::size_t>(std::min<std::uint64_t>(
-			state_->chunk_size,
-			state_->aligned_data_end - state_->next_issue_offset));
-		slot.requested_length = state_->io_mode == FileIoMode::Direct
-			? make_direct_request_size(request_limit, state_->io_alignment)
-			: request_limit;
-		if (read_budget_) {
-			if (wait_for_budget) {
-				read_budget_->acquire(slot.requested_length);
-			} else if (!read_budget_->try_acquire(slot.requested_length)) {
-				slot.requested_length = 0;
-				slot.offset = 0;
-				return false;
-			}
-		}
-		try {
-			auto base_buffer = state_->io_mode == FileIoMode::Direct
-				? make_aligned_buffer(slot.requested_length, state_->io_alignment)
-				: pool_.acquire(slot.requested_length);
-			slot.buffer = read_budget_
-				? wrap_budgeted_buffer(std::move(base_buffer), read_budget_, slot.requested_length)
-				: std::move(base_buffer);
-		} catch (...) {
-			if (read_budget_) {
-				read_budget_->release(slot.requested_length);
-			}
-			slot.requested_length = 0;
-			slot.offset = 0;
-			throw;
-		}
-		slot.overlapped = {};
-		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
-		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
-		slot.overlapped.hEvent = slot.event_handle;
-		::ResetEvent(slot.event_handle);
-
-		DWORD bytes_read = 0;
-		const auto ok = ::ReadFile(
-			state_->handle,
-			slot.buffer.get(),
-			static_cast<DWORD>(slot.requested_length),
-			&bytes_read,
-			&slot.overlapped);
-
-		if (!ok) {
-			const auto error = ::GetLastError();
-			if (error != ERROR_IO_PENDING) {
-				slot.buffer.reset();
-				slot.requested_length = 0;
-				slot.offset = 0;
-				throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
-			}
-		}
-
-		slot.in_flight = true;
-		state_->next_slot_to_issue = (state_->next_slot_to_issue + 1) % state_->slots.size();
-		state_->next_issue_offset += slot.requested_length;
-		++state_->in_flight_reads;
-		return true;
-	};
-
-	while (issue_next_read(false)) {
 	}
 }
 

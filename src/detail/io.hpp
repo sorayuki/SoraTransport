@@ -18,7 +18,6 @@ struct FileIoAlignmentInfo {
 };
 
 inline constexpr std::size_t kFileIoAlignment = 4 * 1024;
-inline constexpr std::size_t kFileIoPreallocationGranularity = 64 * 1024 * 1024;
 
 FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path);
 
@@ -37,7 +36,10 @@ public:
 
 class FileByteSink final : public IByteSink {
 public:
-	explicit FileByteSink(const std::filesystem::path& output_path, FileIoMode mode = FileIoMode::Buffered);
+	explicit FileByteSink(
+		const std::filesystem::path& output_path,
+		FileIoMode mode = FileIoMode::Buffered,
+		std::size_t max_in_flight_write_ops = 1);
 	~FileByteSink() override;
 	FileByteSink(const FileByteSink&) = delete;
 	FileByteSink& operator=(const FileByteSink&) = delete;
@@ -46,6 +48,10 @@ public:
 
 private:
 	struct State;
+	void flush_pending_writes();
+	void submit_active_write(bool finalize);
+	void wait_for_one_write();
+	void wait_for_all_writes();
 	std::unique_ptr<State> state_;
 };
 

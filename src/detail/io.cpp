@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <limits>
 #include <malloc.h>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 #include <windows.h>
 #include <winioctl.h>
@@ -19,6 +21,7 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
+constexpr std::size_t kBufferedWriteBatchSize = 64 * 1024 * 1024;
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
@@ -51,6 +54,11 @@ std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t align
 		throw std::bad_alloc();
 	}
 	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
+}
+
+std::shared_ptr<uint8_t> make_heap_buffer(std::size_t size) {
+	auto* pointer = new uint8_t[size];
+	return {pointer, [](uint8_t* value) { delete[] value; }};
 }
 
 std::wstring make_volume_device_path(const std::filesystem::path& path) {
@@ -237,6 +245,69 @@ FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path) {
 }
 
 struct FileByteSink::State {
+	struct WriteSlot {
+		std::shared_ptr<uint8_t> buffer;
+		OVERLAPPED overlapped{};
+		HANDLE event_handle = nullptr;
+		std::size_t size = 0;
+		std::uint64_t offset = 0;
+		bool in_flight = false;
+
+		WriteSlot() {
+			event_handle = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			if (event_handle == nullptr) {
+				throw make_win32_error("failed to create file write event");
+			}
+			overlapped.hEvent = event_handle;
+		}
+
+		~WriteSlot() {
+			if (event_handle != nullptr) {
+				::CloseHandle(event_handle);
+			}
+		}
+
+		WriteSlot(const WriteSlot&) = delete;
+		WriteSlot& operator=(const WriteSlot&) = delete;
+
+		WriteSlot(WriteSlot&& other) noexcept
+			: buffer(std::move(other.buffer)),
+			  overlapped(other.overlapped),
+			  event_handle(other.event_handle),
+			  size(other.size),
+			  offset(other.offset),
+			  in_flight(other.in_flight) {
+			other.overlapped = {};
+			other.event_handle = nullptr;
+			other.size = 0;
+			other.offset = 0;
+			other.in_flight = false;
+			overlapped.hEvent = event_handle;
+		}
+
+		WriteSlot& operator=(WriteSlot&& other) noexcept {
+			if (this != &other) {
+				if (event_handle != nullptr) {
+					::CloseHandle(event_handle);
+				}
+				buffer = std::move(other.buffer);
+				overlapped = other.overlapped;
+				event_handle = other.event_handle;
+				size = other.size;
+				offset = other.offset;
+				in_flight = other.in_flight;
+
+				other.overlapped = {};
+				other.event_handle = nullptr;
+				other.size = 0;
+				other.offset = 0;
+				other.in_flight = false;
+				overlapped.hEvent = event_handle;
+			}
+			return *this;
+		}
+	};
+
 	HANDLE handle = INVALID_HANDLE_VALUE;
 	std::filesystem::path path;
 	std::string display_path;
@@ -244,11 +315,13 @@ struct FileByteSink::State {
 	FileIoMode mode = FileIoMode::Buffered;
 	std::size_t io_alignment = kFileIoAlignment;
 	std::uint64_t logical_size = 0;
+	std::size_t write_buffer_capacity = 0;
+	std::size_t max_in_flight_write_ops = 1;
 	std::uint64_t physical_size = 0;
-	std::shared_ptr<uint8_t> tail_buffer;
-	std::size_t tail_size = 0;
-	std::shared_ptr<uint8_t> scratch_buffer;
-	std::size_t scratch_capacity = 0;
+	std::vector<WriteSlot> write_slots;
+	std::deque<std::size_t> available_slots;
+	std::deque<std::size_t> in_flight_slots;
+	std::size_t active_slot_index = 0;
 };
 
 struct FileByteSource::State {
@@ -265,16 +338,17 @@ struct FileByteSource::State {
 	std::size_t aligned_buffer_offset = 0;
 };
 
-FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode mode) : state_(std::make_unique<State>()) {
+FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode mode, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
 	state_->path = output_path;
 	state_->display_path = path_to_utf8_string(output_path);
 	state_->mode = mode;
+	state_->max_in_flight_write_ops = std::max<std::size_t>(1, max_in_flight_write_ops);
 	if (mode == FileIoMode::Direct) {
 		state_->io_alignment = query_file_io_alignment(output_path).required_alignment;
 	}
 	const auto flags = mode == FileIoMode::Direct
-		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
-		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
+		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
 	state_->handle = ::CreateFileW(
 		output_path.c_str(),
 		GENERIC_WRITE,
@@ -286,10 +360,23 @@ FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode 
 	if (state_->handle == INVALID_HANDLE_VALUE) {
 		throw make_win32_error("failed to open output file: " + state_->display_path);
 	}
+	state_->write_slots.reserve(state_->max_in_flight_write_ops + 1);
+	for (std::size_t index = 0; index < state_->max_in_flight_write_ops + 1; ++index) {
+		state_->write_slots.emplace_back();
+	}
 	if (mode == FileIoMode::Direct) {
-		state_->tail_buffer = make_aligned_buffer(state_->io_alignment, state_->io_alignment);
-		state_->scratch_capacity = static_cast<std::size_t>(round_up(kDirectIoBufferSize, state_->io_alignment));
-		state_->scratch_buffer = make_aligned_buffer(state_->scratch_capacity, state_->io_alignment);
+		state_->write_buffer_capacity = static_cast<std::size_t>(round_up(kBufferedWriteBatchSize, state_->io_alignment));
+	} else {
+		state_->write_buffer_capacity = kBufferedWriteBatchSize;
+	}
+	for (auto& slot : state_->write_slots) {
+		slot.buffer = mode == FileIoMode::Direct
+			? make_aligned_buffer(state_->write_buffer_capacity, state_->io_alignment)
+			: make_heap_buffer(state_->write_buffer_capacity);
+	}
+	state_->active_slot_index = 0;
+	for (std::size_t index = 1; index < state_->write_slots.size(); ++index) {
+		state_->available_slots.push_back(index);
 	}
 }
 
@@ -300,57 +387,119 @@ FileByteSink::~FileByteSink() {
 	}
 }
 
+void FileByteSink::flush_pending_writes() {
+	submit_active_write(false);
+}
+
 void FileByteSink::write(std::span<const uint8_t> bytes) {
 	if (!state_ || state_->closed || state_->handle == INVALID_HANDLE_VALUE) {
 		throw std::runtime_error("output file is closed");
 	}
-	if (bytes.empty()) {
-		return;
-	}
 	state_->logical_size += bytes.size();
-	if (state_->mode == FileIoMode::Buffered) {
-		write_all(state_->handle, bytes, state_->display_path);
+	while (!bytes.empty()) {
+		auto& active_slot = state_->write_slots[state_->active_slot_index];
+		if (active_slot.size == state_->write_buffer_capacity) {
+			submit_active_write(false);
+		}
+
+		const auto available = state_->write_buffer_capacity - active_slot.size;
+		const auto chunk = std::min<std::size_t>(available, bytes.size());
+		std::memcpy(active_slot.buffer.get() + active_slot.size, bytes.data(), chunk);
+		active_slot.size += chunk;
+		bytes = bytes.subspan(chunk);
+
+		if (active_slot.size == state_->write_buffer_capacity) {
+			submit_active_write(false);
+		}
+	}
+}
+
+void FileByteSink::submit_active_write(bool finalize) {
+	if (!state_) {
 		return;
 	}
 
-	auto append_aligned = [&](const uint8_t* data, std::size_t length) {
-		if (length == 0) {
-			return;
-		}
-		write_exact_at(state_->handle, data, length, state_->physical_size, state_->display_path);
-		state_->physical_size += length;
-	};
-
-	if (state_->tail_size != 0) {
-		const auto fill = std::min<std::size_t>(state_->io_alignment - state_->tail_size, bytes.size());
-		std::memcpy(state_->tail_buffer.get() + state_->tail_size, bytes.data(), fill);
-		state_->tail_size += fill;
-		bytes = bytes.subspan(fill);
-		if (state_->tail_size == state_->io_alignment) {
-			append_aligned(state_->tail_buffer.get(), state_->io_alignment);
-			state_->tail_size = 0;
-		}
+	auto& slot = state_->write_slots[state_->active_slot_index];
+	if (slot.size == 0) {
+		return;
+	}
+	if (slot.in_flight) {
+		throw std::runtime_error("write slot is unexpectedly still in flight");
 	}
 
-	const auto aligned_bytes = static_cast<std::size_t>(round_down(bytes.size(), state_->io_alignment));
-	if (aligned_bytes > 0) {
-		if (is_aligned(bytes.data(), state_->io_alignment)) {
-			append_aligned(bytes.data(), aligned_bytes);
-		} else {
-			std::size_t copied = 0;
-			while (copied < aligned_bytes) {
-				const auto chunk = std::min<std::size_t>(aligned_bytes - copied, state_->scratch_capacity);
-				std::memcpy(state_->scratch_buffer.get(), bytes.data() + copied, chunk);
-				append_aligned(state_->scratch_buffer.get(), chunk);
-				copied += chunk;
-			}
+	if (state_->mode == FileIoMode::Direct && finalize) {
+		const auto padded_size = static_cast<std::size_t>(round_up(slot.size, state_->io_alignment));
+		if (padded_size != slot.size) {
+			std::memset(slot.buffer.get() + slot.size, 0, padded_size - slot.size);
+			slot.size = padded_size;
 		}
-		bytes = bytes.subspan(aligned_bytes);
+	}
+	if (state_->in_flight_slots.size() >= state_->max_in_flight_write_ops) {
+		wait_for_one_write();
 	}
 
-	if (!bytes.empty()) {
-		std::memcpy(state_->tail_buffer.get(), bytes.data(), bytes.size());
-		state_->tail_size = bytes.size();
+	slot.offset = state_->physical_size;
+	slot.overlapped = {};
+	slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
+	slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
+	slot.overlapped.hEvent = slot.event_handle;
+	::ResetEvent(slot.event_handle);
+
+	const auto ok = ::WriteFile(
+		state_->handle,
+		slot.buffer.get(),
+		static_cast<DWORD>(slot.size),
+		nullptr,
+		&slot.overlapped);
+	if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+		throw make_win32_error("failed to write output file: " + state_->display_path);
+	}
+
+	slot.in_flight = true;
+	state_->physical_size += slot.size;
+	state_->in_flight_slots.push_back(state_->active_slot_index);
+
+	if (state_->available_slots.empty()) {
+		wait_for_one_write();
+	}
+	if (state_->available_slots.empty()) {
+		throw std::runtime_error("no write slot available after waiting for completion");
+	}
+
+	state_->active_slot_index = state_->available_slots.front();
+	state_->available_slots.pop_front();
+	state_->write_slots[state_->active_slot_index].size = 0;
+}
+
+void FileByteSink::wait_for_one_write() {
+	if (!state_ || state_->in_flight_slots.empty()) {
+		return;
+	}
+
+	const auto slot_index = state_->in_flight_slots.front();
+	state_->in_flight_slots.pop_front();
+	auto& slot = state_->write_slots[slot_index];
+	DWORD bytes_written = 0;
+	if (!::GetOverlappedResult(state_->handle, &slot.overlapped, &bytes_written, TRUE)) {
+		const auto error = ::GetLastError();
+		slot.in_flight = false;
+		slot.size = 0;
+		throw make_win32_error("failed to complete output write: " + state_->display_path, error);
+	}
+	if (bytes_written != slot.size) {
+		slot.in_flight = false;
+		slot.size = 0;
+		throw std::runtime_error("unexpected short write to output file: " + state_->display_path);
+	}
+	slot.in_flight = false;
+	slot.size = 0;
+	slot.offset = 0;
+	state_->available_slots.push_back(slot_index);
+}
+
+void FileByteSink::wait_for_all_writes() {
+	while (state_ && !state_->in_flight_slots.empty()) {
+		wait_for_one_write();
 	}
 }
 
@@ -358,13 +507,9 @@ void FileByteSink::close() {
 	if (!state_ || state_->closed) {
 		return;
 	}
+	submit_active_write(true);
+	wait_for_all_writes();
 	state_->closed = true;
-	if (state_->mode == FileIoMode::Direct && state_->tail_size != 0) {
-		std::memset(state_->tail_buffer.get() + state_->tail_size, 0, state_->io_alignment - state_->tail_size);
-		write_exact_at(state_->handle, state_->tail_buffer.get(), state_->io_alignment, state_->physical_size, state_->display_path);
-		state_->physical_size += state_->io_alignment;
-		state_->tail_size = 0;
-	}
 	if (!::FlushFileBuffers(state_->handle)) {
 		const auto error = ::GetLastError();
 		::CloseHandle(state_->handle);

@@ -5,10 +5,13 @@
 #include <archive.h>
 #include <archive_entry.h>
 
+#include <atomic>
+
 namespace soratransport {
 
 struct RuntimeOptions {
 	std::optional<std::size_t> max_in_flight_read_bytes;
+	std::optional<std::size_t> max_in_flight_write_ops;
 };
 
 class DirScanner {
@@ -27,6 +30,7 @@ public:
 	bool try_acquire(std::size_t bytes);
 	void release(std::size_t bytes);
 	std::size_t max_bytes() const;
+	std::size_t used_bytes() const;
 
 private:
 	std::size_t max_bytes_;
@@ -93,7 +97,7 @@ private:
 class TarPacker {
 public:
 	TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency);
-	void pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar);
+	void pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr);
 
 private:
 	static la_ssize_t archive_write_callback(struct archive*, void* client_data, const void* buffer, size_t length);
@@ -109,7 +113,7 @@ private:
 class TarUnpacker {
 public:
 	explicit TarUnpacker(const std::filesystem::path& destination_root);
-	void unpack(BoundedQueue<DataChunk>& in_tar);
+	void unpack(BoundedQueue<DataChunk>& in_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr);
 
 private:
 	static la_ssize_t archive_read_callback(struct archive*, void* client_data, const void** buffer);
