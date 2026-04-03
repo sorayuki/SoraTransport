@@ -15,6 +15,18 @@ struct RuntimeOptions {
 	std::optional<int> compression_level;
 };
 
+struct QueueTelemetrySample {
+	std::size_t size = 0;
+	std::size_t capacity = 0;
+
+	double fill_ratio() const {
+		if (capacity == 0) {
+			return 0.0;
+		}
+		return static_cast<double>(size) / static_cast<double>(capacity);
+	}
+};
+
 class DirScanner {
 public:
 	explicit DirScanner(RuntimeExecutors& executors);
@@ -80,6 +92,24 @@ struct OpenedFileReader {
 	std::optional<FileReader> reader;
 };
 
+struct CompressionQueueTelemetry {
+	const BoundedQueue<FileMeta>* meta_queue = nullptr;
+	const BoundedQueue<OpenedFileReader>* opened_queue = nullptr;
+	const BoundedQueue<DataChunk>* tar_queue = nullptr;
+
+	QueueTelemetrySample meta() const {
+		return meta_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{meta_queue->size(), meta_queue->capacity()};
+	}
+
+	QueueTelemetrySample opened() const {
+		return opened_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{opened_queue->size(), opened_queue->capacity()};
+	}
+
+	QueueTelemetrySample tar() const {
+		return tar_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{tar_queue->size(), tar_queue->capacity()};
+	}
+};
+
 class FileReaderOpener {
 public:
 	FileReaderOpener(
@@ -131,7 +161,11 @@ private:
 
 class ZstdCompressor {
 public:
-	ZstdCompressor(BufferPool& pool, RuntimeExecutors& executors, int compression_level);
+	ZstdCompressor(
+		BufferPool& pool,
+		RuntimeExecutors& executors,
+		int compression_level,
+		const CompressionQueueTelemetry* queue_telemetry = nullptr);
 	void compress(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
 
 private:
@@ -140,6 +174,7 @@ private:
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;
 	int compression_level_;
+	const CompressionQueueTelemetry* queue_telemetry_;
 };
 
 class ZstdDecompressor {

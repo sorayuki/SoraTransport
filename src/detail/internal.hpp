@@ -18,6 +18,7 @@ struct RuntimeConfig {
 
 RuntimeConfig make_runtime_config(RuntimeOptions options = {});
 void configure_zstd_context(ZSTD_CCtx* context, int compression_level, std::size_t worker_count);
+void set_zstd_compression_level(ZSTD_CCtx* context, int compression_level);
 
 class PipelineState {
 public:

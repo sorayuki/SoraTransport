@@ -37,11 +37,15 @@ RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	return config;
 }
 
-void configure_zstd_context(ZSTD_CCtx* context, int compression_level, std::size_t worker_count) {
+void set_zstd_compression_level(ZSTD_CCtx* context, int compression_level) {
 	const auto level_result = ZSTD_CCtx_setParameter(context, ZSTD_c_compressionLevel, compression_level);
 	if (ZSTD_isError(level_result)) {
 		throw std::runtime_error(ZSTD_getErrorName(level_result));
 	}
+}
+
+void configure_zstd_context(ZSTD_CCtx* context, int compression_level, std::size_t worker_count) {
+	set_zstd_compression_level(context, compression_level);
 
 	if (worker_count <= 1) {
 		return;

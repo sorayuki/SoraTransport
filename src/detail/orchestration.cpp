@@ -138,6 +138,7 @@ asio::awaitable<void> send_directory_task(
 		SocketByteSink sink(std::move(socket));
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
+		const auto enable_adaptive_compression = !options.compression_level.has_value();
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
@@ -145,6 +146,7 @@ asio::awaitable<void> send_directory_task(
 		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
+		CompressionQueueTelemetry compression_telemetry{&meta_queue, &opened_queue, &tar_queue};
 		DirScanner scanner(executors);
 		FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kPipelineChunkSize);
 		TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
@@ -180,7 +182,11 @@ asio::awaitable<void> send_directory_task(
 
 		std::jthread compressor_thread([&] {
 			try {
-				ZstdCompressor compressor(pool, executors, compression_level);
+				ZstdCompressor compressor(
+					pool,
+					executors,
+					compression_level,
+					enable_adaptive_compression ? &compression_telemetry : nullptr);
 				compressor.compress(tar_queue, sink);
 			} catch (...) {
 				state.fail(std::current_exception());
@@ -249,12 +255,14 @@ asio::awaitable<void> receive_directory_task(
 void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
 	auto config = make_runtime_config(options);
 	const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
+	const auto enable_adaptive_compression = mode == CompressionMode::Zstd && !options.compression_level.has_value();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
+	CompressionQueueTelemetry compression_telemetry{&meta_queue, &opened_queue, &tar_queue};
 	DirScanner scanner(executors);
 	FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kPipelineChunkSize, file_io_mode);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
@@ -307,7 +315,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	std::jthread sink_thread([&] {
 		try {
 			if (mode == CompressionMode::Zstd) {
-				ZstdCompressor compressor(pool, executors, compression_level);
+				ZstdCompressor compressor(
+					pool,
+					executors,
+					compression_level,
+					enable_adaptive_compression ? &compression_telemetry : nullptr);
 				compressor.compress(tar_queue, sink);
 			} else {
 				RawTarWriter writer;
