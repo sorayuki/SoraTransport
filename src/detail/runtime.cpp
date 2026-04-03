@@ -14,7 +14,7 @@ constexpr std::size_t kMediumBufferSize = 256 * 1024;
 constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
 constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
-constexpr std::size_t kTargetInFlightReadBytes = 384 * 1024 * 1024;
+constexpr std::size_t kTargetInFlightReadBytes = 192 * 1024 * 1024;
 constexpr std::size_t kDefaultMaxInFlightWriteOps = 1;
 
 std::size_t hardware_threads() {
@@ -31,7 +31,7 @@ RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	config.reader_threads = std::clamp<std::size_t>(threads, 6, 24);
 	config.compression_threads = std::clamp<std::size_t>(threads / 2, 2, 8);
 	config.read_concurrency = std::clamp<std::size_t>(config.reader_threads * 2, 8, 48);
-	config.tar_queue_depth = std::clamp<std::size_t>(config.read_concurrency * 2, 32, 128);
+	config.tar_queue_depth = std::clamp<std::size_t>(config.read_concurrency, 16, 24);
 	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
 	config.max_in_flight_write_ops = std::max<std::size_t>(1, options.max_in_flight_write_ops.value_or(kDefaultMaxInFlightWriteOps));
 	return config;

@@ -21,9 +21,9 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 8 * 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 256;
-constexpr std::size_t kOpenedQueueDepth = 64;
+constexpr std::size_t kOpenedQueueDepth = 32;
 constexpr int kDefaultCompressionLevel = 3;
 
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
@@ -137,6 +137,7 @@ asio::awaitable<void> send_directory_task(
 		auto socket = co_await connect_socket_async(std::move(host), port);
 		SocketByteSink sink(std::move(socket));
 		auto config = make_runtime_config(options);
+		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
@@ -179,7 +180,7 @@ asio::awaitable<void> send_directory_task(
 
 		std::jthread compressor_thread([&] {
 			try {
-				ZstdCompressor compressor(pool, executors, kDefaultCompressionLevel);
+				ZstdCompressor compressor(pool, executors, compression_level);
 				compressor.compress(tar_queue, sink);
 			} catch (...) {
 				state.fail(std::current_exception());
@@ -247,6 +248,7 @@ asio::awaitable<void> receive_directory_task(
 
 void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
 	auto config = make_runtime_config(options);
+	const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
 	auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
@@ -305,7 +307,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	std::jthread sink_thread([&] {
 		try {
 			if (mode == CompressionMode::Zstd) {
-				ZstdCompressor compressor(pool, executors, kDefaultCompressionLevel);
+				ZstdCompressor compressor(pool, executors, compression_level);
 				compressor.compress(tar_queue, sink);
 			} else {
 				RawTarWriter writer;

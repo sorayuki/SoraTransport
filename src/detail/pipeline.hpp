@@ -12,6 +12,7 @@ namespace soratransport {
 struct RuntimeOptions {
 	std::optional<std::size_t> max_in_flight_read_bytes;
 	std::optional<std::size_t> max_in_flight_write_ops;
+	std::optional<int> compression_level;
 };
 
 class DirScanner {
@@ -54,6 +55,8 @@ public:
 	FileReader(FileReader&& other);
 	FileReader& operator=(FileReader&& other);
 	void open();
+	void reserve_prefetch_budget(std::size_t bytes);
+	void start_prefetch();
 	DataChunk read_next_chunk();
 	std::uint64_t offset() const;
 	bool eof() const;
@@ -61,6 +64,9 @@ public:
 
 private:
 	struct State;
+	bool issue_next_read(bool wait_for_budget);
+	void prime_prefetch_window();
+	void release_slot_budget(std::size_t slot_index);
 	void close();
 	std::string path_for_error() const;
 

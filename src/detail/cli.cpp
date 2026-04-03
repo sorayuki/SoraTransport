@@ -41,6 +41,14 @@ std::size_t parse_positive_count(std::string_view text, std::string_view option_
 	return static_cast<std::size_t>(value);
 }
 
+int parse_compression_level(std::string_view text, std::string_view option_name) {
+	const auto value = std::stoi(std::string(text));
+	if (value < -131072 || value > 22) {
+		throw std::runtime_error(std::string(option_name) + " must be in range -131072..22");
+	}
+	return value;
+}
+
 bool ends_with(std::string_view value, std::string_view suffix) {
 	return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
@@ -53,20 +61,20 @@ CompressionMode infer_fasttar_mode_from_path(std::string_view path_text) {
 }
 
 CompressionMode parse_fasttar_mode_option(std::string_view option) {
-	if (option == "--zstd") {
+	if (option == "-z") {
 		return CompressionMode::Zstd;
 	}
-	if (option == "--no-compress") {
+	if (option == "-n") {
 		return CompressionMode::None;
 	}
 	throw std::runtime_error("unknown fasttar option: " + std::string(option));
 }
 
 FileIoMode parse_file_io_mode_option(std::string_view option) {
-	if (option == "--direct-io") {
+	if (option == "-d") {
 		return FileIoMode::Direct;
 	}
-	if (option == "--buffered-io") {
+	if (option == "-b") {
 		return FileIoMode::Buffered;
 	}
 	throw std::runtime_error("unknown file I/O option: " + std::string(option));
@@ -83,28 +91,36 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 	PackUnpackOptions options;
 	for (int index = first_arg; index < argc; ++index) {
 		const std::string_view argument = argv[index];
-		if (argument == "--direct-io" || argument == "--buffered-io") {
+		if (argument == "-d" || argument == "-b") {
 			options.file_io_mode = parse_file_io_mode_option(argument);
 			continue;
 		}
-		if (allow_compression_mode && (argument == "--zstd" || argument == "--no-compress")) {
+		if (allow_compression_mode && (argument == "-z" || argument == "-n")) {
 			options.compression_mode = parse_fasttar_mode_option(argument);
 			continue;
 		}
-		if (argument == "--max-inflight-read-mb") {
+		if (argument == "-r") {
 			++index;
 			if (index >= argc) {
-				throw std::runtime_error("--max-inflight-read-mb requires a value");
+				throw std::runtime_error(std::string(argument) + " requires a value");
 			}
-			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
+			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], argument);
 			continue;
 		}
-		if (argument == "--max-inflight-write-ops") {
+		if (argument == "-w") {
 			++index;
 			if (index >= argc) {
-				throw std::runtime_error("--max-inflight-write-ops requires a value");
+				throw std::runtime_error(std::string(argument) + " requires a value");
 			}
-			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], "--max-inflight-write-ops");
+			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], argument);
+			continue;
+		}
+		if (argument == "-l") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error(std::string(argument) + " requires a value");
+			}
+			options.runtime_options.compression_level = parse_compression_level(argv[index], argument);
 			continue;
 		}
 		options.positional.push_back(argument);
@@ -121,20 +137,28 @@ SendOptions parse_send_options(int argc, char** argv, int first_arg) {
 	SendOptions options;
 	for (int index = first_arg; index < argc; ++index) {
 		const std::string_view argument = argv[index];
-		if (argument == "--max-inflight-read-mb") {
+		if (argument == "-r") {
 			++index;
 			if (index >= argc) {
-				throw std::runtime_error("--max-inflight-read-mb requires a value");
+				throw std::runtime_error(std::string(argument) + " requires a value");
 			}
-			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], "--max-inflight-read-mb");
+			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], argument);
 			continue;
 		}
-		if (argument == "--max-inflight-write-ops") {
+		if (argument == "-w") {
 			++index;
 			if (index >= argc) {
-				throw std::runtime_error("--max-inflight-write-ops requires a value");
+				throw std::runtime_error(std::string(argument) + " requires a value");
 			}
-			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], "--max-inflight-write-ops");
+			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], argument);
+			continue;
+		}
+		if (argument == "-l") {
+			++index;
+			if (index >= argc) {
+				throw std::runtime_error(std::string(argument) + " requires a value");
+			}
+			options.runtime_options.compression_level = parse_compression_level(argv[index], argument);
 			continue;
 		}
 		options.positional.push_back(argument);
@@ -155,17 +179,33 @@ void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode
 void print_soratransport_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  soratransport pack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <output.tar.zst>\n"
-		<< "  soratransport unpack [--direct-io|--buffered-io] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport send [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <host> <port>\n"
-		<< "  soratransport receive <port> <destination-dir>\n";
+		<< "  soratransport pack [-d|-b] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>\n"
+		<< "  soratransport unpack [-d|-b] [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>\n"
+		<< "  soratransport send [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <host> <port>\n"
+		<< "  soratransport receive <port> <destination-dir>\n"
+		<< "\n"
+		<< "Options:\n"
+		<< "  -d          Use direct I/O for file reads when applicable\n"
+		<< "  -b          Use buffered I/O for file reads\n"
+		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
+		<< "  -w <count>  Max in-flight output write operations\n"
+		<< "  -l <level>  Zstd compression level, range -131072..22\n";
 }
 
 void print_fasttar_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  fasttar pack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <source-dir> <output.tar|output.tar.zst>\n"
-		<< "  fasttar unpack [--direct-io|--buffered-io] [--zstd|--no-compress] [--max-inflight-read-mb <MiB>] [--max-inflight-write-ops <count>] <input.tar|input.tar.zst> <destination-dir>\n";
+		<< "  fasttar pack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar|output.tar.zst>\n"
+		<< "  fasttar unpack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] <input.tar|input.tar.zst> <destination-dir>\n"
+		<< "\n"
+		<< "Options:\n"
+		<< "  -d          Use direct I/O for file reads when applicable\n"
+		<< "  -b          Use buffered I/O for file reads\n"
+		<< "  -z          Use zstd compression\n"
+		<< "  -n          Disable compression and use raw tar\n"
+		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
+		<< "  -w <count>  Max in-flight output write operations\n"
+		<< "  -l <level>  Zstd compression level, range -131072..22\n";
 }
 
 } // namespace

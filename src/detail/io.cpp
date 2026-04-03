@@ -21,7 +21,7 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
-constexpr std::size_t kBufferedWriteBatchSize = 64 * 1024 * 1024;
+constexpr std::size_t kBufferedWriteBatchSize = 32 * 1024 * 1024;
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
@@ -341,14 +341,9 @@ struct FileByteSource::State {
 FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode mode, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
 	state_->path = output_path;
 	state_->display_path = path_to_utf8_string(output_path);
-	state_->mode = mode;
+	state_->mode = FileIoMode::Buffered;
 	state_->max_in_flight_write_ops = std::max<std::size_t>(1, max_in_flight_write_ops);
-	if (mode == FileIoMode::Direct) {
-		state_->io_alignment = query_file_io_alignment(output_path).required_alignment;
-	}
-	const auto flags = mode == FileIoMode::Direct
-		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
-		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
+	const auto flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
 	state_->handle = ::CreateFileW(
 		output_path.c_str(),
 		GENERIC_WRITE,
@@ -364,15 +359,9 @@ FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode 
 	for (std::size_t index = 0; index < state_->max_in_flight_write_ops + 1; ++index) {
 		state_->write_slots.emplace_back();
 	}
-	if (mode == FileIoMode::Direct) {
-		state_->write_buffer_capacity = static_cast<std::size_t>(round_up(kBufferedWriteBatchSize, state_->io_alignment));
-	} else {
-		state_->write_buffer_capacity = kBufferedWriteBatchSize;
-	}
+	state_->write_buffer_capacity = kBufferedWriteBatchSize;
 	for (auto& slot : state_->write_slots) {
-		slot.buffer = mode == FileIoMode::Direct
-			? make_aligned_buffer(state_->write_buffer_capacity, state_->io_alignment)
-			: make_heap_buffer(state_->write_buffer_capacity);
+		slot.buffer = make_heap_buffer(state_->write_buffer_capacity);
 	}
 	state_->active_slot_index = 0;
 	for (std::size_t index = 1; index < state_->write_slots.size(); ++index) {
@@ -427,13 +416,6 @@ void FileByteSink::submit_active_write(bool finalize) {
 		throw std::runtime_error("write slot is unexpectedly still in flight");
 	}
 
-	if (state_->mode == FileIoMode::Direct && finalize) {
-		const auto padded_size = static_cast<std::size_t>(round_up(slot.size, state_->io_alignment));
-		if (padded_size != slot.size) {
-			std::memset(slot.buffer.get() + slot.size, 0, padded_size - slot.size);
-			slot.size = padded_size;
-		}
-	}
 	if (state_->in_flight_slots.size() >= state_->max_in_flight_write_ops) {
 		wait_for_one_write();
 	}
@@ -521,9 +503,6 @@ void FileByteSink::close() {
 		throw make_win32_error("failed to close output file: " + state_->display_path);
 	}
 	state_->handle = INVALID_HANDLE_VALUE;
-	if (state_->mode == FileIoMode::Direct) {
-		resize_file_buffered(state_->path, state_->logical_size);
-	}
 }
 
 FileByteSource::FileByteSource(const std::filesystem::path& input_path, FileIoMode mode) : state_(std::make_unique<State>()) {
