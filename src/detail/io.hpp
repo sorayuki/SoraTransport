@@ -11,8 +11,16 @@ enum class FileIoMode {
 	Direct,
 };
 
+struct FileIoAlignmentInfo {
+	std::size_t logical_sector_size = 4 * 1024;
+	std::size_t physical_sector_size = 4 * 1024;
+	std::size_t required_alignment = 4 * 1024;
+};
+
 inline constexpr std::size_t kFileIoAlignment = 4 * 1024;
 inline constexpr std::size_t kFileIoPreallocationGranularity = 64 * 1024 * 1024;
+
+FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path);
 
 class IByteSink {
 public:

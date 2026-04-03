@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cwchar>
 #include <limits>
 #include <malloc.h>
 #include <stdexcept>
 #include <system_error>
 
 #include <windows.h>
+#include <winioctl.h>
 
 namespace soratransport {
 
@@ -43,12 +45,21 @@ bool is_aligned(const void* pointer, std::size_t alignment) {
 	return (reinterpret_cast<std::uintptr_t>(pointer) % alignment) == 0;
 }
 
-std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size) {
-	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, kFileIoAlignment));
+std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t alignment) {
+	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
 	if (pointer == nullptr) {
 		throw std::bad_alloc();
 	}
 	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
+}
+
+std::wstring make_volume_device_path(const std::filesystem::path& path) {
+	const auto absolute_path = std::filesystem::absolute(path);
+	const auto root_name = absolute_path.root_name().wstring();
+	if (root_name.size() < 2 || root_name[1] != L':') {
+		return L"";
+	}
+	return L"\\\\.\\" + root_name;
 }
 
 void write_all(HANDLE handle, std::span<const uint8_t> bytes, const std::string& path) {
@@ -140,8 +151,7 @@ void set_file_size(HANDLE handle, std::uint64_t size, const std::string& path) {
 	}
 }
 
-void resize_file_buffered(const std::string& path_text, std::uint64_t size) {
-	std::filesystem::path path(path_text);
+void resize_file_buffered(const std::filesystem::path& path, std::uint64_t size) {
 	const auto handle = ::CreateFileW(
 		path.c_str(),
 		GENERIC_WRITE,
@@ -151,12 +161,12 @@ void resize_file_buffered(const std::string& path_text, std::uint64_t size) {
 		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
 		nullptr);
 	if (handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to reopen output file for resize: " + path_text);
+		throw make_win32_error("failed to reopen output file for resize: " + path_to_utf8_string(path));
 	}
 	try {
-		set_file_size(handle, size, path_text);
+		set_file_size(handle, size, path_to_utf8_string(path));
 		if (!::FlushFileBuffers(handle)) {
-			throw make_win32_error("failed to flush resized output file: " + path_text);
+			throw make_win32_error("failed to flush resized output file: " + path_to_utf8_string(path));
 		}
 		::CloseHandle(handle);
 	} catch (...) {
@@ -167,11 +177,72 @@ void resize_file_buffered(const std::string& path_text, std::uint64_t size) {
 
 } // namespace
 
+FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path) {
+	FileIoAlignmentInfo info;
+	const auto absolute_path = std::filesystem::absolute(path);
+	std::wstring volume_path(MAX_PATH, L'\0');
+	if (!::GetVolumePathNameW(absolute_path.c_str(), volume_path.data(), static_cast<DWORD>(volume_path.size()))) {
+		return info;
+	}
+	volume_path.resize(std::wcslen(volume_path.c_str()));
+
+	DWORD sectors_per_cluster = 0;
+	DWORD bytes_per_sector = 0;
+	DWORD number_of_free_clusters = 0;
+	DWORD total_number_of_clusters = 0;
+	if (::GetDiskFreeSpaceW(
+			volume_path.c_str(),
+			&sectors_per_cluster,
+			&bytes_per_sector,
+			&number_of_free_clusters,
+			&total_number_of_clusters)) {
+		info.logical_sector_size = std::max<std::size_t>(kFileIoAlignment, bytes_per_sector);
+		info.physical_sector_size = info.logical_sector_size;
+		info.required_alignment = info.logical_sector_size;
+	}
+
+	const auto volume_device = make_volume_device_path(absolute_path);
+	if (!volume_device.empty()) {
+		const auto handle = ::CreateFileW(
+			volume_device.c_str(),
+			0,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr,
+			OPEN_EXISTING,
+			0,
+			nullptr);
+		if (handle != INVALID_HANDLE_VALUE) {
+			STORAGE_PROPERTY_QUERY query{};
+			query.PropertyId = StorageAccessAlignmentProperty;
+			query.QueryType = PropertyStandardQuery;
+			STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR descriptor{};
+			DWORD bytes_returned = 0;
+			if (::DeviceIoControl(
+					handle,
+					IOCTL_STORAGE_QUERY_PROPERTY,
+					&query,
+					static_cast<DWORD>(sizeof(query)),
+					&descriptor,
+					static_cast<DWORD>(sizeof(descriptor)),
+					&bytes_returned,
+					nullptr) && descriptor.BytesPerPhysicalSector > 0) {
+				info.physical_sector_size = std::max<std::size_t>(info.logical_sector_size, descriptor.BytesPerPhysicalSector);
+				info.required_alignment = std::max(info.required_alignment, info.physical_sector_size);
+			}
+			::CloseHandle(handle);
+		}
+	}
+
+	return info;
+}
+
 struct FileByteSink::State {
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	std::string path;
+	std::filesystem::path path;
+	std::string display_path;
 	bool closed = false;
 	FileIoMode mode = FileIoMode::Buffered;
+	std::size_t io_alignment = kFileIoAlignment;
 	std::uint64_t logical_size = 0;
 	std::uint64_t physical_size = 0;
 	std::shared_ptr<uint8_t> tail_buffer;
@@ -182,8 +253,10 @@ struct FileByteSink::State {
 
 struct FileByteSource::State {
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	std::string path;
+	std::filesystem::path path;
+	std::string display_path;
 	FileIoMode mode = FileIoMode::Buffered;
+	std::size_t io_alignment = kFileIoAlignment;
 	std::uint64_t logical_offset = 0;
 	std::uint64_t size = 0;
 	std::shared_ptr<uint8_t> aligned_buffer;
@@ -193,8 +266,12 @@ struct FileByteSource::State {
 };
 
 FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode mode) : state_(std::make_unique<State>()) {
-	state_->path = path_to_utf8_string(output_path);
+	state_->path = output_path;
+	state_->display_path = path_to_utf8_string(output_path);
 	state_->mode = mode;
+	if (mode == FileIoMode::Direct) {
+		state_->io_alignment = query_file_io_alignment(output_path).required_alignment;
+	}
 	const auto flags = mode == FileIoMode::Direct
 		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
 		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
@@ -207,12 +284,12 @@ FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode 
 		flags,
 		nullptr);
 	if (state_->handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to open output file: " + state_->path);
+		throw make_win32_error("failed to open output file: " + state_->display_path);
 	}
 	if (mode == FileIoMode::Direct) {
-		state_->tail_buffer = make_aligned_buffer(kFileIoAlignment);
-		state_->scratch_capacity = kDirectIoBufferSize;
-		state_->scratch_buffer = make_aligned_buffer(state_->scratch_capacity);
+		state_->tail_buffer = make_aligned_buffer(state_->io_alignment, state_->io_alignment);
+		state_->scratch_capacity = static_cast<std::size_t>(round_up(kDirectIoBufferSize, state_->io_alignment));
+		state_->scratch_buffer = make_aligned_buffer(state_->scratch_capacity, state_->io_alignment);
 	}
 }
 
@@ -232,7 +309,7 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 	}
 	state_->logical_size += bytes.size();
 	if (state_->mode == FileIoMode::Buffered) {
-		write_all(state_->handle, bytes, state_->path);
+		write_all(state_->handle, bytes, state_->display_path);
 		return;
 	}
 
@@ -240,24 +317,24 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 		if (length == 0) {
 			return;
 		}
-		write_exact_at(state_->handle, data, length, state_->physical_size, state_->path);
+		write_exact_at(state_->handle, data, length, state_->physical_size, state_->display_path);
 		state_->physical_size += length;
 	};
 
 	if (state_->tail_size != 0) {
-		const auto fill = std::min<std::size_t>(kFileIoAlignment - state_->tail_size, bytes.size());
+		const auto fill = std::min<std::size_t>(state_->io_alignment - state_->tail_size, bytes.size());
 		std::memcpy(state_->tail_buffer.get() + state_->tail_size, bytes.data(), fill);
 		state_->tail_size += fill;
 		bytes = bytes.subspan(fill);
-		if (state_->tail_size == kFileIoAlignment) {
-			append_aligned(state_->tail_buffer.get(), kFileIoAlignment);
+		if (state_->tail_size == state_->io_alignment) {
+			append_aligned(state_->tail_buffer.get(), state_->io_alignment);
 			state_->tail_size = 0;
 		}
 	}
 
-	const auto aligned_bytes = static_cast<std::size_t>(round_down(bytes.size(), kFileIoAlignment));
+	const auto aligned_bytes = static_cast<std::size_t>(round_down(bytes.size(), state_->io_alignment));
 	if (aligned_bytes > 0) {
-		if (is_aligned(bytes.data(), kFileIoAlignment)) {
+		if (is_aligned(bytes.data(), state_->io_alignment)) {
 			append_aligned(bytes.data(), aligned_bytes);
 		} else {
 			std::size_t copied = 0;
@@ -282,23 +359,21 @@ void FileByteSink::close() {
 		return;
 	}
 	state_->closed = true;
-	if (state_->mode == FileIoMode::Direct) {
-		if (state_->tail_size != 0) {
-			std::memset(state_->tail_buffer.get() + state_->tail_size, 0, kFileIoAlignment - state_->tail_size);
-			write_exact_at(state_->handle, state_->tail_buffer.get(), kFileIoAlignment, state_->physical_size, state_->path);
-			state_->physical_size += kFileIoAlignment;
-			state_->tail_size = 0;
-		}
+	if (state_->mode == FileIoMode::Direct && state_->tail_size != 0) {
+		std::memset(state_->tail_buffer.get() + state_->tail_size, 0, state_->io_alignment - state_->tail_size);
+		write_exact_at(state_->handle, state_->tail_buffer.get(), state_->io_alignment, state_->physical_size, state_->display_path);
+		state_->physical_size += state_->io_alignment;
+		state_->tail_size = 0;
 	}
 	if (!::FlushFileBuffers(state_->handle)) {
 		const auto error = ::GetLastError();
 		::CloseHandle(state_->handle);
 		state_->handle = INVALID_HANDLE_VALUE;
-		throw make_win32_error("failed to flush output file: " + state_->path, error);
+		throw make_win32_error("failed to flush output file: " + state_->display_path, error);
 	}
 	if (!::CloseHandle(state_->handle)) {
 		state_->handle = INVALID_HANDLE_VALUE;
-		throw make_win32_error("failed to close output file: " + state_->path);
+		throw make_win32_error("failed to close output file: " + state_->display_path);
 	}
 	state_->handle = INVALID_HANDLE_VALUE;
 	if (state_->mode == FileIoMode::Direct) {
@@ -307,8 +382,12 @@ void FileByteSink::close() {
 }
 
 FileByteSource::FileByteSource(const std::filesystem::path& input_path, FileIoMode mode) : state_(std::make_unique<State>()) {
-	state_->path = path_to_utf8_string(input_path);
+	state_->path = input_path;
+	state_->display_path = path_to_utf8_string(input_path);
 	state_->mode = mode;
+	if (mode == FileIoMode::Direct) {
+		state_->io_alignment = query_file_io_alignment(input_path).required_alignment;
+	}
 	const auto flags = mode == FileIoMode::Direct
 		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
 		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
@@ -321,19 +400,19 @@ FileByteSource::FileByteSource(const std::filesystem::path& input_path, FileIoMo
 		flags,
 		nullptr);
 	if (state_->handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to open input file: " + state_->path);
+		throw make_win32_error("failed to open input file: " + state_->display_path);
 	}
 	LARGE_INTEGER file_size{};
 	if (!::GetFileSizeEx(state_->handle, &file_size)) {
 		const auto error = ::GetLastError();
 		::CloseHandle(state_->handle);
 		state_->handle = INVALID_HANDLE_VALUE;
-		throw make_win32_error("failed to query input file size: " + state_->path, error);
+		throw make_win32_error("failed to query input file size: " + state_->display_path, error);
 	}
 	state_->size = static_cast<std::uint64_t>(file_size.QuadPart);
 	if (mode == FileIoMode::Direct) {
-		state_->aligned_buffer_capacity = kDirectIoBufferSize;
-		state_->aligned_buffer = make_aligned_buffer(state_->aligned_buffer_capacity);
+		state_->aligned_buffer_capacity = static_cast<std::size_t>(round_up(kDirectIoBufferSize, state_->io_alignment));
+		state_->aligned_buffer = make_aligned_buffer(state_->aligned_buffer_capacity, state_->io_alignment);
 	}
 }
 
@@ -352,7 +431,7 @@ std::size_t FileByteSource::read(uint8_t* buffer, std::size_t length) {
 		return 0;
 	}
 	if (state_->mode == FileIoMode::Buffered) {
-		return read_some(state_->handle, buffer, length, state_->path);
+		return read_some(state_->handle, buffer, length, state_->display_path);
 	}
 
 	std::size_t copied_total = 0;
@@ -373,16 +452,16 @@ std::size_t FileByteSource::read(uint8_t* buffer, std::size_t length) {
 
 		const auto remaining = state_->size - state_->logical_offset;
 		std::size_t request_size = 0;
-		if (remaining >= kFileIoAlignment) {
-			request_size = static_cast<std::size_t>(std::min<std::uint64_t>(round_down(remaining, kFileIoAlignment), state_->aligned_buffer_capacity));
+		if (remaining >= state_->io_alignment) {
+			request_size = static_cast<std::size_t>(std::min<std::uint64_t>(round_down(remaining, state_->io_alignment), state_->aligned_buffer_capacity));
 			if (request_size == 0) {
-				request_size = kFileIoAlignment;
+				request_size = state_->io_alignment;
 			}
 		} else {
-			request_size = kFileIoAlignment;
+			request_size = state_->io_alignment;
 		}
 
-		const auto bytes_read = read_exact_at(state_->handle, state_->aligned_buffer.get(), request_size, state_->logical_offset, state_->path);
+		const auto bytes_read = read_exact_at(state_->handle, state_->aligned_buffer.get(), request_size, state_->logical_offset, state_->display_path);
 		if (bytes_read == 0) {
 			break;
 		}

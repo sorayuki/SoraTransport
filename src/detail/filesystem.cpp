@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <malloc.h>
 #include <map>
 #include <stdexcept>
 #include <system_error>
@@ -16,9 +17,17 @@ std::uint64_t round_down(std::uint64_t value, std::size_t alignment) {
 	return value - (value % alignment);
 }
 
-std::size_t make_direct_request_size(std::size_t preferred_size) {
-	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, kFileIoAlignment));
-	return std::max<std::size_t>(kFileIoAlignment, aligned_size);
+std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t alignment) {
+	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, alignment));
+	return std::max<std::size_t>(alignment, aligned_size);
+}
+
+std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t alignment) {
+	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
+	if (pointer == nullptr) {
+		throw std::bad_alloc();
+	}
+	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
 }
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
@@ -145,6 +154,7 @@ struct FileReader::State {
 	std::uint64_t aligned_data_end = 0;
 	std::uint64_t next_issue_offset = 0;
 	std::size_t chunk_size = 0;
+	std::size_t io_alignment = kFileIoAlignment;
 	HANDLE handle = INVALID_HANDLE_VALUE;
 	FileIoMode io_mode = FileIoMode::Buffered;
 	bool tail_read_complete = false;
@@ -311,7 +321,10 @@ void FileReader::open() {
 		throw make_win32_error("failed to open input file: " + path_for_error());
 	}
 	state_->offset = 0;
-	state_->aligned_data_end = state_->io_mode == FileIoMode::Direct ? round_down(state_->size, kFileIoAlignment) : state_->size;
+	if (state_->io_mode == FileIoMode::Direct) {
+		state_->io_alignment = query_file_io_alignment(state_->path).required_alignment;
+	}
+	state_->aligned_data_end = state_->io_mode == FileIoMode::Direct ? round_down(state_->size, state_->io_alignment) : state_->size;
 	state_->next_issue_offset = 0;
 	state_->next_slot_to_issue = 0;
 	state_->next_slot_to_consume = 0;
@@ -340,9 +353,11 @@ void FileReader::open() {
 			state_->chunk_size,
 			state_->aligned_data_end - state_->next_issue_offset));
 		slot.requested_length = state_->io_mode == FileIoMode::Direct
-			? make_direct_request_size(request_limit)
+			? make_direct_request_size(request_limit, state_->io_alignment)
 			: request_limit;
-		slot.buffer = pool_.acquire(slot.requested_length);
+		slot.buffer = state_->io_mode == FileIoMode::Direct
+			? make_aligned_buffer(slot.requested_length, state_->io_alignment)
+			: pool_.acquire(slot.requested_length);
 		slot.overlapped = {};
 		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
 		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
@@ -404,9 +419,11 @@ DataChunk FileReader::read_next_chunk() {
 			state_->chunk_size,
 			state_->aligned_data_end - state_->next_issue_offset));
 		slot.requested_length = state_->io_mode == FileIoMode::Direct
-			? make_direct_request_size(request_limit)
+			? make_direct_request_size(request_limit, state_->io_alignment)
 			: request_limit;
-		slot.buffer = pool_.acquire(slot.requested_length);
+		slot.buffer = state_->io_mode == FileIoMode::Direct
+			? make_aligned_buffer(slot.requested_length, state_->io_alignment)
+			: pool_.acquire(slot.requested_length);
 		slot.overlapped = {};
 		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
 		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
@@ -448,8 +465,10 @@ DataChunk FileReader::read_next_chunk() {
 	}
 	if (state_->in_flight_reads == 0) {
 		if (state_->offset < state_->size && !state_->tail_read_complete) {
-			const auto tail_request_size = kFileIoAlignment;
-			auto buffer = pool_.acquire(tail_request_size);
+			const auto tail_request_size = state_->io_mode == FileIoMode::Direct ? state_->io_alignment : static_cast<std::size_t>(state_->size - state_->offset);
+			auto buffer = state_->io_mode == FileIoMode::Direct
+				? make_aligned_buffer(tail_request_size, state_->io_alignment)
+				: pool_.acquire(tail_request_size);
 			OVERLAPPED overlapped{};
 			overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
 			if (overlapped.hEvent == nullptr) {
