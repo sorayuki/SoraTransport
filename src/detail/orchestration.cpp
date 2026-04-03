@@ -10,6 +10,8 @@
 
 #include <stdexcept>
 
+namespace asio = boost::asio;
+
 namespace soratransport {
 
 namespace {
@@ -29,22 +31,22 @@ void join_and_capture(std::jthread& thread, PipelineState& state) {
 	}
 }
 
-boost::asio::awaitable<boost::asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port) {
-	auto executor = co_await boost::asio::this_coro::executor;
-	boost::asio::ip::tcp::resolver resolver(executor);
-	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), boost::asio::use_awaitable);
-	boost::asio::ip::tcp::socket socket(executor);
-	co_await boost::asio::async_connect(socket, endpoints, boost::asio::use_awaitable);
+asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port) {
+	auto executor = co_await asio::this_coro::executor;
+	asio::ip::tcp::resolver resolver(executor);
+	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::use_awaitable);
+	asio::ip::tcp::socket socket(executor);
+	co_await asio::async_connect(socket, endpoints, asio::use_awaitable);
 	co_return std::move(socket);
 }
 
-boost::asio::awaitable<boost::asio::ip::tcp::socket> accept_socket_async(std::uint16_t port) {
-	auto executor = co_await boost::asio::this_coro::executor;
-	boost::asio::ip::tcp::acceptor acceptor(executor, {boost::asio::ip::tcp::v4(), port});
-	co_return co_await acceptor.async_accept(boost::asio::use_awaitable);
+asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port) {
+	auto executor = co_await asio::this_coro::executor;
+	asio::ip::tcp::acceptor acceptor(executor, {asio::ip::tcp::v4(), port});
+	co_return co_await acceptor.async_accept(asio::use_awaitable);
 }
 
-boost::asio::awaitable<void> send_directory_task(
+asio::awaitable<void> send_directory_task(
 	const std::filesystem::path source_dir,
 	std::string host,
 	std::uint16_t port,
@@ -58,7 +60,7 @@ boost::asio::awaitable<void> send_directory_task(
 		BufferPool pool;
 		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
-		ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
+		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 		DirScanner scanner(executors);
 		FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
 		TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
@@ -114,7 +116,7 @@ boost::asio::awaitable<void> send_directory_task(
 	co_return;
 }
 
-boost::asio::awaitable<void> receive_directory_task(
+asio::awaitable<void> receive_directory_task(
 	std::uint16_t port,
 	const std::filesystem::path destination_dir,
 	std::exception_ptr* task_error) {
@@ -125,7 +127,7 @@ boost::asio::awaitable<void> receive_directory_task(
 
 		RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 		BufferPool pool;
-		ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
+		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 		PipelineState state;
 		TarUnpacker unpacker(destination_dir);
 
@@ -166,7 +168,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	BufferPool pool;
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth);
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
-	ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
+	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	DirScanner scanner(executors);
 	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
@@ -227,7 +229,7 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	auto config = make_runtime_config();
 	RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
 	BufferPool pool;
-	ConcurrentDataChunkChannel tar_queue(config.tar_queue_depth);
+	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	PipelineState state;
 	TarUnpacker unpacker(destination_dir);
 	FileByteSource source(input_file);
@@ -262,9 +264,9 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 }
 
 void send_directory(const std::filesystem::path& source_dir, std::string_view host, std::uint16_t port) {
-	boost::asio::io_context io_context;
+	asio::io_context io_context;
 	std::exception_ptr task_error;
-	boost::asio::co_spawn(io_context, send_directory_task(source_dir, std::string(host), port, &task_error), boost::asio::detached);
+	asio::co_spawn(io_context, send_directory_task(source_dir, std::string(host), port, &task_error), asio::detached);
 	io_context.run();
 	if (task_error) {
 		std::rethrow_exception(task_error);
@@ -272,9 +274,9 @@ void send_directory(const std::filesystem::path& source_dir, std::string_view ho
 }
 
 void receive_directory(std::uint16_t port, const std::filesystem::path& destination_dir) {
-	boost::asio::io_context io_context;
+	asio::io_context io_context;
 	std::exception_ptr task_error;
-	boost::asio::co_spawn(io_context, receive_directory_task(port, destination_dir, &task_error), boost::asio::detached);
+	asio::co_spawn(io_context, receive_directory_task(port, destination_dir, &task_error), asio::detached);
 	io_context.run();
 	if (task_error) {
 		std::rethrow_exception(task_error);
