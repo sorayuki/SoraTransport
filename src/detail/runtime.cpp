@@ -8,6 +8,8 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kSmallBufferSize = 4 * 1024;
+constexpr std::size_t kMediumBufferSize = 1024 * 1024;
+constexpr std::size_t kPipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
 constexpr std::size_t kMinTarQueueDepth = 16;
 constexpr std::size_t kMinReadConcurrencyDepth = 4;
@@ -82,7 +84,7 @@ std::size_t RuntimeExecutors::compression_threads() const {
 	return compression_threads_;
 }
 
-BufferPool::BufferPool() : buckets_{kSmallBufferSize, kLargeBufferSize} {}
+BufferPool::BufferPool() : buckets_{kSmallBufferSize, kMediumBufferSize, kPipelineBufferSize, kLargeBufferSize} {}
 
 BufferPool::~BufferPool() {
 	for (auto& [bucket_size, free_list] : free_lists_) {

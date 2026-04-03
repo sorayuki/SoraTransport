@@ -16,7 +16,7 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
@@ -62,7 +62,7 @@ asio::awaitable<void> send_directory_task(
 		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 		DirScanner scanner(executors);
-		FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
+		FileReaderOpener opener(executors, config.reader_threads, kPipelineChunkSize);
 		TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 		PipelineState state;
 
@@ -170,7 +170,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth);
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth);
 	DirScanner scanner(executors);
-	FileReaderOpener opener(pool, executors, config.reader_threads, kPipelineChunkSize);
+	FileReaderOpener opener(executors, config.reader_threads, kPipelineChunkSize);
 	TarPacker packer(pool, executors, kPipelineChunkSize, config.read_concurrency);
 	PipelineState state;
 

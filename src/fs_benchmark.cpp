@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
-constexpr std::size_t kReadChunkSize = 1024 * 1024;
+constexpr std::size_t kReadChunkSize = 4 * 1024 * 1024;
 
 std::string path_to_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
 		soratransport::DirScanner scanner(executors);
 		soratransport::BoundedQueue<soratransport::FileMeta> meta_queue(kMetaQueueDepth);
 		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(kOpenedQueueDepth);
-		soratransport::FileReaderOpener opener(pool, executors, config.reader_threads, kReadChunkSize);
+		soratransport::FileReaderOpener opener(executors, config.reader_threads, kReadChunkSize);
 
 		std::exception_ptr scanner_error;
 		std::exception_ptr opener_error;

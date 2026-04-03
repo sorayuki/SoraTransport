@@ -7,6 +7,8 @@
 
 namespace soratransport {
 
+struct FileByteSourceState;
+
 class IByteSink {
 public:
 	virtual ~IByteSink() = default;
@@ -33,10 +35,14 @@ private:
 class FileByteSource final : public IByteSource {
 public:
 	explicit FileByteSource(const std::filesystem::path& input_path);
+	~FileByteSource();
+	FileByteSource(const FileByteSource&) = delete;
+	FileByteSource& operator=(const FileByteSource&) = delete;
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
 
 private:
-	std::ifstream input_;
+	void close();
+	std::unique_ptr<FileByteSourceState> state_;
 };
 
 class SocketByteSink final : public IByteSink {

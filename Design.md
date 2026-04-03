@@ -1,6 +1,6 @@
 这是一份针对极速局域网文件夹传输系统与 fasttar 工具的当前架构设计文档。
 
-当前实现采用“协程控制平面 + 线程化流水线数据面”的方案。控制连接、监听和 socket 建立时使用 Boost.Asio 协程；目录扫描、文件打开、顺序读取、tar 打包、压缩等重负载阶段通过线程、阻塞队列和阻塞通道连接。设计目标仍然是高吞吐、低峰值内存和清晰的阶段边界，但实现已经从早期设想中的 mmap/乱序读模型收敛为更稳的顺序读取模型。
+当前实现采用“协程控制平面 + 线程化流水线数据面”的方案。控制连接、监听和 socket 建立时使用 Boost.Asio 协程；目录扫描、文件打开、顺序读取、tar 打包、压缩等重负载阶段通过线程、阻塞队列和阻塞通道连接。设计目标仍然是高吞吐、低峰值内存和清晰的阶段边界；当前普通文件 payload 采用顺序 `CreateFileMappingW + MapViewOfFile + PrefetchVirtualMemory` 路径，但仍然避免乱序分块读取。
 
 ## 1. 总体架构
 
@@ -74,7 +74,7 @@ FileByteSource / SocketByteSource
 
 这个阶段的存在是为了解决两个实际问题：
 
-- `std::ifstream::open()` 本身是阻塞操作，适合从主打包线程中拆出去
+- `CreateFileW` / `CreateFileMappingW` 本身是阻塞操作，适合从主打包线程中拆出去
 - 直接并发 open 太多文件会触发句柄压力，因此必须配合有界队列和顺序输出
 
 ### 2.3 FileReader
@@ -86,7 +86,7 @@ FileByteSource / SocketByteSource
 - `read_next_chunk()` 每次顺序读取一个块
 - 析构或 `close()` 时关闭文件
 
-当前实现不再使用内存映射、AIO 或乱序分块读取；它使用 `std::ifstream` 配合 `pubsetbuf()` 设置自定义缓冲区，并按调用方给定的块大小顺序读取。
+当前实现对普通文件使用只读 file mapping，并把每个顺序 chunk 的 `MapViewOfFile + PrefetchVirtualMemory` 派发到 reader 线程池执行。消费侧仍按调用方给定的块大小顺序前进，不做乱序分块读取。
 
 ### 2.4 TarPacker
 
@@ -140,7 +140,7 @@ FileByteSource / SocketByteSource
 
 ### 5.2 当前刻意放弃的复杂度
 
-- 不再使用 mmap 快路径
+- 不再对单文件做乱序并发的 mmap 读调度
 - 不再对单文件做乱序并发分块读取
 - 不再使用实验性 Boost `concurrent_channel`
 - 不再强行把所有阶段写成 coroutine-native stage

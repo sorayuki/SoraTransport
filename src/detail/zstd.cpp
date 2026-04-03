@@ -9,7 +9,7 @@ namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kPipelineChunkSize = 1024 * 1024;
+constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 
 } // namespace
 

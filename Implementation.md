@@ -119,7 +119,7 @@
 - `read_next_chunk()` 只按 offset 顺序前进
 - 关闭逻辑集中在 `close()` 和析构里
 
-当前不再使用 mmap、AIO 或乱序分块读取。
+当前普通文件读取使用 `CreateFileW + CreateFileMappingW` 建立只读映射，并通过固定数量的顺序 slot 在 reader 线程池里执行 `MapViewOfFile + PrefetchVirtualMemory`。主打包线程仍然只按 offset 顺序消费 chunk，不做乱序读取。
 
 ### 4.2 FileReaderOpener
 
@@ -133,14 +133,14 @@
 
 ### 4.3 缓冲区策略
 
-`FileReader` 构造时会接收一个 `buffer_size`，并将它用于 `std::ifstream::rdbuf()->pubsetbuf()`。
+`FileReader` 构造时会接收一个 `buffer_size`，并将它作为顺序读取的 chunk 大小。普通文件 payload 不再额外复制到独立用户态缓冲区，而是直接以映射视图的方式暴露给后续阶段。
 
 当前约定是：
 
 - `TarPacker` 路径使用 `kPipelineChunkSize`
 - `fs_benchmark` 路径使用 `kReadChunkSize`
 
-也就是说，用户态缓冲区大小会和实际 chunk 大小对齐，而不是固定写死为 1 MiB。
+也就是说，顺序文件读取、raw tar 读入和 zstd 解压产出的 chunk 现在统一对齐到 4 MiB，而不是固定写死为 1 MiB。
 
 ## 5. 并发与同步原语
 
@@ -230,7 +230,7 @@
 
 与最初的高阶设计相比，当前代码有以下关键变化：
 
-1. 文件读取已从 mmap/异步块读收敛为顺序 `std::ifstream`
+1. 文件读取重新采用了顺序 `mmap + prefetch` 模型，但仍然保持“单 reader 单文件、按 offset 顺序前进”的约束
 2. 新增了 `FileReaderOpener` 阶段，用于把 open 从主读取线程剥离出去
 3. `TarPacker` 不再承担并发读调度逻辑
 4. 通道实现已经完全项目内化，不再使用 Boost.Experimental channel
@@ -243,4 +243,4 @@
 1. `FileReader` 的生命周期现在和文件句柄生命周期严格绑定
 2. `OpenedQueue` 深度直接决定同时打开文件数
 3. `buffer_size` 与 chunk 大小绑定是当前性能调优前提之一
-4. 如果重新引入 mmap 或乱序读取，不应破坏“单 reader 单文件”的生命周期模型
+4. 如果继续调整 `MapViewOfFile` / `PrefetchVirtualMemory` 路径，不应破坏“单 reader 单文件”的生命周期模型
