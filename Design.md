@@ -81,7 +81,7 @@ FileByteSource / SocketByteSource
 - 输入是已经 open 的 `OpenedFileReader`
 - 输出是已经完成初始预读的 `OpenedFileReader`
 - 使用 `InFlightReadBudget` 控制预读占用的总内存预算
-- 当前预算只绑定预读启动阶段，对象送入下游后释放
+- 预算会跟随对象进入 `prefetched_queue (p/t)`，并在对象被 `TarPacker` 取出时立即释放
 
 ### 2.4 FileReader
 

@@ -69,6 +69,7 @@ void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataC
 		}
 
 		while (auto meta = in_meta.pop()) {
+			meta->read_budget_lease.reset();
 			add_entry(writer, *meta);
 		}
 

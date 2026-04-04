@@ -52,6 +52,50 @@ private:
 	std::condition_variable cv_;
 };
 
+class ReadBudgetLease {
+public:
+	ReadBudgetLease() = default;
+	ReadBudgetLease(std::shared_ptr<InFlightReadBudget> budget, std::size_t bytes)
+		: budget_(std::move(budget)), bytes_(bytes) {}
+	~ReadBudgetLease() {
+		reset();
+	}
+
+	ReadBudgetLease(const ReadBudgetLease&) = delete;
+	ReadBudgetLease& operator=(const ReadBudgetLease&) = delete;
+
+	ReadBudgetLease(ReadBudgetLease&& other) noexcept
+		: budget_(std::move(other.budget_)), bytes_(other.bytes_) {
+		other.bytes_ = 0;
+	}
+
+	ReadBudgetLease& operator=(ReadBudgetLease&& other) noexcept {
+		if (this != &other) {
+			reset();
+			budget_ = std::move(other.budget_);
+			bytes_ = other.bytes_;
+			other.bytes_ = 0;
+		}
+		return *this;
+	}
+
+	void reset() {
+		if (budget_ && bytes_ > 0) {
+			budget_->release(bytes_);
+		}
+		budget_.reset();
+		bytes_ = 0;
+	}
+
+	std::size_t bytes() const {
+		return bytes_;
+	}
+
+private:
+	std::shared_ptr<InFlightReadBudget> budget_;
+	std::size_t bytes_ = 0;
+};
+
 class FileReader {
 public:
 	FileReader(
@@ -86,6 +130,7 @@ private:
 struct OpenedFileReader {
 	FileMeta meta;
 	std::optional<FileReader> reader;
+	ReadBudgetLease read_budget_lease;
 };
 
 struct CompressionQueueTelemetry {

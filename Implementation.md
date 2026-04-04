@@ -139,12 +139,14 @@
 - 根据 `InFlightReadBudget` 申请预算
 - 调用 `reader.start_prefetch(max_bytes)`
 - 将完成初始预读的 reader 推给 `TarPacker`
-- 在对象送入下游后立即释放本阶段预算
+- 预算租约会随 `OpenedFileReader` 一起进入 `p/t` 队列
+- 对象一旦被 `TarPacker` 从 `p/t` 取出，就立刻释放预算
 
 这里需要特别注意：
 
-- 当前预算只保证“启动预读窗口时不会无限放大内存占用”
-- 预算并不持续绑定到 `TarPacker` 的整个消费周期
+- 当前预算直接约束 `p/t` 队列中的预读常驻内存
+- `TarPacker` 消费速度变慢时，背压会通过预算和队列容量共同限制新的预读对象进入 `p/t`
+- `TarPacker` 拿到对象后的文件读取与打包过程不再继续占用这部分预算
 
 ### 4.4 缓冲区策略
 

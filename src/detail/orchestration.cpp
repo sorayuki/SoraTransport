@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kMetaQueueDepth = 256;
-constexpr std::size_t kOpenedQueueDepth = 32;
+constexpr std::size_t kOpenedQueueDepth = 4;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
 

@@ -563,12 +563,12 @@ boost::asio::awaitable<void> FileReaderPrefetcher::prefetch(BoundedQueue<OpenedF
 					read_budget_->acquire(budget_bytes);
 					try {
 						opened_file->reader->start_prefetch(budget_bytes);
+						opened_file->read_budget_lease = ReadBudgetLease(read_budget_, budget_bytes);
 						co_await out_prefetched.async_push_await(std::move(*opened_file));
 					} catch (...) {
 						read_budget_->release(budget_bytes);
 						throw;
 					}
-					read_budget_->release(budget_bytes);
 					continue;
 				}
 			}
