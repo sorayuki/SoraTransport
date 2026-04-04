@@ -204,7 +204,8 @@
 - 压缩使用 `ZSTD_compressStream2()`
 - 解压使用 `ZSTD_decompressStream()`
 - 会尝试配置 `ZSTD_c_nbWorkers`
-- 自适应压缩级别仍然可用
+- 自适应压缩级别只在未指定 `-l <level>` 时启用
+- 一旦 CLI 解析到 `-l <level>`，运行时就把该值视为用户锁定值，压缩线程不得再自动升降档
 - `ZstdCompressor` 现在作为独立节点运行：`TarQueue -> ZstdQueue -> QueueWriter -> sink`
 - 当前自适应策略是：
 - 取上游数据时，如果发现 `t/z` 已满，就立即升档
@@ -251,6 +252,11 @@
 
 - `.tar` => `CompressionMode::None`
 - `.tar.zst` / `.tzst` / `.zst` => `CompressionMode::Zstd`
+
+补充约束：
+
+- `-l <level>` 只在 `CompressionMode::Zstd` 下有意义
+- `-l <level>` 表示固定压缩级别，不会触发或保留自适应调节
 
 ## 9. 当前默认参数
 

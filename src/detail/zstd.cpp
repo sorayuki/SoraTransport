@@ -49,6 +49,7 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 
 	const auto output_capacity = ZSTD_CStreamOutSize();
 	auto output_buffer = pool_.acquire(output_capacity);
+	const bool adaptive_enabled = queue_telemetry_ != nullptr;
 	bool pending_downstream_empty_check = false;
 	enum class AdjustmentDirection {
 		None,
@@ -67,6 +68,10 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 		}
 
 		const auto apply_level = [&](int requested_level, AdjustmentDirection direction, const char* reason, std::size_t upstream_size, std::size_t upstream_capacity, std::size_t downstream_size, std::size_t downstream_capacity) {
+			if (!adaptive_enabled) {
+				return;
+			}
+
 			const auto now = std::chrono::steady_clock::now();
 			if (last_adjustment_at != std::chrono::steady_clock::time_point::min() && now - last_adjustment_at < current_adjustment_cooldown) {
 				return;

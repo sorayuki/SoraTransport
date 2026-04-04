@@ -121,6 +121,7 @@ FileByteSource / SocketByteSource
 - `ZstdCompressor` 现在是独立节点：输入 `TarQueue`，输出 `ZstdQueue`
 - `ZstdDecompressor` 负责反向恢复 tar 数据流
 - 自适应压缩级别只绑定 `ZstdCompressor` 自身上下游队列状态
+- 只有未显式指定 `-l <level>` 时才允许自适应调节；一旦用户手动指定压缩级别，就必须固定使用该级别
 - 上游高压且下游低压时降档
 - 下游高压或上游低压时升档
 - 压缩工作会投递到共享线程池执行
@@ -210,6 +211,8 @@ FileByteSource / SocketByteSource
 - `fs_benchmark`
   - 默认扫描 `D:/dev/boost_1_90_0/dist`
   - 可选 `--read-files`，通过真实的 open + prefetch + consume 流水线验证读取性能
+
+其中 `-l <level>` 的语义是“显式锁定压缩级别”，不是“提供一个自适应起始值”。
 
 ## 8. 后续演进方向
 
