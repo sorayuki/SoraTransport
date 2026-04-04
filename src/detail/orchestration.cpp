@@ -176,6 +176,8 @@ asio::awaitable<void> send_directory_task(
 				packer.pack(opened_queue, tar_queue);
 			} catch (...) {
 				state.fail(std::current_exception());
+				meta_queue.close();
+				opened_queue.close();
 				tar_queue.close();
 			}
 		});
@@ -308,6 +310,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 			packer.pack(opened_queue, tar_queue, &uncompressed_bytes_processed);
 		} catch (...) {
 			state.fail(std::current_exception());
+			meta_queue.close();
+			opened_queue.close();
 			tar_queue.close();
 		}
 	});

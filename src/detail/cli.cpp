@@ -87,6 +87,34 @@ struct PackUnpackOptions {
 	std::vector<std::string_view> positional;
 };
 
+bool try_parse_runtime_option(RuntimeOptions& rt, std::string_view argument, int argc, char** argv, int& index) {
+	if (argument == "-r") {
+		++index;
+		if (index >= argc) {
+			throw std::runtime_error(std::string(argument) + " requires a value");
+		}
+		rt.max_in_flight_read_bytes = parse_mebibytes(argv[index], argument);
+		return true;
+	}
+	if (argument == "-w") {
+		++index;
+		if (index >= argc) {
+			throw std::runtime_error(std::string(argument) + " requires a value");
+		}
+		rt.max_in_flight_write_ops = parse_positive_count(argv[index], argument);
+		return true;
+	}
+	if (argument == "-l") {
+		++index;
+		if (index >= argc) {
+			throw std::runtime_error(std::string(argument) + " requires a value");
+		}
+		rt.compression_level = parse_compression_level(argv[index], argument);
+		return true;
+	}
+	return false;
+}
+
 PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg, bool allow_compression_mode) {
 	PackUnpackOptions options;
 	for (int index = first_arg; index < argc; ++index) {
@@ -99,28 +127,7 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 			options.compression_mode = parse_fasttar_mode_option(argument);
 			continue;
 		}
-		if (argument == "-r") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], argument);
-			continue;
-		}
-		if (argument == "-w") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], argument);
-			continue;
-		}
-		if (argument == "-l") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.compression_level = parse_compression_level(argv[index], argument);
+		if (try_parse_runtime_option(options.runtime_options, argument, argc, argv, index)) {
 			continue;
 		}
 		options.positional.push_back(argument);
@@ -137,28 +144,7 @@ SendOptions parse_send_options(int argc, char** argv, int first_arg) {
 	SendOptions options;
 	for (int index = first_arg; index < argc; ++index) {
 		const std::string_view argument = argv[index];
-		if (argument == "-r") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.max_in_flight_read_bytes = parse_mebibytes(argv[index], argument);
-			continue;
-		}
-		if (argument == "-w") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.max_in_flight_write_ops = parse_positive_count(argv[index], argument);
-			continue;
-		}
-		if (argument == "-l") {
-			++index;
-			if (index >= argc) {
-				throw std::runtime_error(std::string(argument) + " requires a value");
-			}
-			options.runtime_options.compression_level = parse_compression_level(argv[index], argument);
+		if (try_parse_runtime_option(options.runtime_options, argument, argc, argv, index)) {
 			continue;
 		}
 		options.positional.push_back(argument);
@@ -282,7 +268,9 @@ int run_fasttar_cli(int argc, char** argv) {
 			const auto mode = options.compression_mode.has_value()
 				? *options.compression_mode
 				: infer_fasttar_mode_from_path(output_path);
-			validate_fasttar_path_mode(output_path, mode, "pack");
+			if (!options.compression_mode.has_value()) {
+				validate_fasttar_path_mode(output_path, mode, "pack");
+			}
 			pack_directory_to_file(source_dir, output_path, mode, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
@@ -298,7 +286,9 @@ int run_fasttar_cli(int argc, char** argv) {
 			const auto mode = options.compression_mode.has_value()
 				? *options.compression_mode
 				: infer_fasttar_mode_from_path(input_path);
-			validate_fasttar_path_mode(input_path, mode, "unpack");
+			if (!options.compression_mode.has_value()) {
+				validate_fasttar_path_mode(input_path, mode, "unpack");
+			}
 			unpack_file_to_directory(input_path, destination_dir, mode, options.file_io_mode, options.runtime_options);
 			return 0;
 		}

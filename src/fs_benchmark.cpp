@@ -1,4 +1,5 @@
 #include "detail/internal.hpp"
+#include "detail/win32_util.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,16 +10,13 @@
 #include <string>
 #include <thread>
 
+using soratransport::path_to_utf8_string;
+
 namespace {
 
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
 constexpr std::size_t kReadChunkSize = 8 * 1024 * 1024;
-
-std::string path_to_utf8_string(const std::filesystem::path& path) {
-	auto utf8 = path.generic_u8string();
-	return {utf8.begin(), utf8.end()};
-}
 
 struct Options {
 	std::filesystem::path root = "D:/dev/boost_1_90_0/dist";

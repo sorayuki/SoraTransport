@@ -1,11 +1,10 @@
 #include "pipeline.hpp"
+#include "win32_util.hpp"
 
 #include <algorithm>
 #include <array>
-#include <malloc.h>
 #include <map>
 #include <stdexcept>
-#include <system_error>
 
 #include <windows.h>
 
@@ -15,31 +14,9 @@ namespace {
 
 constexpr std::size_t kOverlappedReadQueueDepth = 8;
 
-std::uint64_t round_down(std::uint64_t value, std::size_t alignment) {
-	return value - (value % alignment);
-}
-
 std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t alignment) {
 	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, alignment));
 	return std::max<std::size_t>(alignment, aligned_size);
-}
-
-std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t alignment) {
-	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
-	if (pointer == nullptr) {
-		throw std::bad_alloc();
-	}
-	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
-}
-
-std::string path_to_utf8_string(const std::filesystem::path& path) {
-	auto utf8 = path.generic_u8string();
-	return {utf8.begin(), utf8.end()};
-}
-
-std::string path_to_generic_utf8_string(const std::filesystem::path& path) {
-	auto utf8 = path.lexically_normal().generic_u8string();
-	return {utf8.begin(), utf8.end()};
 }
 
 class ConcurrentDirectoryWorkQueue {
@@ -133,71 +110,10 @@ std::size_t InFlightReadBudget::used_bytes() const {
 }
 
 struct FileReader::State {
-	struct ReadSlot {
-		std::shared_ptr<uint8_t> buffer;
-		OVERLAPPED overlapped{};
-		HANDLE event_handle = nullptr;
+	struct ReadSlot : OverlappedSlotBase {
 		std::uint64_t offset = 0;
 		std::size_t requested_length = 0;
 		std::size_t reserved_slot_bytes = 0;
-		bool in_flight = false;
-
-		ReadSlot() {
-			event_handle = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-			if (event_handle == nullptr) {
-				throw std::system_error(
-					static_cast<int>(::GetLastError()),
-					std::system_category(),
-					"failed to create file reader event");
-			}
-			overlapped.hEvent = event_handle;
-		}
-
-		~ReadSlot() {
-			if (event_handle != nullptr) {
-				::CloseHandle(event_handle);
-			}
-		}
-
-		ReadSlot(const ReadSlot&) = delete;
-		ReadSlot& operator=(const ReadSlot&) = delete;
-
-		ReadSlot(ReadSlot&& other) noexcept
-			: buffer(std::move(other.buffer)),
-			  overlapped(other.overlapped),
-			  event_handle(other.event_handle),
-			  offset(other.offset),
-			  requested_length(other.requested_length),
-			  in_flight(other.in_flight) {
-			other.overlapped = {};
-			other.event_handle = nullptr;
-			other.offset = 0;
-			other.requested_length = 0;
-			other.in_flight = false;
-			overlapped.hEvent = event_handle;
-		}
-
-		ReadSlot& operator=(ReadSlot&& other) noexcept {
-			if (this != &other) {
-				if (event_handle != nullptr) {
-					::CloseHandle(event_handle);
-				}
-				buffer = std::move(other.buffer);
-				overlapped = other.overlapped;
-				event_handle = other.event_handle;
-				offset = other.offset;
-				requested_length = other.requested_length;
-				in_flight = other.in_flight;
-
-				other.overlapped = {};
-				other.event_handle = nullptr;
-				other.offset = 0;
-				other.requested_length = 0;
-				other.in_flight = false;
-				overlapped.hEvent = event_handle;
-			}
-			return *this;
-		}
 	};
 
 	State(std::filesystem::path input_path, std::uint64_t input_size, FileIoMode input_mode)
@@ -221,14 +137,6 @@ struct FileReader::State {
 	std::size_t reserved_slot_bytes_total = 0;
 	bool prefetch_started = false;
 };
-
-namespace {
-
-std::runtime_error make_win32_error(const std::string& message) {
-	return std::runtime_error(message + ": " + std::system_category().message(static_cast<int>(::GetLastError())));
-}
-
-} // namespace
 
 DirScanner::DirScanner(RuntimeExecutors& executors) : executors_(executors) {}
 
@@ -356,11 +264,11 @@ void FileReader::close() {
 		::CloseHandle(state_->handle);
 		state_->handle = INVALID_HANDLE_VALUE;
 	}
-	if (read_budget_ && state_->prefetch_budget_limit != 0) {
-		read_budget_->release(state_->prefetch_budget_limit);
-		state_->prefetch_budget_limit = 0;
-		state_->reserved_slot_bytes_total = 0;
+	if (read_budget_ && state_->reserved_slot_bytes_total != 0) {
+		read_budget_->release(state_->reserved_slot_bytes_total);
 	}
+	state_->prefetch_budget_limit = 0;
+	state_->reserved_slot_bytes_total = 0;
 
 	state_.reset();
 }
@@ -410,14 +318,23 @@ bool FileReader::issue_next_read(bool wait_for_budget) {
 	auto& slot = state_->slots[slot_index];
 	slot.offset = state_->next_issue_offset;
 	slot.requested_length = request_length;
-	if (slot.reserved_slot_bytes == 0) {
-		if (state_->reserved_slot_bytes_total + slot.requested_length > state_->prefetch_budget_limit) {
-			slot.requested_length = 0;
-			slot.offset = 0;
-			return false;
+	if (wait_for_budget) {
+		if (slot.reserved_slot_bytes == 0) {
+			if (state_->reserved_slot_bytes_total + slot.requested_length > state_->prefetch_budget_limit) {
+				slot.requested_length = 0;
+				slot.offset = 0;
+				return false;
+			}
+			if (read_budget_) {
+				if (!read_budget_->try_acquire(slot.requested_length)) {
+					slot.requested_length = 0;
+					slot.offset = 0;
+					return false;
+				}
+			}
+			slot.reserved_slot_bytes = slot.requested_length;
+			state_->reserved_slot_bytes_total += slot.requested_length;
 		}
-		slot.reserved_slot_bytes = slot.requested_length;
-		state_->reserved_slot_bytes_total += slot.requested_length;
 	}
 
 	try {
@@ -466,16 +383,25 @@ void FileReader::prime_prefetch_window() {
 		return;
 	}
 
-	if (!issue_next_read(true)) {
-		return;
-	}
-
-	while (issue_next_read(false)) {
+	while (issue_next_read(true)) {
 	}
 }
 
 void FileReader::release_slot_budget(std::size_t slot_index) {
-	static_cast<void>(slot_index);
+	if (!state_) {
+		return;
+	}
+
+	auto& slot = state_->slots[slot_index];
+	if (slot.reserved_slot_bytes == 0) {
+		return;
+	}
+
+	if (read_budget_) {
+		read_budget_->release(slot.reserved_slot_bytes);
+	}
+	state_->reserved_slot_bytes_total -= std::min(state_->reserved_slot_bytes_total, slot.reserved_slot_bytes);
+	slot.reserved_slot_bytes = 0;
 }
 
 void FileReader::open() {
@@ -533,9 +459,6 @@ void FileReader::reserve_prefetch_budget(std::size_t bytes) {
 	}
 	if (bytes == 0) {
 		return;
-	}
-	if (read_budget_) {
-		read_budget_->acquire(bytes);
 	}
 	state_->prefetch_budget_limit = bytes;
 }
@@ -647,11 +570,11 @@ DataChunk FileReader::read_next_chunk() {
 	auto read_offset = slot.offset;
 	slot.requested_length = 0;
 	slot.offset = 0;
+	release_slot_budget(consumed_slot_index);
 
 	if (state_->offset < state_->size) {
 		issue_next_read(false);
 	}
-	release_slot_budget(consumed_slot_index);
 
 	return DataChunk{std::move(data), bytes_read, read_offset, state_->offset >= state_->size};
 }

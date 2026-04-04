@@ -1,4 +1,5 @@
 #include "io.hpp"
+#include "win32_util.hpp"
 
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -8,12 +9,9 @@
 #include <cwchar>
 #include <deque>
 #include <limits>
-#include <malloc.h>
 #include <stdexcept>
-#include <system_error>
 #include <vector>
 
-#include <windows.h>
 #include <winioctl.h>
 
 namespace soratransport {
@@ -22,44 +20,6 @@ namespace {
 
 constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kBufferedWriteBatchSize = 32 * 1024 * 1024;
-
-std::string path_to_utf8_string(const std::filesystem::path& path) {
-	auto utf8 = path.generic_u8string();
-	return {utf8.begin(), utf8.end()};
-}
-
-std::runtime_error make_win32_error(const std::string& message, DWORD error = ::GetLastError()) {
-	return std::runtime_error(message + ": " + std::system_category().message(static_cast<int>(error)));
-}
-
-std::uint64_t round_down(std::uint64_t value, std::size_t alignment) {
-	return value - (value % alignment);
-}
-
-std::uint64_t round_up(std::uint64_t value, std::size_t alignment) {
-	if (value == 0) {
-		return 0;
-	}
-	const auto remainder = value % alignment;
-	return remainder == 0 ? value : value + (alignment - remainder);
-}
-
-bool is_aligned(const void* pointer, std::size_t alignment) {
-	return (reinterpret_cast<std::uintptr_t>(pointer) % alignment) == 0;
-}
-
-std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t alignment) {
-	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
-	if (pointer == nullptr) {
-		throw std::bad_alloc();
-	}
-	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
-}
-
-std::shared_ptr<uint8_t> make_heap_buffer(std::size_t size) {
-	auto* pointer = new uint8_t[size];
-	return {pointer, [](uint8_t* value) { delete[] value; }};
-}
 
 std::wstring make_volume_device_path(const std::filesystem::path& path) {
 	const auto absolute_path = std::filesystem::absolute(path);
@@ -159,6 +119,19 @@ void set_file_size(HANDLE handle, std::uint64_t size, const std::string& path) {
 	}
 }
 
+void flush_file_buffers_if_supported(HANDLE handle, const std::string& path, std::string_view action) {
+	if (::FlushFileBuffers(handle)) {
+		return;
+	}
+
+	const auto error = ::GetLastError();
+	if (error == ERROR_INVALID_FUNCTION && ::GetFileType(handle) != FILE_TYPE_DISK) {
+		return;
+	}
+
+	throw make_win32_error(std::string(action) + ": " + path, error);
+}
+
 void resize_file_buffered(const std::filesystem::path& path, std::uint64_t size) {
 	const auto handle = ::CreateFileW(
 		path.c_str(),
@@ -173,9 +146,7 @@ void resize_file_buffered(const std::filesystem::path& path, std::uint64_t size)
 	}
 	try {
 		set_file_size(handle, size, path_to_utf8_string(path));
-		if (!::FlushFileBuffers(handle)) {
-			throw make_win32_error("failed to flush resized output file: " + path_to_utf8_string(path));
-		}
+		flush_file_buffers_if_supported(handle, path_to_utf8_string(path), "failed to flush resized output file");
 		::CloseHandle(handle);
 	} catch (...) {
 		::CloseHandle(handle);
@@ -245,67 +216,9 @@ FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path) {
 }
 
 struct FileByteSink::State {
-	struct WriteSlot {
-		std::shared_ptr<uint8_t> buffer;
-		OVERLAPPED overlapped{};
-		HANDLE event_handle = nullptr;
+	struct WriteSlot : OverlappedSlotBase {
 		std::size_t size = 0;
 		std::uint64_t offset = 0;
-		bool in_flight = false;
-
-		WriteSlot() {
-			event_handle = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-			if (event_handle == nullptr) {
-				throw make_win32_error("failed to create file write event");
-			}
-			overlapped.hEvent = event_handle;
-		}
-
-		~WriteSlot() {
-			if (event_handle != nullptr) {
-				::CloseHandle(event_handle);
-			}
-		}
-
-		WriteSlot(const WriteSlot&) = delete;
-		WriteSlot& operator=(const WriteSlot&) = delete;
-
-		WriteSlot(WriteSlot&& other) noexcept
-			: buffer(std::move(other.buffer)),
-			  overlapped(other.overlapped),
-			  event_handle(other.event_handle),
-			  size(other.size),
-			  offset(other.offset),
-			  in_flight(other.in_flight) {
-			other.overlapped = {};
-			other.event_handle = nullptr;
-			other.size = 0;
-			other.offset = 0;
-			other.in_flight = false;
-			overlapped.hEvent = event_handle;
-		}
-
-		WriteSlot& operator=(WriteSlot&& other) noexcept {
-			if (this != &other) {
-				if (event_handle != nullptr) {
-					::CloseHandle(event_handle);
-				}
-				buffer = std::move(other.buffer);
-				overlapped = other.overlapped;
-				event_handle = other.event_handle;
-				size = other.size;
-				offset = other.offset;
-				in_flight = other.in_flight;
-
-				other.overlapped = {};
-				other.event_handle = nullptr;
-				other.size = 0;
-				other.offset = 0;
-				other.in_flight = false;
-				overlapped.hEvent = event_handle;
-			}
-			return *this;
-		}
 	};
 
 	HANDLE handle = INVALID_HANDLE_VALUE;
@@ -492,11 +405,12 @@ void FileByteSink::close() {
 	submit_active_write(true);
 	wait_for_all_writes();
 	state_->closed = true;
-	if (!::FlushFileBuffers(state_->handle)) {
-		const auto error = ::GetLastError();
+	try {
+		flush_file_buffers_if_supported(state_->handle, state_->display_path, "failed to flush output file");
+	} catch (...) {
 		::CloseHandle(state_->handle);
 		state_->handle = INVALID_HANDLE_VALUE;
-		throw make_win32_error("failed to flush output file: " + state_->display_path, error);
+		throw;
 	}
 	if (!::CloseHandle(state_->handle)) {
 		state_->handle = INVALID_HANDLE_VALUE;

@@ -14,7 +14,7 @@ constexpr std::size_t kMediumBufferSize = 256 * 1024;
 constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
 constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
-constexpr std::size_t kTargetInFlightReadBytes = 192 * 1024 * 1024;
+constexpr std::size_t kTargetInFlightReadBytes = 128 * 1024 * 1024;
 constexpr std::size_t kDefaultMaxInFlightWriteOps = 1;
 
 std::size_t hardware_threads() {
