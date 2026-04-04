@@ -13,6 +13,7 @@ struct RuntimeOptions {
 	std::optional<std::size_t> max_in_flight_read_bytes;
 	std::optional<std::size_t> max_in_flight_write_ops;
 	std::optional<int> compression_level;
+	bool log_adaptive_compression = false;
 };
 
 struct QueueTelemetrySample {
@@ -134,20 +135,15 @@ struct OpenedFileReader {
 };
 
 struct CompressionQueueTelemetry {
-	const BoundedQueue<FileMeta>* meta_queue = nullptr;
-	const BoundedQueue<OpenedFileReader>* opened_queue = nullptr;
-	const BoundedQueue<DataChunk>* tar_queue = nullptr;
+	const BoundedQueue<DataChunk>* upstream_queue = nullptr;
+	const BoundedQueue<DataChunk>* downstream_queue = nullptr;
 
-	QueueTelemetrySample meta() const {
-		return meta_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{meta_queue->size(), meta_queue->capacity()};
+	QueueTelemetrySample upstream() const {
+		return upstream_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{upstream_queue->size(), upstream_queue->capacity()};
 	}
 
-	QueueTelemetrySample opened() const {
-		return opened_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{opened_queue->size(), opened_queue->capacity()};
-	}
-
-	QueueTelemetrySample tar() const {
-		return tar_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{tar_queue->size(), tar_queue->capacity()};
+	QueueTelemetrySample downstream() const {
+		return downstream_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{downstream_queue->size(), downstream_queue->capacity()};
 	}
 };
 
@@ -219,17 +215,19 @@ public:
 		RuntimeExecutors& executors,
 		int compression_level,
 		const CompressionQueueTelemetry* queue_telemetry = nullptr,
-		std::atomic<int>* active_level = nullptr);
-	void compress(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
+		std::atomic<int>* active_level = nullptr,
+		bool log_adaptive_decisions = false);
+	void compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd);
 
 private:
-	void compress_sync(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
+	void compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd);
 
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;
 	int compression_level_;
 	const CompressionQueueTelemetry* queue_telemetry_;
 	std::atomic<int>* active_level_;
+	bool log_adaptive_decisions_ = false;
 };
 
 class ZstdDecompressor {
@@ -244,6 +242,11 @@ private:
 class RawTarWriter {
 public:
 	void write(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
+};
+
+class QueueWriter {
+public:
+	void write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink);
 };
 
 class RawTarReader {

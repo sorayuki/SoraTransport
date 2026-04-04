@@ -51,17 +51,28 @@ std::string queue_usage(std::string_view name, std::size_t size, std::size_t cap
 	return out.str();
 }
 
-void print_pack_progress_legend() {
+void print_pack_progress_legend(CompressionMode mode) {
 	std::cerr
 		<< "progress legend (pack):\n"
-		<< "  rate: uncompressed tar stream throughput per second\n"
-		<< "  q{s/o o/p p/t t/s}: queue usage current/capacity\n"
-		<< "    s/o = scanner -> opener\n"
-		<< "    o/p = opener -> prefetcher\n"
-		<< "    p/t = prefetcher -> tar packer\n"
-		<< "    t/s = tar -> sink(compressor/file writer)\n"
-		<< "  lvl: active zstd compression level\n"
-		<< "  rb: in-flight file read budget used/limit\n";
+		<< "  rate: uncompressed tar stream throughput per second\n";
+	if (mode == CompressionMode::Zstd) {
+		std::cerr
+			<< "  q{s/o o/p p/t t/z z/s}: queue usage current/capacity\n"
+			<< "    s/o = scanner -> opener\n"
+			<< "    o/p = opener -> prefetcher\n"
+			<< "    p/t = prefetcher -> tar packer\n"
+			<< "    t/z = tar packer -> zstd compressor\n"
+			<< "    z/s = zstd compressor -> sink writer\n"
+			<< "  lvl: active zstd compression level\n";
+	} else {
+		std::cerr
+			<< "  q{s/o o/p p/t t/s}: queue usage current/capacity\n"
+			<< "    s/o = scanner -> opener\n"
+			<< "    o/p = opener -> prefetcher\n"
+			<< "    p/t = prefetcher -> tar packer\n"
+			<< "    t/s = tar packer -> sink writer\n";
+	}
+	std::cerr << "  rb: in-flight file read budget used/limit\n";
 }
 
 void print_unpack_progress_legend() {
@@ -145,7 +156,8 @@ asio::awaitable<void> listen_directory_task(
 		BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth, executors.executor());
 		BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
-		CompressionQueueTelemetry compression_telemetry{&meta_queue, &opened_queue, &tar_queue};
+		BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
+		CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
 		DirScanner scanner(executors);
 		FileReaderOpener opener(pool, executors, config.worker_threads, kPipelineChunkSize);
 		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize);
@@ -165,6 +177,7 @@ asio::awaitable<void> listen_directory_task(
 				opened_queue.close();
 				prefetched_queue.close();
 				tar_queue.close();
+				zstd_queue.close();
 			}
 		});
 
@@ -174,11 +187,25 @@ asio::awaitable<void> listen_directory_task(
 					pool,
 					executors,
 					compression_level,
-					enable_adaptive_compression ? &compression_telemetry : nullptr);
-				compressor.compress(tar_queue, sink);
+					enable_adaptive_compression ? &compression_telemetry : nullptr,
+					nullptr,
+					options.log_adaptive_compression);
+				compressor.compress(tar_queue, zstd_queue);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
+				zstd_queue.close();
+			}
+		});
+
+		std::jthread sink_thread([&] {
+			try {
+				QueueWriter writer;
+				writer.write(zstd_queue, sink);
+			} catch (...) {
+				state.fail(std::current_exception());
+				tar_queue.close();
+				zstd_queue.close();
 			}
 		});
 
@@ -192,9 +219,11 @@ asio::awaitable<void> listen_directory_task(
 			opened_queue.close();
 			prefetched_queue.close();
 			tar_queue.close();
+			zstd_queue.close();
 		}
 		join_and_capture(sender_thread, state);
 		join_and_capture(compressor_thread, state);
+		join_and_capture(sink_thread, state);
 		state.rethrow_if_failed();
 	} catch (...) {
 		*task_error = std::current_exception();
@@ -261,7 +290,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	BoundedQueue<OpenedFileReader> opened_queue(kOpenedQueueDepth, executors.executor());
 	BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
-	CompressionQueueTelemetry compression_telemetry{&meta_queue, &opened_queue, &tar_queue};
+	BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
+	CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
 	DirScanner scanner(executors);
 	FileReaderOpener opener(pool, executors, config.worker_threads, kPipelineChunkSize, file_io_mode);
 	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, file_io_mode);
@@ -269,7 +299,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	PipelineState state;
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<int> active_compression_level{compression_level};
-	print_pack_progress_legend();
+	print_pack_progress_legend(mode);
 
 	auto progress_thread = start_progress_thread(
 		[&](std::uint64_t bytes_per_second) {
@@ -277,9 +307,16 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 			out << "[pack] " << format_rate(bytes_per_second)
 				<< " q{" << queue_usage("s/o", meta_queue.size(), meta_queue.capacity())
 				<< ' ' << queue_usage("o/p", opened_queue.size(), opened_queue.capacity())
-				<< ' ' << queue_usage("p/t", prefetched_queue.size(), prefetched_queue.capacity())
-				<< ' ' << queue_usage("t/s", tar_queue.size(), tar_queue.capacity()) << '}'
-				<< " lvl=" << active_compression_level.load(std::memory_order_relaxed)
+				<< ' ' << queue_usage("p/t", prefetched_queue.size(), prefetched_queue.capacity());
+			if (mode == CompressionMode::Zstd) {
+				out << ' ' << queue_usage("t/z", tar_queue.size(), tar_queue.capacity())
+					<< ' ' << queue_usage("z/s", zstd_queue.size(), zstd_queue.capacity())
+					<< '}'
+					<< " lvl=" << active_compression_level.load(std::memory_order_relaxed);
+			} else {
+				out << ' ' << queue_usage("t/s", tar_queue.size(), tar_queue.capacity()) << '}';
+			}
+			out
 				<< " rb=" << format_scaled_bytes(read_budget->used_bytes(), "")
 				<< '/' << format_scaled_bytes(read_budget->max_bytes(), "");
 			return out.str();
@@ -300,10 +337,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 			opened_queue.close();
 			prefetched_queue.close();
 			tar_queue.close();
+			zstd_queue.close();
 		}
 	});
 
-	std::jthread sink_thread([&] {
+	std::jthread compression_thread([&] {
 		try {
 			if (mode == CompressionMode::Zstd) {
 				ZstdCompressor compressor(
@@ -311,15 +349,31 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 					executors,
 					compression_level,
 					enable_adaptive_compression ? &compression_telemetry : nullptr,
-					&active_compression_level);
-				compressor.compress(tar_queue, sink);
+					&active_compression_level,
+					options.log_adaptive_compression);
+				compressor.compress(tar_queue, zstd_queue);
 			} else {
-				RawTarWriter writer;
+				QueueWriter writer;
 				writer.write(tar_queue, sink);
 			}
 		} catch (...) {
 			state.fail(std::current_exception());
 			tar_queue.close();
+			zstd_queue.close();
+		}
+	});
+
+	std::jthread sink_thread([&] {
+		if (mode != CompressionMode::Zstd) {
+			return;
+		}
+		try {
+			QueueWriter writer;
+			writer.write(zstd_queue, sink);
+		} catch (...) {
+			state.fail(std::current_exception());
+			tar_queue.close();
+			zstd_queue.close();
 		}
 	});
 
@@ -333,8 +387,10 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 		opened_queue.close();
 		prefetched_queue.close();
 		tar_queue.close();
+		zstd_queue.close();
 	}
 	join_and_capture(writer_thread, state);
+	join_and_capture(compression_thread, state);
 	join_and_capture(sink_thread, state);
 	progress_thread.request_stop();
 	if (progress_thread.joinable()) {

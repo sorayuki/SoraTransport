@@ -38,6 +38,12 @@
     ├── (5a) RawTarWriter
     │
     └── (5b) ZstdCompressor
+              │  独立压缩节点
+              ▼
+         [ZstdQueue]
+              │
+              ▼
+         QueueWriter
               │
               ▼
          FileByteSink / SocketByteSink
@@ -112,8 +118,11 @@ FileByteSource / SocketByteSource
 ### 2.6 ZstdCompressor / ZstdDecompressor
 
 - `ZstdCompressor` 负责将 tar 数据流转成 zstd 数据流
+- `ZstdCompressor` 现在是独立节点：输入 `TarQueue`，输出 `ZstdQueue`
 - `ZstdDecompressor` 负责反向恢复 tar 数据流
-- 压缩仍可根据队列填充率做自适应级别调节
+- 自适应压缩级别只绑定 `ZstdCompressor` 自身上下游队列状态
+- 上游高压且下游低压时降档
+- 下游高压或上游低压时升档
 - 压缩工作会投递到共享线程池执行
 
 ### 2.7 TarUnpacker

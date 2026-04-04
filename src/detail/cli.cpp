@@ -88,6 +88,10 @@ struct PackUnpackOptions {
 };
 
 bool try_parse_runtime_option(RuntimeOptions& rt, std::string_view argument, int argc, char** argv, int& index) {
+	if (argument == "--log-adaptive") {
+		rt.log_adaptive_compression = true;
+		return true;
+	}
 	if (argument == "-r") {
 		++index;
 		if (index >= argc) {
@@ -175,7 +179,7 @@ void print_soratransport_usage() {
 		<< "Usage:\n"
 		<< "  soratransport pack [-d|-b] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>\n"
 		<< "  soratransport unpack [-d|-b] [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport listen [-r <MiB>] [-l <level>] <source-dir> <port>\n"
+		<< "  soratransport listen [-r <MiB>] [-l <level>] [--log-adaptive] <source-dir> <port>\n"
 		<< "  soratransport receive <host> <port> <destination-dir>\n"
 		<< "\n"
 		<< "Options:\n"
@@ -183,7 +187,8 @@ void print_soratransport_usage() {
 		<< "  -b          Use buffered I/O for file reads\n"
 		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
 		<< "  -w <count>  Max in-flight output write operations\n"
-		<< "  -l <level>  Zstd compression level, range -131072..22\n";
+		<< "  -l <level>  Zstd compression level, range -131072..22\n"
+		<< "  --log-adaptive  Print adaptive compression decisions\n";
 }
 void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode, std::string_view verb) {
 	const auto is_zstd_path = ends_with(path_text, ".tar.zst") || ends_with(path_text, ".tzst") || ends_with(path_text, ".zst");
@@ -198,7 +203,7 @@ void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode
 void print_fasttar_usage() {
 	std::cerr
 		<< "Usage:\n"
-		<< "  fasttar pack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar|output.tar.zst>\n"
+		<< "  fasttar pack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] [-l <level>] [--log-adaptive] <source-dir> <output.tar|output.tar.zst>\n"
 		<< "  fasttar unpack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] <input.tar|input.tar.zst> <destination-dir>\n"
 		<< "\n"
 		<< "Options:\n"
@@ -208,7 +213,8 @@ void print_fasttar_usage() {
 		<< "  -n          Disable compression and use raw tar\n"
 		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
 		<< "  -w <count>  Max in-flight output write operations\n"
-		<< "  -l <level>  Zstd compression level, range -131072..22\n";
+		<< "  -l <level>  Zstd compression level, range -131072..22\n"
+		<< "  --log-adaptive  Print adaptive compression decisions\n";
 }
 
 } // namespace
