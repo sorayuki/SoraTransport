@@ -49,8 +49,8 @@ std::filesystem::path normalize_relative_path(const std::filesystem::path& input
 
 } // namespace
 
-TarPacker::TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency)
-	: pool_(pool), executors_(executors), chunk_size_(chunk_size), read_concurrency_(std::max<std::size_t>(1, read_concurrency)) {}
+TarPacker::TarPacker(BufferPool& pool, std::size_t chunk_size)
+	: pool_(pool), chunk_size_(chunk_size) {}
 
 void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter) {
 	TarWriteContext context{&out_tar, &pool_, 0, uncompressed_bytes_counter};

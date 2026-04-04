@@ -2,6 +2,8 @@
 #include "detail/win32_util.hpp"
 
 #include <algorithm>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/use_future.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
@@ -16,6 +18,7 @@ namespace {
 
 constexpr std::size_t kMetaQueueDepth = 1024;
 constexpr std::size_t kOpenedQueueDepth = 64;
+constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr std::size_t kReadChunkSize = 8 * 1024 * 1024;
 
 struct Options {
@@ -78,44 +81,30 @@ int main(int argc, char** argv) {
 		}
 
 		auto config = soratransport::make_runtime_config();
-		soratransport::RuntimeExecutors executors(config.scanner_threads, config.reader_threads, config.compression_threads);
+		soratransport::RuntimeExecutors executors(config.worker_threads);
 		soratransport::BufferPool pool;
 		auto read_budget = std::make_shared<soratransport::InFlightReadBudget>(config.max_in_flight_read_bytes);
 		soratransport::DirScanner scanner(executors);
-		soratransport::BoundedQueue<soratransport::FileMeta> meta_queue(kMetaQueueDepth);
-		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(kOpenedQueueDepth);
-		soratransport::FileReaderOpener opener(pool, executors, config.reader_threads, read_budget, kReadChunkSize);
+		soratransport::BoundedQueue<soratransport::FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
+		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(kOpenedQueueDepth, executors.executor());
+		soratransport::BoundedQueue<soratransport::OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
+		soratransport::FileReaderOpener opener(pool, executors, config.worker_threads, kReadChunkSize);
+		soratransport::FileReaderPrefetcher prefetcher(executors, read_budget, kReadChunkSize);
 
-		std::exception_ptr scanner_error;
-		std::exception_ptr opener_error;
 		std::uint64_t file_count = 0;
 		std::uint64_t bytes_read = 0;
 		auto start = std::chrono::steady_clock::now();
 
-		std::jthread scanner_thread([&] {
-			try {
-				scanner.scan(root, meta_queue);
-			} catch (...) {
-				scanner_error = std::current_exception();
-				meta_queue.close();
-			}
-		});
-
-		std::optional<std::jthread> opener_thread;
+		auto scanner_future = boost::asio::co_spawn(executors.executor(), scanner.scan(root, meta_queue), boost::asio::use_future);
+		std::optional<std::future<void>> opener_future;
+		std::optional<std::future<void>> prefetch_future;
 		if (options.read_files) {
-			opener_thread.emplace([&] {
-				try {
-					opener.open(meta_queue, opened_queue);
-				} catch (...) {
-					opener_error = std::current_exception();
-					meta_queue.close();
-					opened_queue.close();
-				}
-			});
+			opener_future.emplace(boost::asio::co_spawn(executors.executor(), opener.open(meta_queue, opened_queue), boost::asio::use_future));
+			prefetch_future.emplace(boost::asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), boost::asio::use_future));
 		}
 
 		if (options.read_files) {
-			while (auto opened = opened_queue.pop()) {
+			while (auto opened = prefetched_queue.pop()) {
 				if (!std::filesystem::is_regular_file(opened->meta.status)) {
 					continue;
 				}
@@ -136,22 +125,17 @@ int main(int argc, char** argv) {
 			}
 		}
 
-		if (scanner_thread.joinable()) {
-			scanner_thread.join();
+		scanner_future.get();
+		if (opener_future.has_value()) {
+			opener_future->get();
 		}
-		if (opener_thread.has_value() && opener_thread->joinable()) {
-			opener_thread->join();
+		if (prefetch_future.has_value()) {
+			prefetch_future->get();
 		}
 
 		auto end = std::chrono::steady_clock::now();
 		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-		if (scanner_error) {
-			std::rethrow_exception(scanner_error);
-		}
-		if (opener_error) {
-			std::rethrow_exception(opener_error);
-		}
 		std::cout << "Root: " << path_to_utf8_string(root) << '\n';
 		std::cout << "Read files: " << (options.read_files ? "enabled" : "disabled") << '\n';
 		std::cout << "Files visited: " << file_count << '\n';

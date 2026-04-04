@@ -19,7 +19,7 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
-constexpr std::size_t kBufferedWriteBatchSize = 32 * 1024 * 1024;
+constexpr std::size_t kBufferedWriteBatchSize = 8 * 1024 * 1024;
 
 std::wstring make_volume_device_path(const std::filesystem::path& path) {
 	const auto absolute_path = std::filesystem::absolute(path);
@@ -251,7 +251,7 @@ struct FileByteSource::State {
 	std::size_t aligned_buffer_offset = 0;
 };
 
-FileByteSink::FileByteSink(const std::filesystem::path& output_path, FileIoMode mode, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
+FileByteSink::FileByteSink(const std::filesystem::path& output_path, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
 	state_->path = output_path;
 	state_->display_path = path_to_utf8_string(output_path);
 	state_->mode = FileIoMode::Buffered;

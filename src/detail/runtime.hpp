@@ -30,40 +30,26 @@ private:
 
 class RuntimeExecutors {
 public:
-	RuntimeExecutors(std::size_t scanner_threads, std::size_t reader_threads, std::size_t compression_threads);
+	explicit RuntimeExecutors(std::size_t thread_count);
 	~RuntimeExecutors();
 
 	template <typename Fn>
-	auto post_reader(Fn&& fn) -> std::future<std::invoke_result_t<Fn>>;
+	auto post(Fn&& fn) -> std::future<std::invoke_result_t<Fn>>;
 
-	template <typename Fn>
-	auto post_compression(Fn&& fn) -> std::future<std::invoke_result_t<Fn>>;
-
-	std::size_t scanner_threads() const;
-	std::size_t compression_threads() const;
+	std::size_t thread_count() const;
+	boost::asio::any_io_executor executor();
 
 private:
-	std::size_t scanner_threads_;
-	std::size_t compression_threads_;
-	boost::asio::thread_pool reader_pool_;
-	boost::asio::thread_pool compression_pool_;
+	std::size_t thread_count_;
+	boost::asio::thread_pool pool_;
 };
 
 template <typename Fn>
-auto RuntimeExecutors::post_reader(Fn&& fn) -> std::future<std::invoke_result_t<Fn>> {
+auto RuntimeExecutors::post(Fn&& fn) -> std::future<std::invoke_result_t<Fn>> {
 	using Result = std::invoke_result_t<Fn>;
 	auto task = std::make_shared<std::packaged_task<Result()>>(std::forward<Fn>(fn));
 	auto future = task->get_future();
-	boost::asio::post(reader_pool_, [task] { (*task)(); });
-	return future;
-}
-
-template <typename Fn>
-auto RuntimeExecutors::post_compression(Fn&& fn) -> std::future<std::invoke_result_t<Fn>> {
-	using Result = std::invoke_result_t<Fn>;
-	auto task = std::make_shared<std::packaged_task<Result()>>(std::forward<Fn>(fn));
-	auto future = task->get_future();
-	boost::asio::post(compression_pool_, [task] { (*task)(); });
+	boost::asio::post(pool_, [task] { (*task)(); });
 	return future;
 }
 

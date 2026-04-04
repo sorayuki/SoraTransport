@@ -30,7 +30,7 @@ struct QueueTelemetrySample {
 class DirScanner {
 public:
 	explicit DirScanner(RuntimeExecutors& executors);
-	void scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const;
+	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const;
 
 private:
 	RuntimeExecutors& executors_;
@@ -56,7 +56,6 @@ class FileReader {
 public:
 	FileReader(
 		BufferPool& pool,
-		std::shared_ptr<InFlightReadBudget> read_budget,
 		const std::filesystem::path& path,
 		std::uint64_t size,
 		std::size_t buffer_size,
@@ -67,8 +66,7 @@ public:
 	FileReader(FileReader&& other);
 	FileReader& operator=(FileReader&& other);
 	void open();
-	void reserve_prefetch_budget(std::size_t bytes);
-	void start_prefetch();
+	void start_prefetch(std::size_t max_bytes);
 	DataChunk read_next_chunk();
 	std::uint64_t offset() const;
 	bool eof() const;
@@ -76,14 +74,12 @@ public:
 
 private:
 	struct State;
-	bool issue_next_read(bool wait_for_budget);
-	void prime_prefetch_window();
-	void release_slot_budget(std::size_t slot_index);
+	bool issue_next_read();
+	void prime_prefetch_window(std::size_t max_bytes);
 	void close();
 	std::string path_for_error() const;
 
 	BufferPool& pool_;
-	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::unique_ptr<State> state_;
 };
 
@@ -116,23 +112,37 @@ public:
 		BufferPool& pool,
 		RuntimeExecutors& executors,
 		std::size_t submit_concurrency,
-		std::shared_ptr<InFlightReadBudget> read_budget,
 		std::size_t buffer_size,
 		FileIoMode io_mode = FileIoMode::Buffered);
-	void open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
+	boost::asio::awaitable<void> open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 
 private:
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;
 	std::size_t submit_concurrency_;
-	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::size_t buffer_size_;
+	FileIoMode io_mode_;
+};
+
+class FileReaderPrefetcher {
+public:
+	FileReaderPrefetcher(
+		RuntimeExecutors& executors,
+		std::shared_ptr<InFlightReadBudget> read_budget,
+		std::size_t prefetch_bytes,
+		FileIoMode io_mode = FileIoMode::Buffered);
+	boost::asio::awaitable<void> prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const;
+
+private:
+	RuntimeExecutors& executors_;
+	std::shared_ptr<InFlightReadBudget> read_budget_;
+	std::size_t prefetch_bytes_;
 	FileIoMode io_mode_;
 };
 
 class TarPacker {
 public:
-	TarPacker(BufferPool& pool, RuntimeExecutors& executors, std::size_t chunk_size, std::size_t read_concurrency);
+	TarPacker(BufferPool& pool, std::size_t chunk_size);
 	void pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr);
 
 private:
@@ -141,9 +151,7 @@ private:
 	void add_entry(struct archive* writer, OpenedFileReader& opened_file) const;
 
 	BufferPool& pool_;
-	RuntimeExecutors& executors_;
 	std::size_t chunk_size_;
-	std::size_t read_concurrency_;
 };
 
 class TarUnpacker {
@@ -165,7 +173,8 @@ public:
 		BufferPool& pool,
 		RuntimeExecutors& executors,
 		int compression_level,
-		const CompressionQueueTelemetry* queue_telemetry = nullptr);
+		const CompressionQueueTelemetry* queue_telemetry = nullptr,
+		std::atomic<int>* active_level = nullptr);
 	void compress(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
 
 private:
@@ -175,6 +184,7 @@ private:
 	RuntimeExecutors& executors_;
 	int compression_level_;
 	const CompressionQueueTelemetry* queue_telemetry_;
+	std::atomic<int>* active_level_;
 };
 
 class ZstdDecompressor {

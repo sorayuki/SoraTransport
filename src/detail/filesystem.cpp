@@ -55,6 +55,24 @@ private:
 	std::condition_variable cv_;
 };
 
+std::size_t compute_reader_prefetch_bytes(
+	const FileMeta& meta,
+	std::size_t buffer_size,
+	FileIoMode io_mode) {
+	if (!std::filesystem::is_regular_file(meta.status) || meta.size == 0) {
+		return 0;
+	}
+
+	auto per_slot_capacity = std::max<std::size_t>(1, buffer_size);
+	if (io_mode == FileIoMode::Direct) {
+		per_slot_capacity = make_direct_request_size(buffer_size, query_file_io_alignment(meta.full_path).required_alignment);
+	}
+
+	return static_cast<std::size_t>(std::min<std::uint64_t>(
+		meta.size,
+		static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
+}
+
 } // namespace
 
 InFlightReadBudget::InFlightReadBudget(std::size_t max_bytes) : max_bytes_(std::max<std::size_t>(1, max_bytes)) {}
@@ -113,7 +131,6 @@ struct FileReader::State {
 	struct ReadSlot : OverlappedSlotBase {
 		std::uint64_t offset = 0;
 		std::size_t requested_length = 0;
-		std::size_t reserved_slot_bytes = 0;
 	};
 
 	State(std::filesystem::path input_path, std::uint64_t input_size, FileIoMode input_mode)
@@ -133,14 +150,12 @@ struct FileReader::State {
 	std::size_t next_slot_to_issue = 0;
 	std::size_t next_slot_to_consume = 0;
 	std::size_t in_flight_reads = 0;
-	std::size_t prefetch_budget_limit = 0;
-	std::size_t reserved_slot_bytes_total = 0;
 	bool prefetch_started = false;
 };
 
 DirScanner::DirScanner(RuntimeExecutors& executors) : executors_(executors) {}
 
-void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const {
+boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const {
 	if (!std::filesystem::exists(root_dir)) {
 		throw std::runtime_error("source directory does not exist: " + path_to_utf8_string(root_dir));
 	}
@@ -148,62 +163,32 @@ void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMe
 		throw std::runtime_error("source path is not a directory: " + path_to_utf8_string(root_dir));
 	}
 
-	ConcurrentDirectoryWorkQueue directory_queue;
-	std::atomic<std::size_t> in_flight_directories = 1;
-	std::exception_ptr worker_error;
-	std::mutex error_mutex;
-	directory_queue.push(root_dir);
+	try {
+		std::deque<std::filesystem::path> directories;
+		directories.push_back(root_dir);
 
-	auto worker = [&] {
-		try {
-			std::filesystem::path current_dir;
-			while (directory_queue.pop(current_dir)) {
-				for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
-					FileMeta meta;
-					meta.full_path = entry.path();
-					meta.status = entry.symlink_status();
-					meta.size = entry.is_regular_file() ? entry.file_size() : 0;
-					meta.relative_path_in_tar = path_to_generic_utf8_string(entry.path().lexically_relative(root_dir));
-					if (meta.relative_path_in_tar.empty()) {
-						continue;
-					}
-					out_queue.push(meta);
-					if (entry.is_directory()) {
-						in_flight_directories.fetch_add(1, std::memory_order_relaxed);
-						directory_queue.push(entry.path());
-					}
+		while (!directories.empty()) {
+			auto current_dir = std::move(directories.front());
+			directories.pop_front();
+
+			for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
+				FileMeta meta;
+				meta.full_path = entry.path();
+				meta.status = entry.symlink_status();
+				meta.size = entry.is_regular_file() ? entry.file_size() : 0;
+				meta.relative_path_in_tar = path_to_generic_utf8_string(entry.path().lexically_relative(root_dir));
+				if (meta.relative_path_in_tar.empty()) {
+					continue;
 				}
-
-				if (in_flight_directories.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-					directory_queue.close();
+				co_await out_queue.async_push_await(std::move(meta));
+				if (entry.is_directory()) {
+					directories.push_back(entry.path());
 				}
 			}
-		} catch (...) {
-			{
-				std::lock_guard lock(error_mutex);
-				if (!worker_error) {
-					worker_error = std::current_exception();
-				}
-			}
-			directory_queue.close();
 		}
-	};
-
-	std::vector<std::jthread> workers;
-	workers.reserve(executors_.scanner_threads());
-	for (std::size_t index = 0; index < executors_.scanner_threads(); ++index) {
-		workers.emplace_back(worker);
-	}
-
-	for (auto& thread : workers) {
-		if (thread.joinable()) {
-			thread.join();
-		}
-	}
-
-	if (worker_error) {
+	} catch (...) {
 		out_queue.close();
-		std::rethrow_exception(worker_error);
+		throw;
 	}
 
 	if (std::filesystem::is_empty(root_dir)) {
@@ -211,19 +196,19 @@ void DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMe
 		meta.full_path = root_dir;
 		meta.status = std::filesystem::status(root_dir);
 		meta.relative_path_in_tar = ".";
-		out_queue.push(std::move(meta));
+		co_await out_queue.async_push_await(std::move(meta));
 	}
 	out_queue.close();
+	co_return;
 }
 
 FileReader::FileReader(
 	BufferPool& pool,
-	std::shared_ptr<InFlightReadBudget> read_budget,
 	const std::filesystem::path& path,
 	std::uint64_t size,
 	std::size_t buffer_size,
 	FileIoMode io_mode)
-	: pool_(pool), read_budget_(std::move(read_budget)), state_(std::make_unique<State>(path, size, io_mode)) {
+	: pool_(pool), state_(std::make_unique<State>(path, size, io_mode)) {
 	state_->chunk_size = std::max<std::size_t>(1, buffer_size);
 }
 
@@ -232,12 +217,11 @@ FileReader::~FileReader() {
 }
 
 FileReader::FileReader(FileReader&& other)
-	: pool_(other.pool_), read_budget_(std::move(other.read_budget_)), state_(std::move(other.state_)) {}
+	: pool_(other.pool_), state_(std::move(other.state_)) {}
 
 FileReader& FileReader::operator=(FileReader&& other) {
 	if (this != &other) {
 		close();
-		read_budget_ = std::move(other.read_budget_);
 		state_ = std::move(other.state_);
 	}
 	return *this;
@@ -259,16 +243,10 @@ void FileReader::close() {
 			slot.buffer.reset();
 			slot.requested_length = 0;
 			slot.offset = 0;
-			slot.reserved_slot_bytes = 0;
 		}
 		::CloseHandle(state_->handle);
 		state_->handle = INVALID_HANDLE_VALUE;
 	}
-	if (read_budget_ && state_->reserved_slot_bytes_total != 0) {
-		read_budget_->release(state_->reserved_slot_bytes_total);
-	}
-	state_->prefetch_budget_limit = 0;
-	state_->reserved_slot_bytes_total = 0;
 
 	state_.reset();
 }
@@ -277,7 +255,7 @@ std::string FileReader::path_for_error() const {
 	return state_ == nullptr ? std::string() : path_to_utf8_string(state_->path);
 }
 
-bool FileReader::issue_next_read(bool wait_for_budget) {
+bool FileReader::issue_next_read() {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
 	}
@@ -292,24 +270,14 @@ bool FileReader::issue_next_read(bool wait_for_budget) {
 		? make_direct_request_size(request_limit, state_->io_alignment)
 		: request_limit;
 
-	auto choose_slot = [&](bool require_reserved_budget) -> std::size_t {
-		for (std::size_t probe = 0; probe < state_->slots.size(); ++probe) {
-			const auto index = (state_->next_slot_to_issue + probe) % state_->slots.size();
-			const auto& candidate = state_->slots[index];
-			if (candidate.in_flight || candidate.buffer) {
-				continue;
-			}
-			if (require_reserved_budget && candidate.reserved_slot_bytes < request_length) {
-				continue;
-			}
-			return index;
+	auto slot_index = state_->slots.size();
+	for (std::size_t probe = 0; probe < state_->slots.size(); ++probe) {
+		const auto index = (state_->next_slot_to_issue + probe) % state_->slots.size();
+		const auto& candidate = state_->slots[index];
+		if (!candidate.in_flight && !candidate.buffer) {
+			slot_index = index;
+			break;
 		}
-		return state_->slots.size();
-	};
-
-	auto slot_index = choose_slot(true);
-	if (slot_index == state_->slots.size()) {
-		slot_index = choose_slot(false);
 	}
 	if (slot_index == state_->slots.size()) {
 		return false;
@@ -318,24 +286,6 @@ bool FileReader::issue_next_read(bool wait_for_budget) {
 	auto& slot = state_->slots[slot_index];
 	slot.offset = state_->next_issue_offset;
 	slot.requested_length = request_length;
-	if (wait_for_budget) {
-		if (slot.reserved_slot_bytes == 0) {
-			if (state_->reserved_slot_bytes_total + slot.requested_length > state_->prefetch_budget_limit) {
-				slot.requested_length = 0;
-				slot.offset = 0;
-				return false;
-			}
-			if (read_budget_) {
-				if (!read_budget_->try_acquire(slot.requested_length)) {
-					slot.requested_length = 0;
-					slot.offset = 0;
-					return false;
-				}
-			}
-			slot.reserved_slot_bytes = slot.requested_length;
-			state_->reserved_slot_bytes_total += slot.requested_length;
-		}
-	}
 
 	try {
 		slot.buffer = state_->io_mode == FileIoMode::Direct
@@ -378,30 +328,22 @@ bool FileReader::issue_next_read(bool wait_for_budget) {
 	return true;
 }
 
-void FileReader::prime_prefetch_window() {
-	if (!state_ || state_->aligned_data_end == 0 || state_->prefetch_budget_limit == 0) {
+void FileReader::prime_prefetch_window(std::size_t max_bytes) {
+	if (!state_ || state_->aligned_data_end == 0 || max_bytes == 0) {
 		return;
 	}
 
-	while (issue_next_read(true)) {
+	std::size_t issued_bytes = 0;
+	while (state_->in_flight_reads < state_->slots.size()) {
+		const auto before = state_->next_issue_offset;
+		if (!issue_next_read()) {
+			break;
+		}
+		issued_bytes += static_cast<std::size_t>(state_->next_issue_offset - before);
+		if (issued_bytes >= max_bytes) {
+			break;
+		}
 	}
-}
-
-void FileReader::release_slot_budget(std::size_t slot_index) {
-	if (!state_) {
-		return;
-	}
-
-	auto& slot = state_->slots[slot_index];
-	if (slot.reserved_slot_bytes == 0) {
-		return;
-	}
-
-	if (read_budget_) {
-		read_budget_->release(slot.reserved_slot_bytes);
-	}
-	state_->reserved_slot_bytes_total -= std::min(state_->reserved_slot_bytes_total, slot.reserved_slot_bytes);
-	slot.reserved_slot_bytes = 0;
 }
 
 void FileReader::open() {
@@ -440,30 +382,10 @@ void FileReader::open() {
 	state_->next_slot_to_consume = 0;
 	state_->in_flight_reads = 0;
 	state_->tail_read_complete = false;
-
-	if (state_->size == 0) {
-		return;
-	}
-
+	state_->prefetch_started = false;
 }
 
-void FileReader::reserve_prefetch_budget(std::size_t bytes) {
-	if (!state_) {
-		throw std::runtime_error("file reader is closed");
-	}
-	if (state_->prefetch_started) {
-		throw std::runtime_error("cannot reserve prefetch budget after prefetch started");
-	}
-	if (state_->prefetch_budget_limit != 0) {
-		throw std::runtime_error("prefetch budget already reserved for file reader");
-	}
-	if (bytes == 0) {
-		return;
-	}
-	state_->prefetch_budget_limit = bytes;
-}
-
-void FileReader::start_prefetch() {
+void FileReader::start_prefetch(std::size_t max_bytes) {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
 	}
@@ -474,7 +396,7 @@ void FileReader::start_prefetch() {
 		return;
 	}
 	state_->prefetch_started = true;
-	prime_prefetch_window();
+	prime_prefetch_window(max_bytes);
 }
 
 DataChunk FileReader::read_next_chunk() {
@@ -491,7 +413,7 @@ DataChunk FileReader::read_next_chunk() {
 	}
 
 	if (state_->in_flight_reads == 0) {
-		issue_next_read(false);
+		issue_next_read();
 	}
 	if (state_->in_flight_reads == 0) {
 		if (state_->offset < state_->size && !state_->tail_read_complete) {
@@ -570,10 +492,9 @@ DataChunk FileReader::read_next_chunk() {
 	auto read_offset = slot.offset;
 	slot.requested_length = 0;
 	slot.offset = 0;
-	release_slot_budget(consumed_slot_index);
 
 	if (state_->offset < state_->size) {
-		issue_next_read(false);
+		issue_next_read();
 	}
 
 	return DataChunk{std::move(data), bytes_read, read_offset, state_->offset >= state_->size};
@@ -595,88 +516,70 @@ FileReaderOpener::FileReaderOpener(
 	BufferPool& pool,
 	RuntimeExecutors& executors,
 	std::size_t submit_concurrency,
-	std::shared_ptr<InFlightReadBudget> read_budget,
 	std::size_t buffer_size,
 	FileIoMode io_mode)
 	: pool_(pool),
 	  executors_(executors),
 	  submit_concurrency_(std::max<std::size_t>(1, submit_concurrency)),
-	  read_budget_(std::move(read_budget)),
 	  buffer_size_(std::max<std::size_t>(1, buffer_size)),
 	  io_mode_(io_mode) {}
 
-void FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
-	std::map<std::size_t, std::future<OpenedFileReader>> pending;
-	std::size_t next_submit = 0;
-	std::size_t next_emit = 0;
-	bool input_closed = false;
-
-	auto compute_prefetch_reservation = [&](const OpenedFileReader& opened_file) -> std::size_t {
-		if (!opened_file.reader.has_value()) {
-			return 0;
-		}
-		if (opened_file.meta.size == 0) {
-			return 0;
-		}
-
-		std::size_t per_slot_capacity = buffer_size_;
-		if (io_mode_ == FileIoMode::Direct) {
-			const auto alignment = query_file_io_alignment(opened_file.meta.full_path).required_alignment;
-			per_slot_capacity = make_direct_request_size(buffer_size_, alignment);
-			return static_cast<std::size_t>(std::min<std::uint64_t>(
-				opened_file.meta.size,
-				static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
-		}
-
-		return static_cast<std::size_t>(std::min<std::uint64_t>(
-			opened_file.meta.size,
-			static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
-	};
-
-	auto submit = [&](FileMeta meta) {
-		pending.emplace(next_submit++, executors_.post_reader([this, meta = std::move(meta)]() mutable {
+boost::asio::awaitable<void> FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
+	try {
+		while (auto meta = co_await in_meta.async_pop_await()) {
 			OpenedFileReader opened_file;
-			opened_file.meta = std::move(meta);
+			opened_file.meta = std::move(*meta);
 			if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
-				auto reader = FileReader(pool_, read_budget_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
+				auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
+				reader.open();
 				opened_file.reader.emplace(std::move(reader));
 			}
-			return opened_file;
-		}));
-	};
-
-	try {
-		while (!input_closed || !pending.empty()) {
-			while (!input_closed && pending.size() < submit_concurrency_) {
-				auto meta = in_meta.pop();
-				if (!meta) {
-					input_closed = true;
-					break;
-				}
-				submit(std::move(*meta));
-			}
-
-			auto current = pending.find(next_emit);
-			if (current == pending.end()) {
-				continue;
-			}
-
-			auto opened_file = current->second.get();
-			pending.erase(current);
-			if (opened_file.reader.has_value()) {
-				auto reservation_bytes = compute_prefetch_reservation(opened_file);
-				opened_file.reader->open();
-				opened_file.reader->reserve_prefetch_budget(reservation_bytes);
-				opened_file.reader->start_prefetch();
-			}
-			out_opened.push(std::move(opened_file));
-			++next_emit;
+			co_await out_opened.async_push_await(std::move(opened_file));
 		}
 		out_opened.close();
 	} catch (...) {
 		out_opened.close();
 		throw;
 	}
+	co_return;
+}
+
+FileReaderPrefetcher::FileReaderPrefetcher(
+	RuntimeExecutors& executors,
+	std::shared_ptr<InFlightReadBudget> read_budget,
+	std::size_t prefetch_bytes,
+	FileIoMode io_mode)
+	: executors_(executors),
+	  read_budget_(std::move(read_budget)),
+	  prefetch_bytes_(std::max<std::size_t>(1, prefetch_bytes)),
+	  io_mode_(io_mode) {}
+
+boost::asio::awaitable<void> FileReaderPrefetcher::prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const {
+	try {
+		while (auto opened_file = co_await in_opened.async_pop_await()) {
+			if (opened_file->reader.has_value()) {
+				const auto budget_bytes = compute_reader_prefetch_bytes(opened_file->meta, prefetch_bytes_, io_mode_);
+				if (budget_bytes > 0) {
+					read_budget_->acquire(budget_bytes);
+					try {
+						opened_file->reader->start_prefetch(budget_bytes);
+						co_await out_prefetched.async_push_await(std::move(*opened_file));
+					} catch (...) {
+						read_budget_->release(budget_bytes);
+						throw;
+					}
+					read_budget_->release(budget_bytes);
+					continue;
+				}
+			}
+			co_await out_prefetched.async_push_await(std::move(*opened_file));
+		}
+		out_prefetched.close();
+	} catch (...) {
+		out_prefetched.close();
+		throw;
+	}
+	co_return;
 }
 
 } // namespace soratransport

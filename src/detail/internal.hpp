@@ -7,13 +7,10 @@
 namespace soratransport {
 
 struct RuntimeConfig {
-	std::size_t scanner_threads = 1;
-	std::size_t reader_threads = 1;
-	std::size_t compression_threads = 1;
-	std::size_t tar_queue_depth = 16;
-	std::size_t read_concurrency = 4;
+	std::size_t worker_threads = 1;
+	std::size_t tar_queue_depth = 64;
 	std::size_t max_in_flight_read_bytes = 256 * 1024 * 1024;
-	std::size_t max_in_flight_write_ops = 1;
+	std::size_t max_in_flight_write_ops = 4;
 };
 
 RuntimeConfig make_runtime_config(RuntimeOptions options = {});

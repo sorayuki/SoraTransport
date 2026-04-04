@@ -15,7 +15,8 @@ constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
 constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
 constexpr std::size_t kTargetInFlightReadBytes = 128 * 1024 * 1024;
-constexpr std::size_t kDefaultMaxInFlightWriteOps = 1;
+constexpr std::size_t kDefaultTarQueueDepth = 64;
+constexpr std::size_t kDefaultMaxInFlightWriteOps = 4;
 
 std::size_t hardware_threads() {
 	const auto detected = std::thread::hardware_concurrency();
@@ -27,11 +28,8 @@ std::size_t hardware_threads() {
 RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	const auto threads = hardware_threads();
 	RuntimeConfig config;
-	config.scanner_threads = std::clamp<std::size_t>(threads / 2, 4, 12);
-	config.reader_threads = std::clamp<std::size_t>(threads, 6, 24);
-	config.compression_threads = std::clamp<std::size_t>(threads / 2, 2, 8);
-	config.read_concurrency = std::clamp<std::size_t>(config.reader_threads * 2, 8, 48);
-	config.tar_queue_depth = std::clamp<std::size_t>(config.read_concurrency, 16, 24);
+	config.worker_threads = std::max<std::size_t>(1, threads);
+	config.tar_queue_depth = kDefaultTarQueueDepth;
 	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
 	config.max_in_flight_write_ops = std::max<std::size_t>(1, options.max_in_flight_write_ops.value_or(kDefaultMaxInFlightWriteOps));
 	return config;
@@ -74,23 +72,20 @@ void PipelineState::rethrow_if_failed() const {
 	}
 }
 
-RuntimeExecutors::RuntimeExecutors(std::size_t scanner_threads, std::size_t reader_threads, std::size_t compression_threads)
-	: scanner_threads_(std::max<std::size_t>(1, scanner_threads)),
-	  compression_threads_(std::max<std::size_t>(1, compression_threads)),
-	  reader_pool_(std::max<std::size_t>(1, reader_threads)),
-	  compression_pool_(std::max<std::size_t>(1, compression_threads)) {}
+RuntimeExecutors::RuntimeExecutors(std::size_t thread_count)
+	: thread_count_(std::max<std::size_t>(1, thread_count)),
+	  pool_(thread_count_) {}
 
 RuntimeExecutors::~RuntimeExecutors() {
-	reader_pool_.join();
-	compression_pool_.join();
+	pool_.join();
 }
 
-std::size_t RuntimeExecutors::scanner_threads() const {
-	return scanner_threads_;
+std::size_t RuntimeExecutors::thread_count() const {
+	return thread_count_;
 }
 
-std::size_t RuntimeExecutors::compression_threads() const {
-	return compression_threads_;
+boost::asio::any_io_executor RuntimeExecutors::executor() {
+	return pool_.get_executor();
 }
 
 BufferPool::BufferPool() : buckets_{kSmallBufferSize, kMediumBufferSize, kPipelineBufferSize, kLargePipelineBufferSize, kLargeBufferSize} {}

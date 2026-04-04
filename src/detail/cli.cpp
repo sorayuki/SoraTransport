@@ -135,23 +135,56 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 	return options;
 }
 
-struct SendOptions {
+struct ListenOptions {
 	RuntimeOptions runtime_options;
 	std::vector<std::string_view> positional;
 };
 
-SendOptions parse_send_options(int argc, char** argv, int first_arg) {
-	SendOptions options;
+ListenOptions parse_listen_options(int argc, char** argv, int first_arg) {
+	ListenOptions options;
 	for (int index = first_arg; index < argc; ++index) {
 		const std::string_view argument = argv[index];
-		if (try_parse_runtime_option(options.runtime_options, argument, argc, argv, index)) {
-			continue;
+		if (argument == "-r" || argument == "-l") {
+			if (try_parse_runtime_option(options.runtime_options, argument, argc, argv, index)) {
+				continue;
+			}
 		}
 		options.positional.push_back(argument);
 	}
 	return options;
 }
 
+struct ReceiveOptions {
+	std::vector<std::string_view> positional;
+};
+
+ReceiveOptions parse_receive_options(int argc, char** argv, int first_arg) {
+	ReceiveOptions options;
+	for (int index = first_arg; index < argc; ++index) {
+		const std::string_view argument = argv[index];
+		if (argument == "-r" || argument == "-w" || argument == "-l" || argument == "-d" || argument == "-b") {
+			throw std::runtime_error("receive does not accept runtime or file I/O options");
+		}
+		options.positional.push_back(argument);
+	}
+	return options;
+}
+
+void print_soratransport_usage() {
+	std::cerr
+		<< "Usage:\n"
+		<< "  soratransport pack [-d|-b] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>\n"
+		<< "  soratransport unpack [-d|-b] [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>\n"
+		<< "  soratransport listen [-r <MiB>] [-l <level>] <source-dir> <port>\n"
+		<< "  soratransport receive <host> <port> <destination-dir>\n"
+		<< "\n"
+		<< "Options:\n"
+		<< "  -d          Use direct I/O for file reads when applicable\n"
+		<< "  -b          Use buffered I/O for file reads\n"
+		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
+		<< "  -w <count>  Max in-flight output write operations\n"
+		<< "  -l <level>  Zstd compression level, range -131072..22\n";
+}
 void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode, std::string_view verb) {
 	const auto is_zstd_path = ends_with(path_text, ".tar.zst") || ends_with(path_text, ".tzst") || ends_with(path_text, ".zst");
 	if (mode == CompressionMode::Zstd && !is_zstd_path) {
@@ -160,22 +193,6 @@ void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode
 	if (mode == CompressionMode::None && is_zstd_path) {
 		throw std::runtime_error(std::string("fasttar ") + std::string(verb) + " with --no-compress requires a .tar path");
 	}
-}
-
-void print_soratransport_usage() {
-	std::cerr
-		<< "Usage:\n"
-		<< "  soratransport pack [-d|-b] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>\n"
-		<< "  soratransport unpack [-d|-b] [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport send [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <host> <port>\n"
-		<< "  soratransport receive <port> <destination-dir>\n"
-		<< "\n"
-		<< "Options:\n"
-		<< "  -d          Use direct I/O for file reads when applicable\n"
-		<< "  -b          Use buffered I/O for file reads\n"
-		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
-		<< "  -w <count>  Max in-flight output write operations\n"
-		<< "  -l <level>  Zstd compression level, range -131072..22\n";
 }
 
 void print_fasttar_usage() {
@@ -222,21 +239,22 @@ int run_soratransport_cli(int argc, char** argv) {
 			unpack_file_to_directory(options.positional[0], options.positional[1], CompressionMode::Zstd, options.file_io_mode, options.runtime_options);
 			return 0;
 		}
-		if (command == "send") {
-			auto options = parse_send_options(argc, argv, 2);
+		if (command == "listen") {
+			auto options = parse_listen_options(argc, argv, 2);
+			if (options.positional.size() != 2) {
+				print_soratransport_usage();
+				return 1;
+			}
+			listen_directory(options.positional[0], parse_port(options.positional[1]), options.runtime_options);
+			return 0;
+		}
+		if (command == "receive") {
+			auto options = parse_receive_options(argc, argv, 2);
 			if (options.positional.size() != 3) {
 				print_soratransport_usage();
 				return 1;
 			}
-			send_directory(options.positional[0], options.positional[1], parse_port(options.positional[2]), options.runtime_options);
-			return 0;
-		}
-		if (command == "receive") {
-			if (argc != 4) {
-				print_soratransport_usage();
-				return 1;
-			}
-			receive_directory(parse_port(argv[2]), argv[3]);
+			receive_directory(options.positional[0], parse_port(options.positional[1]), options.positional[2]);
 			return 0;
 		}
 

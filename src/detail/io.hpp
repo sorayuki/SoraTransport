@@ -36,10 +36,7 @@ public:
 
 class FileByteSink final : public IByteSink {
 public:
-	explicit FileByteSink(
-		const std::filesystem::path& output_path,
-		FileIoMode mode = FileIoMode::Buffered,
-		std::size_t max_in_flight_write_ops = 1);
+	explicit FileByteSink(const std::filesystem::path& output_path, std::size_t max_in_flight_write_ops = 1);
 	~FileByteSink() override;
 	FileByteSink(const FileByteSink&) = delete;
 	FileByteSink& operator=(const FileByteSink&) = delete;

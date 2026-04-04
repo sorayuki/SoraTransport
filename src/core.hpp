@@ -16,12 +16,14 @@ void unpack_file_to_directory(
 	CompressionMode mode,
 	FileIoMode file_io_mode = FileIoMode::Buffered,
 	RuntimeOptions options = {});
-void send_directory(
+void listen_directory(
 	const std::filesystem::path& source_dir,
-	std::string_view host,
 	std::uint16_t port,
 	RuntimeOptions options = {});
-void receive_directory(std::uint16_t port, const std::filesystem::path& destination_dir);
+void receive_directory(
+	std::string_view host,
+	std::uint16_t port,
+	const std::filesystem::path& destination_dir);
 int run_soratransport_cli(int argc, char** argv);
 int run_fasttar_cli(int argc, char** argv);
 
