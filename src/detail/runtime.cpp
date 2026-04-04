@@ -14,9 +14,11 @@ constexpr std::size_t kMediumBufferSize = 256 * 1024;
 constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
 constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
-constexpr std::size_t kTargetInFlightReadBytes = 128 * 1024 * 1024;
-constexpr std::size_t kDefaultTarQueueDepth = 64;
-constexpr std::size_t kDefaultMaxInFlightWriteOps = 4;
+constexpr std::size_t kTargetInFlightReadBytes = 96 * 1024 * 1024;
+constexpr std::size_t kDefaultTarQueueDepth = 32;
+constexpr std::size_t kDefaultMaxInFlightWriteOps = 3;
+constexpr std::size_t kMaxDefaultWorkerThreads = 12;
+constexpr int kMaxZstdWorkers = 6;
 
 std::size_t hardware_threads() {
 	const auto detected = std::thread::hardware_concurrency();
@@ -28,7 +30,7 @@ std::size_t hardware_threads() {
 RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	const auto threads = hardware_threads();
 	RuntimeConfig config;
-	config.worker_threads = std::max<std::size_t>(1, threads);
+	config.worker_threads = std::clamp<std::size_t>(threads, 1, kMaxDefaultWorkerThreads);
 	config.tar_queue_depth = kDefaultTarQueueDepth;
 	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
 	config.max_in_flight_write_ops = std::max<std::size_t>(1, options.max_in_flight_write_ops.value_or(kDefaultMaxInFlightWriteOps));
@@ -49,7 +51,8 @@ void configure_zstd_context(ZSTD_CCtx* context, int compression_level, std::size
 		return;
 	}
 
-	const auto worker_result = ZSTD_CCtx_setParameter(context, ZSTD_c_nbWorkers, static_cast<int>(worker_count));
+	const auto zstd_workers = static_cast<int>(std::min<std::size_t>(worker_count, kMaxZstdWorkers));
+	const auto worker_result = ZSTD_CCtx_setParameter(context, ZSTD_c_nbWorkers, zstd_workers);
 	if (ZSTD_isError(worker_result)) {
 		const auto error_code = ZSTD_getErrorCode(worker_result);
 		if (error_code != ZSTD_error_parameter_unsupported && error_code != ZSTD_error_parameter_outOfBound) {

@@ -16,7 +16,7 @@ constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr auto kRetuneInterval = std::chrono::milliseconds(1250);
 constexpr auto kWindowDuration = std::chrono::milliseconds(3500);
 constexpr auto kMinimumWindowSpan = std::chrono::milliseconds(1200);
-constexpr int kMinAdaptiveCompressionLevel = 0;
+constexpr int kMinAdaptiveCompressionLevel = 1;
 constexpr int kMaxAdaptiveCompressionLevel = 12;
 
 class WindowedCompressionStats {
@@ -143,12 +143,12 @@ public:
 		const auto throughput_ratio = window.input_mib_per_sec / baseline;
 		const bool severe_sink_backlog =
 			window.avg_tar_fill >= 0.97 &&
-			window.avg_upstream_fill >= 0.88 &&
-			throughput_ratio >= 0.72;
+			window.avg_upstream_fill >= 0.82 &&
+			throughput_ratio >= 0.40;
 		const bool sink_is_backed_up =
-			window.avg_tar_fill >= 0.86 &&
-			window.avg_upstream_fill >= 0.70 &&
-			throughput_ratio >= 0.62;
+			window.avg_tar_fill >= 0.84 &&
+			window.avg_upstream_fill >= 0.62 &&
+			throughput_ratio >= 0.28;
 		const bool sink_has_headroom =
 			window.avg_tar_fill <= 0.30 &&
 			window.avg_upstream_fill <= 0.45;
@@ -157,7 +157,7 @@ public:
 			if (pressure_score_ < 0) {
 				pressure_score_ = 0;
 			}
-			++pressure_score_;
+			pressure_score_ += 2;
 		} else if (sink_has_headroom) {
 			if (pressure_score_ > 0) {
 				pressure_score_ = 0;
@@ -175,7 +175,7 @@ public:
 			current_level_ = std::min(kMaxAdaptiveCompressionLevel, current_level_ + 2);
 			pressure_score_ = 0;
 			cooldown_samples_ = 2;
-		} else if (pressure_score_ >= 2 && current_level_ < kMaxAdaptiveCompressionLevel) {
+		} else if (pressure_score_ >= 3 && current_level_ < kMaxAdaptiveCompressionLevel) {
 			++current_level_;
 			pressure_score_ = 0;
 			cooldown_samples_ = 2;
