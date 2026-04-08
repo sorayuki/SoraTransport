@@ -68,21 +68,32 @@ private:
 class SocketByteSink final : public IByteSink {
 public:
 	explicit SocketByteSink(boost::asio::ip::tcp::socket socket);
+	~SocketByteSink() override;
+	SocketByteSink(const SocketByteSink&) = delete;
+	SocketByteSink& operator=(const SocketByteSink&) = delete;
+	SocketByteSink(SocketByteSink&&) noexcept;
+	SocketByteSink& operator=(SocketByteSink&&) noexcept;
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
 
 private:
-	boost::asio::ip::tcp::socket socket_;
-	bool closed_ = false;
+	struct State;
+	std::unique_ptr<State> state_;
 };
 
 class SocketByteSource final : public IByteSource {
 public:
 	explicit SocketByteSource(boost::asio::ip::tcp::socket socket);
+	~SocketByteSource() override;
+	SocketByteSource(const SocketByteSource&) = delete;
+	SocketByteSource& operator=(const SocketByteSource&) = delete;
+	SocketByteSource(SocketByteSource&&) noexcept;
+	SocketByteSource& operator=(SocketByteSource&&) noexcept;
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
 
 private:
-	boost::asio::ip::tcp::socket socket_;
+	struct State;
+	std::unique_ptr<State> state_;
 };
 
 } // namespace soratransport
