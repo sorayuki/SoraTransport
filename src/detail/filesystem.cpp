@@ -5,6 +5,7 @@
 #include <array>
 #include <map>
 #include <stdexcept>
+#include <system_error>
 
 #include <windows.h>
 
@@ -13,6 +14,86 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kOverlappedReadQueueDepth = 8;
+constexpr std::int64_t kWindowsToUnixEpochOffset100ns = 116444736000000000ll;
+
+FileTimestamp filetime_to_timestamp(LARGE_INTEGER value) {
+	const auto unix_ticks = value.QuadPart - kWindowsToUnixEpochOffset100ns;
+	auto seconds = unix_ticks / 10000000ll;
+	auto remaining_ticks = unix_ticks % 10000000ll;
+	if (remaining_ticks < 0) {
+		remaining_ticks += 10000000ll;
+		--seconds;
+	}
+
+	return FileTimestamp{
+		seconds,
+		static_cast<long>(remaining_ticks * 100ll),
+	};
+}
+
+void maybe_set_timestamp(std::optional<FileTimestamp>& destination, LARGE_INTEGER value) {
+	if (value.QuadPart <= 0) {
+		return;
+	}
+	destination = filetime_to_timestamp(value);
+}
+
+std::string path_to_preserved_generic_utf8_string(const std::filesystem::path& path) {
+	auto utf8 = path.generic_u8string();
+	return {utf8.begin(), utf8.end()};
+}
+
+void populate_file_meta(FileMeta& meta) {
+	meta.status = std::filesystem::symlink_status(meta.full_path);
+	meta.size = 0;
+	if (std::filesystem::is_regular_file(meta.status)) {
+		std::error_code size_error;
+		meta.size = std::filesystem::file_size(meta.full_path, size_error);
+		if (size_error) {
+			meta.size = 0;
+		}
+	}
+
+	const auto handle = ::CreateFileW(
+		meta.full_path.c_str(),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		nullptr);
+	if (handle != INVALID_HANDLE_VALUE) {
+		FILE_BASIC_INFO basic_info{};
+		if (::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic_info, static_cast<DWORD>(sizeof(basic_info)))) {
+			meta.windows_file_attributes = basic_info.FileAttributes;
+			maybe_set_timestamp(meta.creation_time, basic_info.CreationTime);
+			maybe_set_timestamp(meta.last_access_time, basic_info.LastAccessTime);
+			maybe_set_timestamp(meta.last_write_time, basic_info.LastWriteTime);
+			maybe_set_timestamp(meta.change_time, basic_info.ChangeTime);
+		}
+
+		FILE_STANDARD_INFO standard_info{};
+		if (::GetFileInformationByHandleEx(handle, FileStandardInfo, &standard_info, static_cast<DWORD>(sizeof(standard_info)))
+			&& std::filesystem::is_regular_file(meta.status)) {
+			meta.size = static_cast<std::uint64_t>(std::max<LONGLONG>(0, standard_info.EndOfFile.QuadPart));
+		}
+
+		::CloseHandle(handle);
+	} else {
+		const auto attributes = ::GetFileAttributesW(meta.full_path.c_str());
+		if (attributes != INVALID_FILE_ATTRIBUTES) {
+			meta.windows_file_attributes = attributes;
+		}
+	}
+
+	if (meta.status.type() == std::filesystem::file_type::symlink) {
+		std::error_code read_link_error;
+		auto target = std::filesystem::read_symlink(meta.full_path, read_link_error);
+		if (!read_link_error) {
+			meta.symlink_target = path_to_preserved_generic_utf8_string(target);
+		}
+	}
+}
 
 std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t alignment) {
 	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, alignment));
@@ -193,7 +274,7 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 	try {
 		FileMeta root_meta;
 		root_meta.full_path = root_dir;
-		root_meta.status = std::filesystem::status(root_dir);
+		populate_file_meta(root_meta);
 		root_meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
 		co_await out_queue.async_push_await(std::move(root_meta));
 
@@ -207,8 +288,7 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 			for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
 				FileMeta meta;
 				meta.full_path = entry.path();
-				meta.status = entry.symlink_status();
-				meta.size = entry.is_regular_file() ? entry.file_size() : 0;
+				populate_file_meta(meta);
 				meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
 				if (meta.relative_path_in_tar.empty()) {
 					continue;

@@ -33,11 +33,22 @@ struct DataChunk {
 	bool is_eof = false;
 };
 
+struct FileTimestamp {
+	std::int64_t seconds = 0;
+	long nanoseconds = 0;
+};
+
 struct FileMeta {
 	std::filesystem::path full_path;
 	std::filesystem::file_status status;
 	std::uint64_t size = 0;
 	std::string relative_path_in_tar;
+	std::optional<FileTimestamp> creation_time;
+	std::optional<FileTimestamp> last_access_time;
+	std::optional<FileTimestamp> last_write_time;
+	std::optional<FileTimestamp> change_time;
+	std::optional<std::uint32_t> windows_file_attributes;
+	std::optional<std::string> symlink_target;
 };
 
 enum class CompressionMode {

@@ -27,6 +27,38 @@ int permissions_to_mode(std::filesystem::perms permissions) {
 	return static_cast<int>(permissions) & 0777;
 }
 
+void set_entry_timestamp(
+	archive_entry* entry,
+	const std::optional<FileTimestamp>& timestamp,
+	void (*setter)(archive_entry*, time_t, long)) {
+	if (!timestamp.has_value()) {
+		return;
+	}
+	setter(entry, static_cast<time_t>(timestamp->seconds), timestamp->nanoseconds);
+}
+
+void add_windows_attribute_metadata(archive_entry* entry, const FileMeta& meta) {
+	if (!meta.windows_file_attributes.has_value()) {
+		return;
+	}
+	const auto value = std::to_string(*meta.windows_file_attributes);
+	archive_entry_xattr_add_entry(
+		entry,
+		"user.soratransport.win32_file_attributes",
+		value.data(),
+		value.size());
+}
+
+void apply_entry_metadata(archive_entry* entry, const FileMeta& meta) {
+	archive_entry_set_pathname(entry, meta.relative_path_in_tar.c_str());
+	archive_entry_set_perm(entry, permissions_to_mode(meta.status.permissions()));
+	set_entry_timestamp(entry, meta.creation_time, &archive_entry_set_birthtime);
+	set_entry_timestamp(entry, meta.last_access_time, &archive_entry_set_atime);
+	set_entry_timestamp(entry, meta.last_write_time, &archive_entry_set_mtime);
+	set_entry_timestamp(entry, meta.change_time, &archive_entry_set_ctime);
+	add_windows_attribute_metadata(entry, meta);
+}
+
 void throw_archive_error(struct archive* handle, std::string_view prefix) {
 	throw std::runtime_error(std::string(prefix) + ": " + archive_error_string(handle));
 }
@@ -113,8 +145,7 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 		throw std::runtime_error("failed to allocate archive entry");
 	}
 
-	archive_entry_set_pathname(entry, meta.relative_path_in_tar.c_str());
-	archive_entry_set_perm(entry, permissions_to_mode(meta.status.permissions()));
+	apply_entry_metadata(entry, meta);
 
 	auto status_type = meta.status.type();
 	if (status_type == std::filesystem::file_type::directory || meta.relative_path_in_tar == ".") {
@@ -126,6 +157,14 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 		if (file_counter != nullptr) {
 			file_counter->fetch_add(1, std::memory_order_relaxed);
 		}
+	} else if (status_type == std::filesystem::file_type::symlink) {
+		if (!meta.symlink_target.has_value()) {
+			archive_entry_free(entry);
+			throw std::runtime_error("failed to resolve symlink target for tar entry: " + meta.relative_path_in_tar);
+		}
+		archive_entry_set_filetype(entry, AE_IFLNK);
+		archive_entry_set_size(entry, 0);
+		archive_entry_set_symlink(entry, meta.symlink_target->c_str());
 	} else {
 		archive_entry_free(entry);
 		return;
