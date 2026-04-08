@@ -73,6 +73,31 @@ std::size_t compute_reader_prefetch_bytes(
 		static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
 }
 
+std::filesystem::path archive_root_name_for_directory(const std::filesystem::path& root_dir) {
+	auto normalized = root_dir.lexically_normal();
+	auto name = normalized.filename();
+	if (!name.empty()) {
+		return name;
+	}
+
+	auto root_name = normalized.root_name().wstring();
+	if (!root_name.empty()) {
+		std::replace(root_name.begin(), root_name.end(), L':', L'_');
+		return std::filesystem::path(root_name);
+	}
+
+	throw std::runtime_error("source directory must have a name in the archive");
+}
+
+std::string archive_path_for_entry(
+	const std::filesystem::path& root_dir_name,
+	const std::filesystem::path& path_relative_to_root) {
+	if (path_relative_to_root.empty() || path_relative_to_root == ".") {
+		return path_to_generic_utf8_string(root_dir_name);
+	}
+	return path_to_generic_utf8_string(root_dir_name / path_relative_to_root);
+}
+
 } // namespace
 
 InFlightReadBudget::InFlightReadBudget(std::size_t max_bytes) : max_bytes_(std::max<std::size_t>(1, max_bytes)) {}
@@ -163,7 +188,15 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 		throw std::runtime_error("source path is not a directory: " + path_to_utf8_string(root_dir));
 	}
 
+	const auto archive_root_name = archive_root_name_for_directory(root_dir);
+
 	try {
+		FileMeta root_meta;
+		root_meta.full_path = root_dir;
+		root_meta.status = std::filesystem::status(root_dir);
+		root_meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
+		co_await out_queue.async_push_await(std::move(root_meta));
+
 		std::deque<std::filesystem::path> directories;
 		directories.push_back(root_dir);
 
@@ -176,7 +209,7 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 				meta.full_path = entry.path();
 				meta.status = entry.symlink_status();
 				meta.size = entry.is_regular_file() ? entry.file_size() : 0;
-				meta.relative_path_in_tar = path_to_generic_utf8_string(entry.path().lexically_relative(root_dir));
+				meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
 				if (meta.relative_path_in_tar.empty()) {
 					continue;
 				}
@@ -191,13 +224,6 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 		throw;
 	}
 
-	if (std::filesystem::is_empty(root_dir)) {
-		FileMeta meta;
-		meta.full_path = root_dir;
-		meta.status = std::filesystem::status(root_dir);
-		meta.relative_path_in_tar = ".";
-		co_await out_queue.async_push_await(std::move(meta));
-	}
 	out_queue.close();
 	co_return;
 }

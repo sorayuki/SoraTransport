@@ -52,7 +52,11 @@ std::filesystem::path normalize_relative_path(const std::filesystem::path& input
 TarPacker::TarPacker(BufferPool& pool, std::size_t chunk_size)
 	: pool_(pool), chunk_size_(chunk_size) {}
 
-void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataChunk>& out_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter) {
+void TarPacker::pack(
+	BoundedQueue<OpenedFileReader>& in_meta,
+	BoundedQueue<DataChunk>& out_tar,
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter,
+	std::atomic<std::uint64_t>* file_counter) {
 	TarWriteContext context{&out_tar, &pool_, 0, uncompressed_bytes_counter};
 
 	auto* writer = archive_write_new();
@@ -70,7 +74,7 @@ void TarPacker::pack(BoundedQueue<OpenedFileReader>& in_meta, BoundedQueue<DataC
 
 		while (auto meta = in_meta.pop()) {
 			meta->read_budget_lease.reset();
-			add_entry(writer, *meta);
+			add_entry(writer, *meta, file_counter);
 		}
 
 		if (archive_write_close(writer) != ARCHIVE_OK) {
@@ -102,8 +106,8 @@ int TarPacker::archive_close_callback(struct archive*, void*) {
 }
 
 
-void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file) const {
-		auto& meta = opened_file.meta;
+void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file, std::atomic<std::uint64_t>* file_counter) const {
+	auto& meta = opened_file.meta;
 	auto* entry = archive_entry_new();
 	if (entry == nullptr) {
 		throw std::runtime_error("failed to allocate archive entry");
@@ -119,6 +123,9 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file)
 	} else if (status_type == std::filesystem::file_type::regular) {
 		archive_entry_set_filetype(entry, AE_IFREG);
 		archive_entry_set_size(entry, meta.size);
+		if (file_counter != nullptr) {
+			file_counter->fetch_add(1, std::memory_order_relaxed);
+		}
 	} else {
 		archive_entry_free(entry);
 		return;
@@ -159,7 +166,10 @@ TarUnpacker::TarUnpacker(const std::filesystem::path& destination_root) : destin
 	std::filesystem::create_directories(destination_root_);
 }
 
-void TarUnpacker::unpack(BoundedQueue<DataChunk>& in_tar, std::atomic<std::uint64_t>* uncompressed_bytes_counter) {
+void TarUnpacker::unpack(
+	BoundedQueue<DataChunk>& in_tar,
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter,
+	std::atomic<std::uint64_t>* file_counter) {
 	TarReadContext context{&in_tar, std::nullopt, 0, uncompressed_bytes_counter};
 	auto* reader = archive_read_new();
 	auto* disk_writer = archive_write_disk_new();
@@ -216,6 +226,9 @@ void TarUnpacker::unpack(BoundedQueue<DataChunk>& in_tar, std::atomic<std::uint6
 
 			if (archive_write_finish_entry(disk_writer) != ARCHIVE_OK) {
 				throw std::runtime_error(std::string("failed to finalize extracted entry: ") + archive_error_string(disk_writer));
+			}
+			if (file_counter != nullptr && archive_entry_filetype(entry) == AE_IFREG) {
+				file_counter->fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 

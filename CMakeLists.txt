@@ -5,6 +5,10 @@ project(SoraTransport)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+	add_compile_options(/utf-8)
+endif()
+
 set(SORATRANSPORT_VCPKG_ROOT "D:/devspace/vcpkg" CACHE PATH "Path to the local vcpkg installation")
 set(SORATRANSPORT_VCPKG_TRIPLET "x64-windows" CACHE STRING "Triplet used for prebuilt vcpkg dependencies")
 set(SORATRANSPORT_VCPKG_INSTALLED_DIR "${SORATRANSPORT_VCPKG_ROOT}/installed/${SORATRANSPORT_VCPKG_TRIPLET}")
@@ -62,6 +66,16 @@ if(NOT TARGET LibArchive::LibArchive)
 	)
 endif()
 
+set(FLTK_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_FORMS OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_GL OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_FLUID OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_FLTK_OPTIONS OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_TEST OFF CACHE BOOL "" FORCE)
+set(FLTK_MSVC_RUNTIME_DLL ON CACHE BOOL "" FORCE)
+add_subdirectory(deps/fltk EXCLUDE_FROM_ALL)
+
 if(TARGET Boost::headers)
 	set(SORATRANSPORT_BOOST_TARGET Boost::headers)
 elseif(TARGET Boost::boost)
@@ -79,13 +93,12 @@ target_link_libraries(soratransport_dependencies
 		LibArchive::LibArchive
 )
 
-find_package(Threads REQUIRED)
-
 if(WIN32)
 	target_link_libraries(soratransport_dependencies
 		INTERFACE
 			ws2_32
 			mswsock
+			iphlpapi
 	)
 endif()
 
@@ -99,6 +112,7 @@ add_library(soratransport_core
 	src/detail/zstd.cpp
 	src/detail/orchestration.cpp
 	src/detail/cli.cpp
+	src/detail/windows_helpers.cpp
 )
 
 target_include_directories(soratransport_core
@@ -109,7 +123,6 @@ target_include_directories(soratransport_core
 target_link_libraries(soratransport_core
 	PUBLIC
 		soratransport_dependencies
-		Threads::Threads
 )
 
 target_compile_definitions(soratransport_core
@@ -144,5 +157,15 @@ add_executable(fs_benchmark
 target_link_libraries(fs_benchmark
 	PRIVATE
 		soratransport_core
+)
+
+add_executable(soratransport_app WIN32
+	src/gui_app.cpp
+)
+
+target_link_libraries(soratransport_app
+	PRIVATE
+		soratransport_core
+		fltk::fltk
 )
 

@@ -11,6 +11,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -82,6 +84,27 @@ void print_unpack_progress_legend() {
 		<< "  q{s/u}: queue usage current/capacity, s/u = source -> unpacker\n";
 }
 
+void print_listen_progress_legend() {
+	std::cerr
+		<< "progress legend (listen):\n"
+		<< "  rate: uncompressed tar stream throughput per second\n"
+		<< "  q{s/o o/p p/t t/z z/n}: queue usage current/capacity\n"
+		<< "    s/o = scanner -> opener\n"
+		<< "    o/p = opener -> prefetcher\n"
+		<< "    p/t = prefetcher -> tar packer\n"
+		<< "    t/z = tar packer -> zstd compressor\n"
+		<< "    z/n = zstd compressor -> network sender\n"
+		<< "  lvl: active zstd compression level\n"
+		<< "  rb: in-flight file read budget used/limit\n";
+}
+
+void print_receive_progress_legend() {
+	std::cerr
+		<< "progress legend (receive):\n"
+		<< "  rate: uncompressed tar stream throughput per second\n"
+		<< "  q{n/u}: queue usage current/capacity, n/u = network source -> unpacker\n";
+}
+
 void clear_progress_line() {
 	std::cerr << "\r\x1b[2K";
 }
@@ -122,6 +145,55 @@ void join_and_capture(std::jthread& thread, PipelineState& state) {
 	}
 }
 
+void set_progress_status(const std::shared_ptr<TransferProgress>& progress, std::string status) {
+	if (progress) {
+		progress->set_status(std::move(status));
+	}
+}
+
+void complete_progress(
+	const std::shared_ptr<TransferProgress>& progress,
+	bool failed,
+	std::string status) {
+	if (!progress) {
+		return;
+	}
+
+	if (failed) {
+		progress->set_failed(std::move(status));
+	} else {
+		progress->set_completed(std::move(status));
+	}
+}
+
+std::jthread start_progress_sync_thread(
+	const std::shared_ptr<TransferProgress>& progress,
+	std::atomic<std::uint64_t>& processed_bytes,
+	std::atomic<std::uint64_t>& processed_files) {
+	return std::jthread([progress, &processed_bytes, &processed_files](std::stop_token stop_token) {
+		using namespace std::chrono_literals;
+		std::uint64_t previous_bytes = 0;
+		std::uint64_t previous_files = 0;
+		while (!stop_token.stop_requested()) {
+			std::this_thread::sleep_for(250ms);
+			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
+			const auto current_files = processed_files.load(std::memory_order_relaxed);
+			if (progress) {
+				progress->add_processed_bytes(current_bytes - previous_bytes);
+				progress->add_processed_files(current_files - previous_files);
+			}
+			previous_bytes = current_bytes;
+			previous_files = current_files;
+		}
+		if (progress) {
+			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
+			const auto current_files = processed_files.load(std::memory_order_relaxed);
+			progress->add_processed_bytes(current_bytes - previous_bytes);
+			progress->add_processed_files(current_files - previous_files);
+		}
+	});
+}
+
 asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::resolver resolver(executor);
@@ -131,9 +203,39 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	co_return std::move(socket);
 }
 
-asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port) {
+asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port) {
 	auto executor = co_await asio::this_coro::executor;
-	asio::ip::tcp::acceptor acceptor(executor, {asio::ip::tcp::v4(), port});
+	asio::ip::tcp::acceptor acceptor(executor);
+	boost::system::error_code error;
+
+	acceptor.open(asio::ip::tcp::v6(), error);
+	if (!error) {
+		acceptor.set_option(asio::ip::v6_only(false), error);
+		if (!error) {
+			acceptor.bind({asio::ip::tcp::v6(), port}, error);
+		}
+	}
+
+	if (error) {
+		error.clear();
+		acceptor = asio::ip::tcp::acceptor(executor);
+		acceptor.open(asio::ip::tcp::v4(), error);
+		if (error) {
+			throw boost::system::system_error(error);
+		}
+		acceptor.bind({asio::ip::tcp::v4(), port}, error);
+		if (error) {
+			throw boost::system::system_error(error);
+		}
+	}
+
+	acceptor.listen(asio::socket_base::max_listen_connections, error);
+	if (error) {
+		throw boost::system::system_error(error);
+	}
+	if (bound_port != nullptr) {
+		bound_port->store(acceptor.local_endpoint().port(), std::memory_order_relaxed);
+	}
 	co_return co_await acceptor.async_accept(asio::use_awaitable);
 }
 
@@ -141,9 +243,17 @@ asio::awaitable<void> listen_directory_task(
 	const std::filesystem::path source_dir,
 	std::uint16_t port,
 	RuntimeOptions options,
+	const std::shared_ptr<TransferProgress>& progress,
+	std::atomic<std::uint16_t>* bound_port,
 	std::exception_ptr* task_error) {
+	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
+	std::atomic<std::uint64_t> files_processed{0};
 	try {
-		auto socket = co_await accept_socket_async(port);
+		set_progress_status(progress, "binding listener");
+		auto socket = co_await accept_socket_async(port, bound_port);
+		set_progress_status(progress, "receiver connected");
+		std::cerr << "listening on port " << socket.local_endpoint().port() << ", waiting for receiver...\n";
+		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(socket));
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
@@ -163,6 +273,26 @@ asio::awaitable<void> listen_directory_task(
 		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize);
 		TarPacker packer(pool, kPipelineChunkSize);
 		PipelineState state;
+		std::atomic<int> active_compression_level{compression_level};
+		print_listen_progress_legend();
+		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+
+		auto progress_thread = start_progress_thread(
+			[&](std::uint64_t bytes_per_second) {
+				std::ostringstream out;
+				out << "[listen] " << format_rate(bytes_per_second)
+					<< " q{" << queue_usage("s/o", meta_queue.size(), meta_queue.capacity())
+					<< ' ' << queue_usage("o/p", opened_queue.size(), opened_queue.capacity())
+					<< ' ' << queue_usage("p/t", prefetched_queue.size(), prefetched_queue.capacity())
+					<< ' ' << queue_usage("t/z", tar_queue.size(), tar_queue.capacity())
+					<< ' ' << queue_usage("z/n", zstd_queue.size(), zstd_queue.capacity())
+					<< '}'
+					<< " lvl=" << active_compression_level.load(std::memory_order_relaxed)
+					<< " rb=" << format_scaled_bytes(read_budget->used_bytes(), "")
+					<< '/' << format_scaled_bytes(read_budget->max_bytes(), "");
+				return out.str();
+			},
+			uncompressed_bytes_processed);
 
 		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue), asio::use_future);
 		auto opener_future = asio::co_spawn(executors.executor(), opener.open(meta_queue, opened_queue), asio::use_future);
@@ -170,7 +300,7 @@ asio::awaitable<void> listen_directory_task(
 
 		std::jthread sender_thread([&] {
 			try {
-				packer.pack(prefetched_queue, tar_queue);
+				packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, &files_processed);
 			} catch (...) {
 				state.fail(std::current_exception());
 				meta_queue.close();
@@ -188,7 +318,7 @@ asio::awaitable<void> listen_directory_task(
 					executors,
 					compression_level,
 					enable_adaptive_compression ? &compression_telemetry : nullptr,
-					nullptr,
+					&active_compression_level,
 					options.log_adaptive_compression);
 				compressor.compress(tar_queue, zstd_queue);
 			} catch (...) {
@@ -224,8 +354,19 @@ asio::awaitable<void> listen_directory_task(
 		join_and_capture(sender_thread, state);
 		join_and_capture(compressor_thread, state);
 		join_and_capture(sink_thread, state);
+		progress_thread.request_stop();
+		if (progress_thread.joinable()) {
+			progress_thread.join();
+		}
+		progress_sync_thread.request_stop();
+		if (progress_sync_thread.joinable()) {
+			progress_sync_thread.join();
+		}
+		finalize_progress_line();
 		state.rethrow_if_failed();
+		complete_progress(progress, false, "send completed");
 	} catch (...) {
+		complete_progress(progress, true, "send failed");
 		*task_error = std::current_exception();
 	}
 
@@ -236,9 +377,16 @@ asio::awaitable<void> receive_directory_task(
 	std::string host,
 	std::uint16_t port,
 	const std::filesystem::path destination_dir,
+	const std::shared_ptr<TransferProgress>& progress,
 	std::exception_ptr* task_error) {
+	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
+	std::atomic<std::uint64_t> files_processed{0};
 	try {
+		set_progress_status(progress, "connecting");
+		std::cerr << "connecting to " << host << ':' << port << "...\n";
 		auto socket = co_await connect_socket_async(std::move(host), port);
+		set_progress_status(progress, "receiving");
+		std::cerr << "connected, receiving transfer...\n";
 		SocketByteSource source(std::move(socket));
 		auto config = make_runtime_config();
 
@@ -247,6 +395,17 @@ asio::awaitable<void> receive_directory_task(
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 		PipelineState state;
 		TarUnpacker unpacker(destination_dir);
+		print_receive_progress_legend();
+		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+
+		auto progress_thread = start_progress_thread(
+			[&](std::uint64_t bytes_per_second) {
+				std::ostringstream out;
+				out << "[receive] " << format_rate(bytes_per_second)
+					<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}';
+				return out.str();
+			},
+			uncompressed_bytes_processed);
 
 		std::jthread input_thread([&] {
 			try {
@@ -260,7 +419,7 @@ asio::awaitable<void> receive_directory_task(
 
 		std::jthread unpacker_thread([&] {
 			try {
-				unpacker.unpack(tar_queue);
+				unpacker.unpack(tar_queue, &uncompressed_bytes_processed, &files_processed);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
@@ -269,8 +428,19 @@ asio::awaitable<void> receive_directory_task(
 
 		join_and_capture(input_thread, state);
 		join_and_capture(unpacker_thread, state);
+		progress_thread.request_stop();
+		if (progress_thread.joinable()) {
+			progress_thread.join();
+		}
+		progress_sync_thread.request_stop();
+		if (progress_sync_thread.joinable()) {
+			progress_sync_thread.join();
+		}
+		finalize_progress_line();
 		state.rethrow_if_failed();
+		complete_progress(progress, false, "receive completed");
 	} catch (...) {
+		complete_progress(progress, true, "receive failed");
 		*task_error = std::current_exception();
 	}
 
@@ -455,9 +625,18 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 }
 
 void listen_directory(const std::filesystem::path& source_dir, std::uint16_t port, RuntimeOptions options) {
+	listen_directory(source_dir, port, options, {}, nullptr);
+}
+
+void listen_directory(
+	const std::filesystem::path& source_dir,
+	std::uint16_t port,
+	RuntimeOptions options,
+	const std::shared_ptr<TransferProgress>& progress,
+	std::atomic<std::uint16_t>* bound_port) {
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, &task_error), asio::detached);
+	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, &task_error), asio::detached);
 	io_context.run();
 	if (task_error) {
 		std::rethrow_exception(task_error);
@@ -465,9 +644,17 @@ void listen_directory(const std::filesystem::path& source_dir, std::uint16_t por
 }
 
 void receive_directory(std::string_view host, std::uint16_t port, const std::filesystem::path& destination_dir) {
+	receive_directory(host, port, destination_dir, {});
+}
+
+void receive_directory(
+	std::string_view host,
+	std::uint16_t port,
+	const std::filesystem::path& destination_dir,
+	const std::shared_ptr<TransferProgress>& progress) {
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, &task_error), asio::detached);
+	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, &task_error), asio::detached);
 	io_context.run();
 	if (task_error) {
 		std::rethrow_exception(task_error);
