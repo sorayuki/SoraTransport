@@ -157,6 +157,7 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 		if (file_counter != nullptr) {
 			file_counter->fetch_add(1, std::memory_order_relaxed);
 		}
+#if 0
 	} else if (status_type == std::filesystem::file_type::symlink) {
 		if (!meta.symlink_target.has_value()) {
 			archive_entry_free(entry);
@@ -165,6 +166,8 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 		archive_entry_set_filetype(entry, AE_IFLNK);
 		archive_entry_set_size(entry, 0);
 		archive_entry_set_symlink_utf8(entry, meta.symlink_target->c_str());
+	} else {
+#endif
 	} else {
 		archive_entry_free(entry);
 		return;
@@ -238,6 +241,10 @@ void TarUnpacker::unpack(
 			}
 			if (status != ARCHIVE_OK) {
 				throw_archive_error(reader, "failed to read tar header");
+			}
+			if (archive_entry_filetype(entry) == AE_IFLNK) {
+				archive_read_data_skip(reader);
+				continue;
 			}
 
 			const auto* utf8_name = archive_entry_pathname_utf8(entry);

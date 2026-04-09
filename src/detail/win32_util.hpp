@@ -6,7 +6,9 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <cwctype>
 
 #include <malloc.h>
 #include <windows.h>
@@ -23,6 +25,20 @@ inline std::string path_to_utf8_string(const std::filesystem::path& path) {
 inline std::string path_to_generic_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.lexically_normal().generic_u8string();
 	return {utf8.begin(), utf8.end()};
+}
+
+inline std::string utf16_to_utf8(std::wstring_view text) {
+	if (text.empty()) {
+		return {};
+	}
+	const int size = ::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+	if (size <= 0) {
+		throw std::runtime_error("failed to convert UTF-16 text to UTF-8");
+	}
+
+	std::string result(static_cast<std::size_t>(size), '\0');
+	::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
+	return result;
 }
 
 // ── Alignment math utilities ─────────────────────────────────────────
@@ -60,8 +76,30 @@ inline std::shared_ptr<uint8_t> make_heap_buffer(std::size_t size) {
 
 // ── Win32 error helpers ──────────────────────────────────────────────
 
+inline std::string win32_error_message_utf8(DWORD error) {
+	LPWSTR buffer = nullptr;
+	const DWORD size = ::FormatMessageW(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr,
+		error,
+		0,
+		reinterpret_cast<LPWSTR>(&buffer),
+		0,
+		nullptr);
+	if (size == 0 || buffer == nullptr) {
+		return std::system_category().message(static_cast<int>(error));
+	}
+
+	std::wstring message(buffer, size);
+	::LocalFree(buffer);
+	while (!message.empty() && std::iswspace(message.back())) {
+		message.pop_back();
+	}
+	return utf16_to_utf8(message);
+}
+
 inline std::runtime_error make_win32_error(const std::string& message, DWORD error = ::GetLastError()) {
-	return std::runtime_error(message + ": " + std::system_category().message(static_cast<int>(error)));
+	return std::runtime_error(message + ": " + win32_error_message_utf8(error));
 }
 
 // ── OVERLAPPED slot base class ───────────────────────────────────────

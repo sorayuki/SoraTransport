@@ -38,10 +38,12 @@ void maybe_set_timestamp(std::optional<FileTimestamp>& destination, LARGE_INTEGE
 	destination = filetime_to_timestamp(value);
 }
 
+#if 0
 std::string path_to_preserved_generic_utf8_string(const std::filesystem::path& path) {
 	auto utf8 = path.generic_u8string();
 	return {utf8.begin(), utf8.end()};
 }
+#endif
 
 void populate_file_meta(FileMeta& meta) {
 	meta.status = std::filesystem::symlink_status(meta.full_path);
@@ -86,6 +88,7 @@ void populate_file_meta(FileMeta& meta) {
 		}
 	}
 
+#if 0
 	if (meta.status.type() == std::filesystem::file_type::symlink) {
 		std::error_code read_link_error;
 		auto target = std::filesystem::read_symlink(meta.full_path, read_link_error);
@@ -93,6 +96,7 @@ void populate_file_meta(FileMeta& meta) {
 			meta.symlink_target = path_to_preserved_generic_utf8_string(target);
 		}
 	}
+#endif
 }
 
 std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t alignment) {
@@ -291,6 +295,9 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 				populate_file_meta(meta);
 				meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
 				if (meta.relative_path_in_tar.empty()) {
+					continue;
+				}
+				if (meta.status.type() == std::filesystem::file_type::symlink) {
 					continue;
 				}
 				co_await out_queue.async_push_await(std::move(meta));
