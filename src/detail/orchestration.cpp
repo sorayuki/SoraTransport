@@ -32,7 +32,7 @@ constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
 
 std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
-	if (std::string_view(error.category().name()) == "system") {
+	if (error.category() == boost::system::system_category()) {
 		return std::runtime_error(message + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
 	}
 	return std::runtime_error(message + ": " + error.message());

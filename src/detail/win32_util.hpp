@@ -8,7 +8,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <cwctype>
 
 #include <malloc.h>
 #include <windows.h>
@@ -92,7 +91,11 @@ inline std::string win32_error_message_utf8(DWORD error) {
 
 	std::wstring message(buffer, size);
 	::LocalFree(buffer);
-	while (!message.empty() && std::iswspace(message.back())) {
+	while (!message.empty()
+		&& (message.back() == L'\r'
+			|| message.back() == L'\n'
+			|| message.back() == L' '
+			|| message.back() == L'\t')) {
 		message.pop_back();
 	}
 	return utf16_to_utf8(message);
