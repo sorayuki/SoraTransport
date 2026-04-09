@@ -1,9 +1,11 @@
 #include "../core.hpp"
 #include "internal.hpp"
+#include "win32_util.hpp"
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/connect.hpp>
+#include <boost/asio/redirect_error.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_future.hpp>
@@ -197,9 +199,16 @@ std::jthread start_progress_sync_thread(
 asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::resolver resolver(executor);
-	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::use_awaitable);
+	boost::system::error_code error;
+	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
+	if (error) {
+		throw make_win32_error("failed to resolve receiver address", static_cast<DWORD>(error.value()));
+	}
 	asio::ip::tcp::socket socket(executor);
-	co_await asio::async_connect(socket, endpoints, asio::use_awaitable);
+	co_await asio::async_connect(socket, endpoints, asio::redirect_error(asio::use_awaitable, error));
+	if (error) {
+		throw make_win32_error("failed to connect to sender", static_cast<DWORD>(error.value()));
+	}
 	co_return std::move(socket);
 }
 
@@ -221,22 +230,26 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 		acceptor = asio::ip::tcp::acceptor(executor);
 		acceptor.open(asio::ip::tcp::v4(), error);
 		if (error) {
-			throw boost::system::system_error(error);
+			throw make_win32_error("failed to open IPv4 listener socket", static_cast<DWORD>(error.value()));
 		}
 		acceptor.bind({asio::ip::tcp::v4(), port}, error);
 		if (error) {
-			throw boost::system::system_error(error);
+			throw make_win32_error("failed to bind IPv4 listener socket", static_cast<DWORD>(error.value()));
 		}
 	}
 
 	acceptor.listen(asio::socket_base::max_listen_connections, error);
 	if (error) {
-		throw boost::system::system_error(error);
+		throw make_win32_error("failed to listen on socket", static_cast<DWORD>(error.value()));
 	}
 	if (bound_port != nullptr) {
 		bound_port->store(acceptor.local_endpoint().port(), std::memory_order_relaxed);
 	}
-	co_return co_await acceptor.async_accept(asio::use_awaitable);
+	auto socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
+	if (error) {
+		throw make_win32_error("failed to accept receiver connection", static_cast<DWORD>(error.value()));
+	}
+	co_return std::move(socket);
 }
 
 asio::awaitable<void> listen_directory_task(
