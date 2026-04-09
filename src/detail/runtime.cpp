@@ -18,6 +18,8 @@ constexpr std::size_t kTargetInFlightReadBytes = 96 * 1024 * 1024;
 constexpr std::size_t kDefaultTarQueueDepth = 16;
 constexpr std::size_t kDefaultMaxInFlightWriteOps = 3;
 constexpr std::size_t kMaxDefaultWorkerThreads = 12;
+constexpr std::size_t kOpenConcurrencyMultiplier = 4;
+constexpr std::size_t kMaxDefaultOpenConcurrency = 48;
 constexpr int kMaxZstdWorkers = 6;
 
 std::size_t hardware_threads() {
@@ -31,6 +33,10 @@ RuntimeConfig make_runtime_config(RuntimeOptions options) {
 	const auto threads = hardware_threads();
 	RuntimeConfig config;
 	config.worker_threads = std::clamp<std::size_t>(threads, 1, kMaxDefaultWorkerThreads);
+	config.file_open_concurrency = std::clamp<std::size_t>(
+		config.worker_threads * kOpenConcurrencyMultiplier,
+		static_cast<std::size_t>(1),
+		kMaxDefaultOpenConcurrency);
 	config.tar_queue_depth = kDefaultTarQueueDepth;
 	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
 	config.max_in_flight_write_ops = std::max<std::size_t>(1, options.max_in_flight_write_ops.value_or(kDefaultMaxInFlightWriteOps));

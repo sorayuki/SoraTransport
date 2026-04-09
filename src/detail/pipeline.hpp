@@ -156,6 +156,7 @@ public:
 		std::size_t buffer_size,
 		FileIoMode io_mode = FileIoMode::Buffered);
 	boost::asio::awaitable<void> open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
+	void open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 
 private:
 	BufferPool& pool_;

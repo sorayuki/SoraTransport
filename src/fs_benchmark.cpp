@@ -9,8 +9,10 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using soratransport::path_to_utf8_string;
 
@@ -86,20 +88,41 @@ int main(int argc, char** argv) {
 		auto read_budget = std::make_shared<soratransport::InFlightReadBudget>(config.max_in_flight_read_bytes);
 		soratransport::DirScanner scanner(executors);
 		soratransport::BoundedQueue<soratransport::FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
-		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(kOpenedQueueDepth, executors.executor());
+		soratransport::BoundedQueue<soratransport::OpenedFileReader> opened_queue(
+			std::max(kOpenedQueueDepth, config.file_open_concurrency),
+			executors.executor());
 		soratransport::BoundedQueue<soratransport::OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
-		soratransport::FileReaderOpener opener(pool, executors, config.worker_threads, kReadChunkSize);
+		soratransport::FileReaderOpener opener(pool, executors, config.file_open_concurrency, kReadChunkSize);
 		soratransport::FileReaderPrefetcher prefetcher(executors, read_budget, kReadChunkSize);
 
 		std::uint64_t file_count = 0;
 		std::uint64_t bytes_read = 0;
 		auto start = std::chrono::steady_clock::now();
+		std::exception_ptr opener_error;
+		std::mutex opener_error_mutex;
 
 		auto scanner_future = boost::asio::co_spawn(executors.executor(), scanner.scan(root, meta_queue), boost::asio::use_future);
-		std::optional<std::future<void>> opener_future;
+		std::vector<std::jthread> opener_threads;
 		std::optional<std::future<void>> prefetch_future;
 		if (options.read_files) {
-			opener_future.emplace(boost::asio::co_spawn(executors.executor(), opener.open(meta_queue, opened_queue), boost::asio::use_future));
+			opener_threads.reserve(config.file_open_concurrency);
+			for (std::size_t index = 0; index < config.file_open_concurrency; ++index) {
+				opener_threads.emplace_back([&] {
+					try {
+						opener.open_sync(meta_queue, opened_queue);
+					} catch (...) {
+						{
+							std::lock_guard lock(opener_error_mutex);
+							if (!opener_error) {
+								opener_error = std::current_exception();
+							}
+						}
+						meta_queue.close();
+						opened_queue.close();
+						prefetched_queue.close();
+					}
+				});
+			}
 			prefetch_future.emplace(boost::asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), boost::asio::use_future));
 		}
 
@@ -126,8 +149,16 @@ int main(int argc, char** argv) {
 		}
 
 		scanner_future.get();
-		if (opener_future.has_value()) {
-			opener_future->get();
+		for (auto& opener_thread : opener_threads) {
+			if (opener_thread.joinable()) {
+				opener_thread.join();
+			}
+		}
+		if (opener_error) {
+			std::rethrow_exception(opener_error);
+		}
+		if (options.read_files) {
+			opened_queue.close();
 		}
 		if (prefetch_future.has_value()) {
 			prefetch_future->get();

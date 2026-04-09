@@ -639,22 +639,26 @@ FileReaderOpener::FileReaderOpener(
 
 boost::asio::awaitable<void> FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
 	try {
-		while (auto meta = co_await in_meta.async_pop_await()) {
-			OpenedFileReader opened_file;
-			opened_file.meta = std::move(*meta);
-			if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
-				auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
-				reader.open();
-				opened_file.reader.emplace(std::move(reader));
-			}
-			co_await out_opened.async_push_await(std::move(opened_file));
-		}
+		open_sync(in_meta, out_opened);
 		out_opened.close();
 	} catch (...) {
 		out_opened.close();
 		throw;
 	}
 	co_return;
+}
+
+void FileReaderOpener::open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
+	while (auto meta = in_meta.pop()) {
+		OpenedFileReader opened_file;
+		opened_file.meta = std::move(*meta);
+		if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
+			auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
+			reader.open();
+			opened_file.reader.emplace(std::move(reader));
+		}
+		out_opened.push(std::move(opened_file));
+	}
 }
 
 FileReaderPrefetcher::FileReaderPrefetcher(
