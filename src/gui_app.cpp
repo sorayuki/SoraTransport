@@ -6,6 +6,7 @@
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Scroll.H>
+#include <FL/fl_ask.H>
 #include <FL/platform.H>
 
 #include <chrono>
@@ -212,6 +213,7 @@ public:
 			break;
 		}
 
+		callback(window_close_callback, this);
 		update_ui();
 		Fl::add_timeout(0.25, timer_callback, this);
 	}
@@ -221,6 +223,10 @@ public:
 	}
 
 private:
+	static void window_close_callback(Fl_Widget*, void* context) {
+		static_cast<AppWindow*>(context)->handle_close_request();
+	}
+
 	static void copy_address_callback(Fl_Widget* widget, void* context) {
 		auto* self = static_cast<AppWindow*>(context);
 		write_clipboard_text(widget->label());
@@ -233,6 +239,23 @@ private:
 		auto* self = static_cast<AppWindow*>(context);
 		self->update_ui();
 		Fl::repeat_timeout(0.25, timer_callback, context);
+	}
+
+	void handle_close_request() {
+		const auto snapshot = progress_->snapshot();
+		if (mode_ == GuiMode::Idle || snapshot.completed) {
+			hide();
+			return;
+		}
+
+		if (transfer_started_) {
+			const auto choice = fl_choice("传输仍在进行，要停止吗", "否", "是", nullptr);
+			if (choice != 1) {
+				return;
+			}
+		}
+
+		ExitProcess(0);
 	}
 
 	void rebuild_address_buttons() {
