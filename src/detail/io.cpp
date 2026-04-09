@@ -26,6 +26,9 @@ constexpr std::size_t kSocketIoBufferSize = 1 * 1024 * 1024;
 constexpr std::size_t kSocketIoReceiveBufferSize = kSocketIoBufferSize / 2;
 
 std::runtime_error make_socket_error(std::string_view action, const boost::system::error_code& error) {
+	if (error.category() == boost::system::system_category()) {
+		return std::runtime_error(std::string(action) + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
+	}
 	return std::runtime_error(std::string(action) + ": " + error.message());
 }
 
