@@ -216,7 +216,7 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	if (error) {
 		throw make_boost_error("failed to connect to sender", error);
 	}
-	co_return std::move(socket);
+	co_return socket;
 }
 
 asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port) {
@@ -256,7 +256,7 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 	if (error) {
 		throw make_boost_error("failed to accept receiver connection", error);
 	}
-	co_return std::move(socket);
+	co_return socket;
 }
 
 asio::awaitable<void> listen_directory_task(
