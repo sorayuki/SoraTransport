@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <cwchar>
 #include <deque>
@@ -24,6 +25,7 @@ constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kBufferedWriteBatchSize = 8 * 1024 * 1024;
 constexpr std::size_t kSocketIoBufferSize = 1 * 1024 * 1024;
 constexpr std::size_t kSocketIoReceiveBufferSize = kSocketIoBufferSize / 2;
+constexpr auto kSocketIoMaxBufferedSendDelay = std::chrono::milliseconds(100);
 
 std::runtime_error make_socket_error(std::string_view action, const boost::system::error_code& error) {
 	if (error.category() == boost::system::system_category()) {
@@ -550,11 +552,17 @@ struct SocketByteSink::State {
 				continue;
 			}
 
+			const auto was_empty = fill_size == 0;
+			const auto now = std::chrono::steady_clock::now();
 			const auto chunk = std::min<std::size_t>(available, bytes.size() - offset);
 			std::memcpy(buffers[fill_index].data() + fill_size, bytes.data() + offset, chunk);
 			fill_size += chunk;
 			offset += chunk;
-			if (fill_size == kSocketIoBufferSize) {
+			if (was_empty) {
+				fill_started_at = now;
+			}
+			if (fill_size == kSocketIoBufferSize
+				|| (fill_started_at.has_value() && now - *fill_started_at >= kSocketIoMaxBufferedSendDelay)) {
 				submit_fill_buffer();
 			}
 		}
@@ -574,18 +582,26 @@ struct SocketByteSink::State {
 	}
 
 	void stop() {
-		if (stopped) {
+		if (stop_completed) {
 			return;
 		}
-		stopped = true;
+		close_socket();
+		if (send_in_flight) {
+			wait_for_pending_send();
+		}
+		stop_completed = true;
+	}
+
+	void close_socket() {
+		if (stop_requested) {
+			return;
+		}
+		stop_requested = true;
 		if (send_in_flight) {
 			boost::system::error_code ignored;
 			socket.cancel(ignored);
-			shutdown_socket();
-			wait_for_pending_send();
-		} else {
-			shutdown_socket();
 		}
+		shutdown_socket();
 	}
 
 	void submit_fill_buffer() {
@@ -615,6 +631,7 @@ struct SocketByteSink::State {
 		if (sizes[fill_index] != 0) {
 			throw std::runtime_error("socket sink fill buffer was not released");
 		}
+		fill_started_at.reset();
 		poll_pending_send();
 	}
 
@@ -641,7 +658,7 @@ struct SocketByteSink::State {
 		}
 		send_completed = false;
 		if (send_error) {
-			if (!async_error && !(stopped && send_error == boost::asio::error::operation_aborted)) {
+			if (!async_error) {
 				async_error = std::make_exception_ptr(make_socket_error("socket write failed", send_error));
 			}
 		} else if (completed_index.has_value()) {
@@ -688,9 +705,11 @@ struct SocketByteSink::State {
 	std::array<std::vector<uint8_t>, 2> buffers;
 	std::array<std::size_t, 2> sizes{};
 	std::size_t fill_index = 0;
+	std::optional<std::chrono::steady_clock::time_point> fill_started_at;
 	std::optional<std::size_t> completed_index;
 	bool closed = false;
-	bool stopped = false;
+	bool stop_requested = false;
+	bool stop_completed = false;
 	bool send_in_flight = false;
 	bool send_completed = false;
 	std::size_t send_bytes_transferred = 0;
@@ -717,6 +736,12 @@ void SocketByteSink::write(std::span<const uint8_t> bytes) {
 
 void SocketByteSink::close() {
 	state_->close();
+}
+
+void SocketByteSink::close_socket() {
+	if (state_) {
+		state_->close_socket();
+	}
 }
 
 void SocketByteSink::stop() {
@@ -781,24 +806,32 @@ struct SocketByteSource::State {
 	}
 
 	void stop() {
-		if (stopped) {
+		if (stop_completed) {
 			return;
 		}
-		stopped = true;
+		close_socket();
 		if (receive_in_flight) {
-			boost::system::error_code ignored;
-			socket.cancel(ignored);
-			shutdown_socket();
 			while (receive_in_flight) {
 				run_one_io();
 			}
-		} else {
-			shutdown_socket();
 		}
+		stop_completed = true;
+	}
+
+	void close_socket() {
+		if (stop_requested) {
+			return;
+		}
+		stop_requested = true;
+		if (receive_in_flight) {
+			boost::system::error_code ignored;
+			socket.cancel(ignored);
+		}
+		shutdown_socket();
 	}
 
 	void start_receive_if_possible() {
-		if (stopped || eof || async_error || receive_in_flight) {
+		if (stop_requested || eof || async_error || receive_in_flight) {
 			return;
 		}
 		if (staged_free_capacity() < receive_buffer.size()) {
@@ -813,9 +846,6 @@ struct SocketByteSource::State {
 			[this](const boost::system::error_code& error, std::size_t bytes_transferred) {
 				receive_in_flight = false;
 
-				if (stopped && error == boost::asio::error::operation_aborted) {
-					return;
-				}
 				if (error == boost::asio::error::eof || bytes_transferred == 0) {
 					eof = true;
 					return;
@@ -898,7 +928,8 @@ struct SocketByteSource::State {
 	std::size_t active_offset = 0;
 	std::size_t staged_size = 0;
 	bool eof = false;
-	bool stopped = false;
+	bool stop_requested = false;
+	bool stop_completed = false;
 	bool receive_in_flight = false;
 	std::exception_ptr async_error;
 	bool socket_shutdown = false;
@@ -918,6 +949,12 @@ SocketByteSource& SocketByteSource::operator=(SocketByteSource&&) noexcept = def
 
 std::size_t SocketByteSource::read(uint8_t* buffer, std::size_t length) {
 	return state_->read(buffer, length);
+}
+
+void SocketByteSource::close_socket() {
+	if (state_) {
+		state_->close_socket();
+	}
 }
 
 void SocketByteSource::stop() {

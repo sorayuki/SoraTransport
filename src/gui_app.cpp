@@ -9,6 +9,7 @@
 #include <FL/fl_ask.H>
 #include <FL/platform.H>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -184,6 +185,7 @@ public:
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
+				session_finished_.store(true, std::memory_order_release);
 				Fl::awake();
 			});
 			break;
@@ -201,6 +203,7 @@ public:
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
+				session_finished_.store(true, std::memory_order_release);
 				Fl::awake();
 			});
 			break;
@@ -244,6 +247,10 @@ private:
 	}
 
 	void handle_close_request() {
+		if (close_requested_) {
+			return;
+		}
+
 		const auto snapshot = progress_->snapshot();
 		if (mode_ == GuiMode::Idle || snapshot.completed) {
 			hide();
@@ -258,14 +265,14 @@ private:
 			}
 		}
 
+		close_requested_ = true;
+		transient_status_ = "正在停止传输...";
+		transient_status_until_ = std::chrono::steady_clock::time_point::max();
 		session_thread_.request_stop();
-		auto thread = std::move(session_thread_);
-		std::thread([t = std::move(thread)]() mutable {
-			if (t.joinable()) {
-				t.join();
-			}
-		}).detach();
-		hide();
+		update_ui();
+		if (session_finished_.load(std::memory_order_acquire)) {
+			hide();
+		}
 	}
 
 	void rebuild_address_buttons() {
@@ -310,6 +317,11 @@ private:
 	}
 
 	void update_ui() {
+		if (close_requested_ && session_finished_.load(std::memory_order_acquire)) {
+			hide();
+			return;
+		}
+
 		update_send_addresses();
 
 		const auto snapshot = progress_->snapshot();
@@ -377,6 +389,8 @@ private:
 	std::optional<std::chrono::steady_clock::time_point> completed_at_;
 	bool addresses_loaded_ = false;
 	bool transfer_started_ = false;
+	bool close_requested_ = false;
+	std::atomic<bool> session_finished_{false};
 	std::vector<InterfaceAddress> addresses_;
 	std::vector<Fl_Button*> address_buttons_;
 	std::chrono::steady_clock::time_point last_sample_time_{};

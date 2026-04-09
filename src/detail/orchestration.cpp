@@ -324,7 +324,7 @@ asio::awaitable<void> listen_directory_task(
 		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(socket));
 		std::stop_callback sink_stop(stop_token, [&sink] {
-			sink.stop();
+			sink.close_socket();
 		});
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
@@ -463,7 +463,7 @@ asio::awaitable<void> receive_directory_task(
 		std::cerr << "connected, receiving transfer...\n";
 		SocketByteSource source(std::move(socket));
 		std::stop_callback source_stop(stop_token, [&source] {
-			source.stop();
+			source.close_socket();
 		});
 		auto config = make_runtime_config();
 

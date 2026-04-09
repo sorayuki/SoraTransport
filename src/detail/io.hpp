@@ -75,6 +75,7 @@ public:
 	SocketByteSink& operator=(SocketByteSink&&) noexcept;
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
+	void close_socket();
 	void stop();
 
 private:
@@ -91,6 +92,7 @@ public:
 	SocketByteSource(SocketByteSource&&) noexcept;
 	SocketByteSource& operator=(SocketByteSource&&) noexcept;
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
+	void close_socket();
 	void stop();
 
 private:
