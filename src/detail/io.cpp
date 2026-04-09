@@ -716,6 +716,12 @@ void SocketByteSink::close() {
 	state_->close();
 }
 
+void SocketByteSink::stop() {
+	if (state_) {
+		state_->stop();
+	}
+}
+
 struct SocketByteSource::State {
 	explicit State(boost::asio::ip::tcp::socket s)
 		: socket(std::move(s)), io_context(static_cast<boost::asio::io_context&>(socket.get_executor().context())) {
@@ -909,6 +915,12 @@ SocketByteSource& SocketByteSource::operator=(SocketByteSource&&) noexcept = def
 
 std::size_t SocketByteSource::read(uint8_t* buffer, std::size_t length) {
 	return state_->read(buffer, length);
+}
+
+void SocketByteSource::stop() {
+	if (state_) {
+		state_->stop();
+	}
 }
 
 } // namespace soratransport

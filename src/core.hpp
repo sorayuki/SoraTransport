@@ -2,6 +2,8 @@
 
 #include "detail/pipeline.hpp"
 
+#include <stop_token>
+
 namespace soratransport {
 
 struct TransferProgressSnapshot {
@@ -47,12 +49,14 @@ void listen_directory(
 	std::uint16_t port,
 	RuntimeOptions options = {},
 	const std::shared_ptr<TransferProgress>& progress = {},
-	std::atomic<std::uint16_t>* bound_port = nullptr);
+	std::atomic<std::uint16_t>* bound_port = nullptr,
+	std::stop_token stop_token = {});
 void receive_directory(
 	std::string_view host,
 	std::uint16_t port,
 	const std::filesystem::path& destination_dir,
-	const std::shared_ptr<TransferProgress>& progress = {});
+	const std::shared_ptr<TransferProgress>& progress = {},
+	std::stop_token stop_token = {});
 int run_soratransport_cli(int argc, char** argv);
 int run_fasttar_cli(int argc, char** argv);
 
