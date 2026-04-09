@@ -14,6 +14,29 @@ endif()
 
 project(SoraTransport)
 
+# boost
+list(APPEND CMAKE_PREFIX_PATH "D:/dev/boost_1_90_0/dist/lib/cmake/Boost-1.90.0")
+
+# fltk
+include(FetchContent)
+
+set(FLTK_BUILD_TEST OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_FLUID OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_HTML_DOCS OFF CACHE BOOL "" FORCE)
+set(FLTK_BUILD_PDF_DOCS OFF CACHE BOOL "" FORCE)
+set(FLTK_OPTION_PRINT_SUPPORT OFF CACHE BOOL "" FORCE)
+set(FLTK_MSVC_RUNTIME_DLL OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    fltk
+    GIT_REPOSITORY https://github.com/fltk/fltk.git
+    GIT_TAG release-1.4.4
+    GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(fltk)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -31,7 +54,7 @@ find_package(Boost REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
-find_package(FLTK CONFIG REQUIRED)
+# find_package(FLTK CONFIG REQUIRED)
 
 if(TARGET fltk AND NOT TARGET fltk::fltk)
 	add_library(fltk::fltk INTERFACE IMPORTED)
@@ -128,6 +151,6 @@ add_executable(soratransport_app WIN32
 target_link_libraries(soratransport_app
 	PRIVATE
 		soratransport_core
-		fltk::fltk
+		fltk
 )
 

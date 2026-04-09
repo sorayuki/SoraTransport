@@ -2,14 +2,10 @@
   "name": "soratransport",
   "version-string": "0.1.0",
   "dependencies": [
-    "boost-asio",
-    "zlib",
     "zstd",
-    "fltk",
     {
       "name": "libarchive",
       "default-features": false
     }
-  ],
-  "builtin-baseline": "140057915cbe11472be91fab313694304aba43fb"
+  ]
 }

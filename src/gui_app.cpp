@@ -250,7 +250,8 @@ private:
 			return;
 		}
 
-		if (transfer_started_) {
+		const bool active_transfer = (mode_ == GuiMode::Receive) || transfer_started_;
+		if (active_transfer) {
 			const auto choice = fl_choice("传输仍在进行，要停止吗？", "否", "是", nullptr);
 			if (choice != kStopTransferChoice) {
 				return;
@@ -258,9 +259,12 @@ private:
 		}
 
 		session_thread_.request_stop();
-		if (session_thread_.joinable()) {
-			session_thread_.join();
-		}
+		auto thread = std::move(session_thread_);
+		std::thread([t = std::move(thread)]() mutable {
+			if (t.joinable()) {
+				t.join();
+			}
+		}).detach();
 		hide();
 	}
 
