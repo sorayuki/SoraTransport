@@ -16,6 +16,7 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <stop_token>
 #include <sstream>
 #include <stdexcept>
 
@@ -30,6 +31,11 @@ constexpr std::size_t kMetaQueueDepth = 256;
 constexpr std::size_t kOpenedQueueDepth = 4;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
+
+class TransferCancelledError : public std::runtime_error {
+public:
+	TransferCancelledError() : std::runtime_error("transfer cancelled") {}
+};
 
 std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
 	if (error.category() == boost::system::system_category()) {
@@ -203,25 +209,63 @@ std::jthread start_progress_sync_thread(
 	});
 }
 
-asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port) {
+bool is_transfer_cancelled(const std::exception_ptr& error) {
+	if (!error) {
+		return false;
+	}
+	try {
+		std::rethrow_exception(error);
+	} catch (const TransferCancelledError&) {
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+bool should_throw_cancelled_error(std::stop_token stop_token, const boost::system::error_code& error) {
+	return stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
+}
+
+bool should_report_transfer_error(std::stop_token stop_token, const std::exception_ptr& error) {
+	return !stop_token.stop_requested() && !is_transfer_cancelled(error);
+}
+
+asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port, std::stop_token stop_token) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::resolver resolver(executor);
+	asio::ip::tcp::socket socket(executor);
+	std::stop_callback on_stop(stop_token, [&resolver, &socket] {
+		resolver.cancel();
+		boost::system::error_code ignored;
+		socket.cancel(ignored);
+		socket.close(ignored);
+	});
 	boost::system::error_code error;
 	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
+		if (should_throw_cancelled_error(stop_token, error)) {
+			throw TransferCancelledError();
+		}
 		throw make_boost_error("failed to resolve receiver address", error);
 	}
-	asio::ip::tcp::socket socket(executor);
 	co_await asio::async_connect(socket, endpoints, asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
+		if (should_throw_cancelled_error(stop_token, error)) {
+			throw TransferCancelledError();
+		}
 		throw make_boost_error("failed to connect to sender", error);
 	}
 	co_return socket;
 }
 
-asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port) {
+asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port, std::stop_token stop_token) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::acceptor acceptor(executor);
+	std::stop_callback on_stop(stop_token, [&acceptor] {
+		boost::system::error_code ignored;
+		acceptor.cancel(ignored);
+		acceptor.close(ignored);
+	});
 	boost::system::error_code error;
 
 	acceptor.open(asio::ip::tcp::v6(), error);
@@ -254,6 +298,9 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 	}
 	auto socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
+		if (should_throw_cancelled_error(stop_token, error)) {
+			throw TransferCancelledError();
+		}
 		throw make_boost_error("failed to accept receiver connection", error);
 	}
 	co_return socket;
@@ -265,16 +312,20 @@ asio::awaitable<void> listen_directory_task(
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint16_t>* bound_port,
+	std::stop_token stop_token,
 	std::exception_ptr* task_error) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "binding listener");
-		auto socket = co_await accept_socket_async(port, bound_port);
+		auto socket = co_await accept_socket_async(port, bound_port, stop_token);
 		set_progress_status(progress, "receiver connected");
 		std::cerr << "listening on port " << socket.local_endpoint().port() << ", waiting for receiver...\n";
 		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(socket));
+		std::stop_callback sink_stop(stop_token, [&sink] {
+			sink.stop();
+		});
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 		const auto enable_adaptive_compression = !options.compression_level.has_value();
@@ -386,8 +437,10 @@ asio::awaitable<void> listen_directory_task(
 		state.rethrow_if_failed();
 		complete_progress(progress, false, "send completed");
 	} catch (...) {
-		complete_progress(progress, true, "send failed");
 		*task_error = std::current_exception();
+		if (should_report_transfer_error(stop_token, *task_error)) {
+			complete_progress(progress, true, "send failed");
+		}
 	}
 
 	co_return;
@@ -398,16 +451,20 @@ asio::awaitable<void> receive_directory_task(
 	std::uint16_t port,
 	const std::filesystem::path destination_dir,
 	const std::shared_ptr<TransferProgress>& progress,
+	std::stop_token stop_token,
 	std::exception_ptr* task_error) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "connecting");
 		std::cerr << "connecting to " << host << ':' << port << "...\n";
-		auto socket = co_await connect_socket_async(std::move(host), port);
+		auto socket = co_await connect_socket_async(std::move(host), port, stop_token);
 		set_progress_status(progress, "receiving");
 		std::cerr << "connected, receiving transfer...\n";
 		SocketByteSource source(std::move(socket));
+		std::stop_callback source_stop(stop_token, [&source] {
+			source.stop();
+		});
 		auto config = make_runtime_config();
 
 		RuntimeExecutors executors(config.worker_threads);
@@ -460,8 +517,10 @@ asio::awaitable<void> receive_directory_task(
 		state.rethrow_if_failed();
 		complete_progress(progress, false, "receive completed");
 	} catch (...) {
-		complete_progress(progress, true, "receive failed");
 		*task_error = std::current_exception();
+		if (should_report_transfer_error(stop_token, *task_error)) {
+			complete_progress(progress, true, "receive failed");
+		}
 	}
 
 	co_return;
@@ -645,7 +704,7 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 }
 
 void listen_directory(const std::filesystem::path& source_dir, std::uint16_t port, RuntimeOptions options) {
-	listen_directory(source_dir, port, options, {}, nullptr);
+	listen_directory(source_dir, port, options, {}, nullptr, {});
 }
 
 void listen_directory(
@@ -653,30 +712,32 @@ void listen_directory(
 	std::uint16_t port,
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
-	std::atomic<std::uint16_t>* bound_port) {
+	std::atomic<std::uint16_t>* bound_port,
+	std::stop_token stop_token) {
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, &task_error), asio::detached);
+	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, stop_token, &task_error), asio::detached);
 	io_context.run();
-	if (task_error) {
+	if (task_error && should_report_transfer_error(stop_token, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }
 
 void receive_directory(std::string_view host, std::uint16_t port, const std::filesystem::path& destination_dir) {
-	receive_directory(host, port, destination_dir, {});
+	receive_directory(host, port, destination_dir, {}, {});
 }
 
 void receive_directory(
 	std::string_view host,
 	std::uint16_t port,
 	const std::filesystem::path& destination_dir,
-	const std::shared_ptr<TransferProgress>& progress) {
+	const std::shared_ptr<TransferProgress>& progress,
+	std::stop_token stop_token) {
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, &task_error), asio::detached);
+	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, stop_token, &task_error), asio::detached);
 	io_context.run();
-	if (task_error) {
+	if (task_error && should_report_transfer_error(stop_token, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }

@@ -6,6 +6,7 @@
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Scroll.H>
+#include <FL/fl_ask.H>
 #include <FL/platform.H>
 
 #include <chrono>
@@ -21,6 +22,8 @@
 namespace soratransport {
 
 namespace {
+
+constexpr int kStopTransferChoice = 1;
 
 std::string format_size(std::uint64_t bytes) {
 	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -175,9 +178,9 @@ public:
 			address_title_box_->show();
 			address_scroll_->show();
 			progress_->set_status("starting sender");
-			session_thread_ = std::jthread([this] {
+			session_thread_ = std::jthread([this](std::stop_token stop_token) {
 				try {
-					listen_directory(path_, 0, {}, progress_, &bound_port_);
+					listen_directory(path_, 0, {}, progress_, &bound_port_, stop_token);
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
@@ -192,9 +195,9 @@ public:
 			empty_box_->show();
 			empty_box_->copy_label("接收模式会从剪贴板读取 soratrans:// 地址，并将收到的文件保存到当前文件夹。");
 			progress_->set_status("starting receiver");
-			session_thread_ = std::jthread([this] {
+			session_thread_ = std::jthread([this](std::stop_token stop_token) {
 				try {
-					receive_directory(receive_url_->host, receive_url_->port, path_, progress_);
+					receive_directory(receive_url_->host, receive_url_->port, path_, progress_, stop_token);
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
@@ -212,6 +215,7 @@ public:
 			break;
 		}
 
+		callback(window_close_callback, this);
 		update_ui();
 		Fl::add_timeout(0.25, timer_callback, this);
 	}
@@ -221,6 +225,10 @@ public:
 	}
 
 private:
+	static void window_close_callback(Fl_Widget*, void* context) {
+		static_cast<AppWindow*>(context)->handle_close_request();
+	}
+
 	static void copy_address_callback(Fl_Widget* widget, void* context) {
 		auto* self = static_cast<AppWindow*>(context);
 		write_clipboard_text(widget->label());
@@ -233,6 +241,27 @@ private:
 		auto* self = static_cast<AppWindow*>(context);
 		self->update_ui();
 		Fl::repeat_timeout(0.25, timer_callback, context);
+	}
+
+	void handle_close_request() {
+		const auto snapshot = progress_->snapshot();
+		if (mode_ == GuiMode::Idle || snapshot.completed) {
+			hide();
+			return;
+		}
+
+		if (transfer_started_) {
+			const auto choice = fl_choice("传输仍在进行，要停止吗？", "否", "是", nullptr);
+			if (choice != kStopTransferChoice) {
+				return;
+			}
+		}
+
+		session_thread_.request_stop();
+		if (session_thread_.joinable()) {
+			session_thread_.join();
+		}
+		hide();
 	}
 
 	void rebuild_address_buttons() {
