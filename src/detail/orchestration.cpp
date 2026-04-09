@@ -31,6 +31,13 @@ constexpr std::size_t kOpenedQueueDepth = 4;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
 
+std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
+	if (std::string_view(error.category().name()) == "system") {
+		return std::runtime_error(message + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
+	}
+	return std::runtime_error(message + ": " + error.message());
+}
+
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
 	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
 	double value = static_cast<double>(bytes);
@@ -202,12 +209,12 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	boost::system::error_code error;
 	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		throw make_win32_error("failed to resolve receiver address", static_cast<DWORD>(error.value()));
+		throw make_boost_error("failed to resolve receiver address", error);
 	}
 	asio::ip::tcp::socket socket(executor);
 	co_await asio::async_connect(socket, endpoints, asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		throw make_win32_error("failed to connect to sender", static_cast<DWORD>(error.value()));
+		throw make_boost_error("failed to connect to sender", error);
 	}
 	co_return std::move(socket);
 }
@@ -230,24 +237,24 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 		acceptor = asio::ip::tcp::acceptor(executor);
 		acceptor.open(asio::ip::tcp::v4(), error);
 		if (error) {
-			throw make_win32_error("failed to open IPv4 listener socket", static_cast<DWORD>(error.value()));
+			throw make_boost_error("failed to open IPv4 listener socket", error);
 		}
 		acceptor.bind({asio::ip::tcp::v4(), port}, error);
 		if (error) {
-			throw make_win32_error("failed to bind IPv4 listener socket", static_cast<DWORD>(error.value()));
+			throw make_boost_error("failed to bind IPv4 listener socket", error);
 		}
 	}
 
 	acceptor.listen(asio::socket_base::max_listen_connections, error);
 	if (error) {
-		throw make_win32_error("failed to listen on socket", static_cast<DWORD>(error.value()));
+		throw make_boost_error("failed to listen on socket", error);
 	}
 	if (bound_port != nullptr) {
 		bound_port->store(acceptor.local_endpoint().port(), std::memory_order_relaxed);
 	}
 	auto socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		throw make_win32_error("failed to accept receiver connection", static_cast<DWORD>(error.value()));
+		throw make_boost_error("failed to accept receiver connection", error);
 	}
 	co_return std::move(socket);
 }
