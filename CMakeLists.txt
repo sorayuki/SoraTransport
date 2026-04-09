@@ -1,80 +1,42 @@
 cmake_minimum_required(VERSION 4.0.0)
 
+if(NOT DEFINED VCPKG_MANIFEST_MODE)
+	set(VCPKG_MANIFEST_MODE ON CACHE BOOL "Use the vcpkg manifest in the source tree")
+endif()
+
+if(NOT DEFINED VCPKG_MANIFEST_DIR)
+	set(VCPKG_MANIFEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Path to the vcpkg manifest directory")
+endif()
+
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+	set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "vcpkg target triplet")
+endif()
+
 project(SoraTransport)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-	add_compile_options(/utf-8)
+	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library" FORCE)
 endif()
 
-set(SORATRANSPORT_VCPKG_ROOT "D:/devspace/vcpkg" CACHE PATH "Path to the local vcpkg installation")
-set(SORATRANSPORT_VCPKG_TRIPLET "x64-windows" CACHE STRING "Triplet used for prebuilt vcpkg dependencies")
-set(SORATRANSPORT_VCPKG_INSTALLED_DIR "${SORATRANSPORT_VCPKG_ROOT}/installed/${SORATRANSPORT_VCPKG_TRIPLET}")
-
-if(NOT EXISTS "${SORATRANSPORT_VCPKG_INSTALLED_DIR}")
-	message(FATAL_ERROR "Missing vcpkg installed directory: ${SORATRANSPORT_VCPKG_INSTALLED_DIR}")
+if(MSVC)
+	add_compile_options(/utf-8)
 endif()
 
 write_file("${CMAKE_CURRENT_BINARY_DIR}/.gitignore" "**")
 
-list(PREPEND CMAKE_PREFIX_PATH
-	"D:/dev/boost_1_90_0/dist/lib/cmake/Boost-1.90.0"
-	"${SORATRANSPORT_VCPKG_INSTALLED_DIR}"
-	"${SORATRANSPORT_VCPKG_INSTALLED_DIR}/share/zstd"
-)
-
 find_package(Boost REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(LibArchive REQUIRED)
+find_package(FLTK CONFIG REQUIRED)
 
-find_path(LibArchive_INCLUDE_DIR
-	NAMES archive.h
-	PATHS "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/include"
-	NO_DEFAULT_PATH
-	REQUIRED
-)
-
-find_library(LibArchive_LIBRARY_RELEASE
-	NAMES archive
-	PATHS "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/lib"
-	NO_DEFAULT_PATH
-	REQUIRED
-)
-
-find_library(LibArchive_LIBRARY_DEBUG
-	NAMES archive
-	PATHS "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/debug/lib"
-	NO_DEFAULT_PATH
-	REQUIRED
-)
-
-if(NOT TARGET LibArchive::LibArchive)
-	add_library(LibArchive::LibArchive SHARED IMPORTED GLOBAL)
-	set_target_properties(LibArchive::LibArchive PROPERTIES
-		IMPORTED_CONFIGURATIONS "Debug;Release;RelWithDebInfo;MinSizeRel"
-		IMPORTED_IMPLIB_DEBUG "${LibArchive_LIBRARY_DEBUG}"
-		IMPORTED_IMPLIB_RELEASE "${LibArchive_LIBRARY_RELEASE}"
-		IMPORTED_IMPLIB_RELWITHDEBINFO "${LibArchive_LIBRARY_RELEASE}"
-		IMPORTED_IMPLIB_MINSIZEREL "${LibArchive_LIBRARY_RELEASE}"
-		IMPORTED_LOCATION_DEBUG "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/debug/bin/archive.dll"
-		IMPORTED_LOCATION_RELEASE "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/bin/archive.dll"
-		IMPORTED_LOCATION_RELWITHDEBINFO "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/bin/archive.dll"
-		IMPORTED_LOCATION_MINSIZEREL "${SORATRANSPORT_VCPKG_INSTALLED_DIR}/bin/archive.dll"
-		INTERFACE_INCLUDE_DIRECTORIES "${LibArchive_INCLUDE_DIR}"
-	)
+if(TARGET fltk AND NOT TARGET fltk::fltk)
+	add_library(fltk::fltk INTERFACE IMPORTED)
+	target_link_libraries(fltk::fltk INTERFACE fltk)
 endif()
-
-set(FLTK_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_FORMS OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_GL OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_FLUID OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_FLTK_OPTIONS OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_TEST OFF CACHE BOOL "" FORCE)
-set(FLTK_MSVC_RUNTIME_DLL ON CACHE BOOL "" FORCE)
-add_subdirectory(deps/fltk EXCLUDE_FROM_ALL)
 
 if(TARGET Boost::headers)
 	set(SORATRANSPORT_BOOST_TARGET Boost::headers)

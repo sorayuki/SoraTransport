@@ -332,11 +332,6 @@ private:
 			status_text += "    " + transient_status_;
 		}
 		status_box_->copy_label(("状态：" + status_text).c_str());
-
-		if (snapshot.completed && !completion_notified_) {
-			completion_notified_ = true;
-			flash_window_in_taskbar(fl_win32_xid(this));
-		}
 	}
 
 	GuiMode mode_;
@@ -348,7 +343,6 @@ private:
 	std::chrono::steady_clock::time_point started_at_;
 	std::optional<std::chrono::steady_clock::time_point> completed_at_;
 	bool addresses_loaded_ = false;
-	bool completion_notified_ = false;
 	bool transfer_started_ = false;
 	std::vector<InterfaceAddress> addresses_;
 	std::vector<Fl_Button*> address_buttons_;
