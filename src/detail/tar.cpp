@@ -50,7 +50,7 @@ void add_windows_attribute_metadata(archive_entry* entry, const FileMeta& meta) 
 }
 
 void apply_entry_metadata(archive_entry* entry, const FileMeta& meta) {
-	archive_entry_set_pathname(entry, meta.relative_path_in_tar.c_str());
+	archive_entry_set_pathname_utf8(entry, meta.relative_path_in_tar.c_str());
 	archive_entry_set_perm(entry, permissions_to_mode(meta.status.permissions()));
 	set_entry_timestamp(entry, meta.creation_time, &archive_entry_set_birthtime);
 	set_entry_timestamp(entry, meta.last_access_time, &archive_entry_set_atime);
@@ -164,7 +164,7 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 		}
 		archive_entry_set_filetype(entry, AE_IFLNK);
 		archive_entry_set_size(entry, 0);
-		archive_entry_set_symlink(entry, meta.symlink_target->c_str());
+		archive_entry_set_symlink_utf8(entry, meta.symlink_target->c_str());
 	} else {
 		archive_entry_free(entry);
 		return;
@@ -240,8 +240,12 @@ void TarUnpacker::unpack(
 				throw_archive_error(reader, "failed to read tar header");
 			}
 
-			const auto output_path = resolve_output_path(archive_entry_pathname(entry));
-			archive_entry_set_pathname(entry, output_path.string().c_str());
+			const auto* utf8_name = archive_entry_pathname_utf8(entry);
+			if (utf8_name == nullptr) {
+				throw std::runtime_error("archive entry has non-UTF-8 or undecodable pathname");
+			}
+			const auto output_path = resolve_output_path(utf8_name);
+			archive_entry_copy_pathname_w(entry, output_path.c_str());
 			const auto write_status = archive_write_header(disk_writer, entry);
 			if (write_status != ARCHIVE_OK) {
 				throw std::runtime_error(std::string("failed to prepare extracted output: ") + archive_error_string(disk_writer));
@@ -301,8 +305,8 @@ int TarUnpacker::archive_close_callback(struct archive*, void*) {
 	return ARCHIVE_OK;
 }
 
-std::filesystem::path TarUnpacker::resolve_output_path(const char* raw_path) const {
-	auto relative_path = normalize_relative_path(std::filesystem::path(raw_path));
+std::filesystem::path TarUnpacker::resolve_output_path(const char* utf8_path) const {
+	auto relative_path = normalize_relative_path(std::filesystem::path(reinterpret_cast<const char8_t*>(utf8_path)));
 	if (relative_path == ".") {
 		return destination_root_;
 	}
