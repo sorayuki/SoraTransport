@@ -222,6 +222,14 @@ bool is_transfer_cancelled(const std::exception_ptr& error) {
 	}
 }
 
+bool should_throw_cancelled_error(std::stop_token stop_token, const boost::system::error_code& error) {
+	return stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
+}
+
+bool should_report_transfer_error(std::stop_token stop_token, const std::exception_ptr& error) {
+	return !stop_token.stop_requested() && !is_transfer_cancelled(error);
+}
+
 asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port, std::stop_token stop_token) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::resolver resolver(executor);
@@ -235,14 +243,14 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	boost::system::error_code error;
 	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor)) {
+		if (should_throw_cancelled_error(stop_token, error)) {
 			throw TransferCancelledError();
 		}
 		throw make_boost_error("failed to resolve receiver address", error);
 	}
 	co_await asio::async_connect(socket, endpoints, asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor)) {
+		if (should_throw_cancelled_error(stop_token, error)) {
 			throw TransferCancelledError();
 		}
 		throw make_boost_error("failed to connect to sender", error);
@@ -290,7 +298,7 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 	}
 	auto socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor)) {
+		if (should_throw_cancelled_error(stop_token, error)) {
 			throw TransferCancelledError();
 		}
 		throw make_boost_error("failed to accept receiver connection", error);
@@ -430,7 +438,7 @@ asio::awaitable<void> listen_directory_task(
 		complete_progress(progress, false, "send completed");
 	} catch (...) {
 		*task_error = std::current_exception();
-		if (!stop_token.stop_requested() && !is_transfer_cancelled(*task_error)) {
+		if (should_report_transfer_error(stop_token, *task_error)) {
 			complete_progress(progress, true, "send failed");
 		}
 	}
@@ -510,7 +518,7 @@ asio::awaitable<void> receive_directory_task(
 		complete_progress(progress, false, "receive completed");
 	} catch (...) {
 		*task_error = std::current_exception();
-		if (!stop_token.stop_requested() && !is_transfer_cancelled(*task_error)) {
+		if (should_report_transfer_error(stop_token, *task_error)) {
 			complete_progress(progress, true, "receive failed");
 		}
 	}
@@ -710,7 +718,7 @@ void listen_directory(
 	std::exception_ptr task_error;
 	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, stop_token, &task_error), asio::detached);
 	io_context.run();
-	if (task_error && !stop_token.stop_requested() && !is_transfer_cancelled(task_error)) {
+	if (task_error && should_report_transfer_error(stop_token, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }
@@ -729,7 +737,7 @@ void receive_directory(
 	std::exception_ptr task_error;
 	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, stop_token, &task_error), asio::detached);
 	io_context.run();
-	if (task_error && !stop_token.stop_requested() && !is_transfer_cancelled(task_error)) {
+	if (task_error && should_report_transfer_error(stop_token, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }

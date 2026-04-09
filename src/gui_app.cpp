@@ -23,6 +23,8 @@ namespace soratransport {
 
 namespace {
 
+constexpr int kStopTransferChoice = 1;
+
 std::string format_size(std::uint64_t bytes) {
 	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
 	double value = static_cast<double>(bytes);
@@ -250,7 +252,7 @@ private:
 
 		if (transfer_started_) {
 			const auto choice = fl_choice("传输仍在进行，要停止吗？", "否", "是", nullptr);
-			if (choice != 1) {
+			if (choice != kStopTransferChoice) {
 				return;
 			}
 		}
