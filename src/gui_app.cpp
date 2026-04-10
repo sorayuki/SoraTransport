@@ -64,6 +64,7 @@ bool should_mark_transfer_started(std::string_view raw_status_text, const Transf
 	return raw_status_text == "receiver connected"
 		|| raw_status_text == "send completed"
 		|| raw_status_text == "send failed"
+		|| raw_status_text == "cancelled"
 		|| snapshot.processed_bytes != 0
 		|| snapshot.processed_files != 0;
 }
@@ -110,6 +111,9 @@ std::string translate_status_text(std::string_view status_text) {
 	}
 	if (status_text == "receive failed") {
 		return "接收失败";
+	}
+	if (status_text == "cancelled") {
+		return "已取消";
 	}
 	return std::string(status_text);
 }
@@ -181,7 +185,7 @@ public:
 			progress_->set_status("starting sender");
 			session_thread_ = std::jthread([this](std::stop_token stop_token) {
 				try {
-					listen_directory(path_, 0, {}, progress_, &bound_port_, stop_token);
+					listen_directory(path_, 0, {}, progress_, &bound_port_, stop_token, &cancel_event_);
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
@@ -199,7 +203,7 @@ public:
 			progress_->set_status("starting receiver");
 			session_thread_ = std::jthread([this](std::stop_token stop_token) {
 				try {
-					receive_directory(receive_url_->host, receive_url_->port, path_, progress_, stop_token);
+					receive_directory(receive_url_->host, receive_url_->port, path_, progress_, stop_token, &cancel_event_);
 				} catch (const std::exception& error) {
 					progress_->set_failed(error.what());
 				}
@@ -266,8 +270,9 @@ private:
 		}
 
 		close_requested_ = true;
-		transient_status_ = "正在停止传输...";
+		transient_status_ = "正在取消传输...";
 		transient_status_until_ = std::chrono::steady_clock::time_point::max();
+		cancel_event_.emit();
 		session_thread_.request_stop();
 		update_ui();
 		if (session_finished_.load(std::memory_order_acquire)) {
@@ -383,6 +388,7 @@ private:
 	std::filesystem::path path_;
 	std::optional<SoratransUrl> receive_url_;
 	std::shared_ptr<TransferProgress> progress_;
+	CancelEvent cancel_event_;
 	std::jthread session_thread_;
 	std::atomic<std::uint16_t> bound_port_{0};
 	std::chrono::steady_clock::time_point started_at_;

@@ -18,6 +18,12 @@ constexpr int kMinAdaptiveCompressionLevel = 1;
 constexpr int kMaxAdaptiveCompressionLevel = 12;
 constexpr auto kAdaptiveAdjustmentBaseCooldown = std::chrono::seconds(1);
 
+void throw_if_cancelled(const CancelEvent* cancel_event) {
+	if (cancel_event != nullptr && cancel_event->is_cancelled()) {
+		throw CancelledError();
+	}
+}
+
 } // namespace
 
 ZstdCompressor::ZstdCompressor(
@@ -34,14 +40,14 @@ ZstdCompressor::ZstdCompressor(
 	  active_level_(active_level),
 	  log_adaptive_decisions_(log_adaptive_decisions) {}
 
-void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd) {
-	auto result = executors_.post([this, &in_tar, &out_zstd] {
-		compress_sync(in_tar, out_zstd);
+void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd, const CancelEvent* cancel_event) {
+	auto result = executors_.post([this, &in_tar, &out_zstd, cancel_event] {
+		compress_sync(in_tar, out_zstd, cancel_event);
 	});
 	result.get();
 }
 
-void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd) {
+void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd, const CancelEvent* cancel_event) {
 	auto* context = ZSTD_createCCtx();
 	if (context == nullptr) {
 		throw std::runtime_error("failed to create zstd compression context");
@@ -125,6 +131,7 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 		};
 
 		for (;;) {
+			throw_if_cancelled(cancel_event);
 			const auto upstream_size_before_pop = in_tar.size();
 			const auto upstream_capacity = in_tar.capacity();
 			const bool upstream_is_full = upstream_size_before_pop >= upstream_capacity;
@@ -159,6 +166,7 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 
 			ZSTD_inBuffer input{chunk->data.get(), chunk->length, 0};
 			while (input.pos < input.size) {
+				throw_if_cancelled(cancel_event);
 				ZSTD_outBuffer output{output_buffer.get(), output_capacity, 0};
 				const auto result = ZSTD_compressStream2(context, &output, &input, ZSTD_e_continue);
 				if (ZSTD_isError(result)) {
@@ -188,6 +196,7 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 		}
 
 		for (;;) {
+			throw_if_cancelled(cancel_event);
 			ZSTD_inBuffer input{nullptr, 0, 0};
 			ZSTD_outBuffer output{output_buffer.get(), output_capacity, 0};
 			const auto remaining = ZSTD_compressStream2(context, &output, &input, ZSTD_e_end);
@@ -230,7 +239,7 @@ void ZstdCompressor::compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue
 
 ZstdDecompressor::ZstdDecompressor(BufferPool& pool) : pool_(pool) {}
 
-void ZstdDecompressor::decompress(IByteSource& source, BoundedQueue<DataChunk>& out_tar) {
+void ZstdDecompressor::decompress(IByteSource& source, BoundedQueue<DataChunk>& out_tar, const CancelEvent* cancel_event) {
 	auto* context = ZSTD_createDCtx();
 	if (context == nullptr) {
 		throw std::runtime_error("failed to create zstd decompression context");
@@ -243,6 +252,7 @@ void ZstdDecompressor::decompress(IByteSource& source, BoundedQueue<DataChunk>& 
 
 	try {
 		while (!eof || input.pos < input.size) {
+			throw_if_cancelled(cancel_event);
 			if (input.pos == input.size && !eof) {
 				input.size = source.read(input_storage.get(), ZSTD_DStreamInSize());
 				input.pos = 0;
@@ -276,15 +286,17 @@ void ZstdDecompressor::decompress(IByteSource& source, BoundedQueue<DataChunk>& 
 	}
 }
 
-void RawTarWriter::write(BoundedQueue<DataChunk>& in_tar, IByteSink& sink) {
+void RawTarWriter::write(BoundedQueue<DataChunk>& in_tar, IByteSink& sink, const CancelEvent* cancel_event) {
 	while (auto chunk = in_tar.pop()) {
+		throw_if_cancelled(cancel_event);
 		sink.write({chunk->data.get(), chunk->length});
 	}
 	sink.close();
 }
 
-void QueueWriter::write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink) {
+void QueueWriter::write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink, const CancelEvent* cancel_event) {
 	while (auto chunk = in_queue.pop()) {
+		throw_if_cancelled(cancel_event);
 		sink.write({chunk->data.get(), chunk->length});
 	}
 	sink.close();
@@ -292,9 +304,10 @@ void QueueWriter::write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink) {
 
 RawTarReader::RawTarReader(BufferPool& pool) : pool_(pool) {}
 
-void RawTarReader::read(IByteSource& source, BoundedQueue<DataChunk>& out_tar) {
+void RawTarReader::read(IByteSource& source, BoundedQueue<DataChunk>& out_tar, const CancelEvent* cancel_event) {
 	std::uint64_t offset = 0;
 	for (;;) {
+		throw_if_cancelled(cancel_event);
 		auto buffer = pool_.acquire(kPipelineChunkSize);
 		const auto bytes_read = source.read(buffer.get(), kPipelineChunkSize);
 		if (bytes_read == 0) {

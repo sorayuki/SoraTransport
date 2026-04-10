@@ -34,6 +34,12 @@ std::runtime_error make_socket_error(std::string_view action, const boost::syste
 	return std::runtime_error(std::string(action) + ": " + error.message());
 }
 
+bool is_cancelled_socket_error(bool cancel_requested, const boost::system::error_code& error) {
+	using boost::asio::error::bad_descriptor;
+	using boost::asio::error::operation_aborted;
+	return cancel_requested && (error == operation_aborted || error == bad_descriptor);
+}
+
 std::wstring make_volume_device_path(const std::filesystem::path& path) {
 	const auto absolute_path = std::filesystem::absolute(path);
 	const auto root_name = absolute_path.root_name().wstring();
@@ -248,6 +254,8 @@ struct FileByteSink::State {
 	std::deque<std::size_t> available_slots;
 	std::deque<std::size_t> in_flight_slots;
 	std::size_t active_slot_index = 0;
+	std::atomic<bool> cancel_requested{false};
+	boost::signals2::scoped_connection cancel_connection;
 };
 
 struct FileByteSource::State {
@@ -302,6 +310,15 @@ FileByteSink::~FileByteSink() {
 	}
 }
 
+void FileByteSink::listenCancelSignal(CancelEvent& event) {
+	if (!state_) {
+		return;
+	}
+	state_->cancel_connection = event.connect([this] {
+		cancel_pending_work();
+	});
+}
+
 void FileByteSink::flush_pending_writes() {
 	submit_active_write(false);
 }
@@ -309,6 +326,9 @@ void FileByteSink::flush_pending_writes() {
 void FileByteSink::write(std::span<const uint8_t> bytes) {
 	if (!state_ || state_->closed || state_->handle == INVALID_HANDLE_VALUE) {
 		throw std::runtime_error("output file is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("output file write cancelled");
 	}
 	state_->logical_size += bytes.size();
 	while (!bytes.empty()) {
@@ -332,6 +352,9 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 void FileByteSink::submit_active_write(bool finalize) {
 	if (!state_) {
 		return;
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("output file write cancelled");
 	}
 
 	auto& slot = state_->write_slots[state_->active_slot_index];
@@ -360,6 +383,9 @@ void FileByteSink::submit_active_write(bool finalize) {
 		nullptr,
 		&slot.overlapped);
 	if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+		if (state_->cancel_requested.load(std::memory_order_acquire)) {
+			throw CancelledError("output file write cancelled");
+		}
 		throw make_win32_error("failed to write output file: " + state_->display_path);
 	}
 
@@ -392,6 +418,10 @@ void FileByteSink::wait_for_one_write() {
 		const auto error = ::GetLastError();
 		slot.in_flight = false;
 		slot.size = 0;
+		if (state_->cancel_requested.load(std::memory_order_acquire)
+			&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
+			throw CancelledError("output file write cancelled");
+		}
 		throw make_win32_error("failed to complete output write: " + state_->display_path, error);
 	}
 	if (bytes_written != slot.size) {
@@ -415,6 +445,9 @@ void FileByteSink::close() {
 	if (!state_ || state_->closed) {
 		return;
 	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("output file write cancelled");
+	}
 	submit_active_write(true);
 	wait_for_all_writes();
 	state_->closed = true;
@@ -430,6 +463,20 @@ void FileByteSink::close() {
 		throw make_win32_error("failed to close output file: " + state_->display_path);
 	}
 	state_->handle = INVALID_HANDLE_VALUE;
+}
+
+bool FileByteSink::is_cancelled() const {
+	return state_ != nullptr && state_->cancel_requested.load(std::memory_order_acquire);
+}
+
+void FileByteSink::cancel_pending_work() {
+	if (!state_) {
+		return;
+	}
+	state_->cancel_requested.store(true, std::memory_order_release);
+	if (state_->handle != INVALID_HANDLE_VALUE) {
+		::CancelIoEx(state_->handle, nullptr);
+	}
 }
 
 FileByteSource::FileByteSource(const std::filesystem::path& input_path, FileIoMode mode) : state_(std::make_unique<State>()) {
@@ -540,6 +587,9 @@ struct SocketByteSink::State {
 		if (closed) {
 			throw std::runtime_error("socket sink is closed");
 		}
+		if (cancel_requested) {
+			throw CancelledError("socket send cancelled");
+		}
 
 		std::size_t offset = 0;
 		while (offset < bytes.size()) {
@@ -573,6 +623,9 @@ struct SocketByteSink::State {
 			rethrow_async_error();
 			return;
 		}
+		if (cancel_requested) {
+			throw CancelledError("socket send cancelled");
+		}
 		rethrow_async_error();
 		submit_fill_buffer();
 		wait_for_pending_send();
@@ -585,7 +638,7 @@ struct SocketByteSink::State {
 		if (stop_completed) {
 			return;
 		}
-		close_socket();
+		cancel_pending_work();
 		if (send_in_flight) {
 			wait_for_pending_send();
 		}
@@ -593,7 +646,7 @@ struct SocketByteSink::State {
 	}
 
 	void close_socket() {
-		if (stop_requested) {
+		if (stop_requested || cancel_requested) {
 			return;
 		}
 		stop_requested = true;
@@ -607,6 +660,9 @@ struct SocketByteSink::State {
 	void submit_fill_buffer() {
 		if (sizes[fill_index] == 0) {
 			return;
+		}
+		if (cancel_requested) {
+			throw CancelledError("socket send cancelled");
 		}
 		wait_for_pending_send();
 		rethrow_async_error();
@@ -659,7 +715,11 @@ struct SocketByteSink::State {
 		send_completed = false;
 		if (send_error) {
 			if (!async_error) {
-				async_error = std::make_exception_ptr(make_socket_error("socket write failed", send_error));
+				if (is_cancelled_socket_error(cancel_requested, send_error)) {
+					async_error = std::make_exception_ptr(CancelledError("socket send cancelled"));
+				} else {
+					async_error = std::make_exception_ptr(make_socket_error("socket write failed", send_error));
+				}
 			}
 		} else if (completed_index.has_value()) {
 			const auto index = *completed_index;
@@ -700,6 +760,18 @@ struct SocketByteSink::State {
 		}
 	}
 
+	void cancel_pending_work() {
+		if (cancel_requested) {
+			return;
+		}
+		cancel_requested = true;
+		if (send_in_flight) {
+			boost::system::error_code ignored;
+			socket.cancel(ignored);
+		}
+		shutdown_socket();
+	}
+
 	boost::asio::ip::tcp::socket socket;
 	boost::asio::io_context& io_context;
 	std::array<std::vector<uint8_t>, 2> buffers;
@@ -716,6 +788,8 @@ struct SocketByteSink::State {
 	boost::system::error_code send_error;
 	std::exception_ptr async_error;
 	bool socket_shutdown = false;
+	boost::signals2::scoped_connection cancel_connection;
+	bool cancel_requested = false;
 };
 
 SocketByteSink::SocketByteSink(boost::asio::ip::tcp::socket socket) : state_(std::make_unique<State>(std::move(socket))) {}
@@ -729,6 +803,14 @@ SocketByteSink::~SocketByteSink() {
 SocketByteSink::SocketByteSink(SocketByteSink&&) noexcept = default;
 
 SocketByteSink& SocketByteSink::operator=(SocketByteSink&&) noexcept = default;
+
+void SocketByteSink::listenCancelSignal(CancelEvent& event) {
+	if (state_) {
+		state_->cancel_connection = event.connect([this] {
+			cancel_pending_work();
+		});
+	}
+}
 
 void SocketByteSink::write(std::span<const uint8_t> bytes) {
 	state_->write(bytes);
@@ -747,6 +829,16 @@ void SocketByteSink::close_socket() {
 void SocketByteSink::stop() {
 	if (state_) {
 		state_->stop();
+	}
+}
+
+bool SocketByteSink::is_cancelled() const {
+	return state_ != nullptr && state_->cancel_requested;
+}
+
+void SocketByteSink::cancel_pending_work() {
+	if (state_) {
+		state_->cancel_pending_work();
 	}
 }
 
@@ -769,6 +861,9 @@ struct SocketByteSource::State {
 		}
 
 		rethrow_async_error();
+		if (cancel_requested) {
+			throw CancelledError("socket receive cancelled");
+		}
 		std::size_t copied_total = 0;
 		for (;;) {
 			promote_staged_buffer_if_possible();
@@ -809,7 +904,7 @@ struct SocketByteSource::State {
 		if (stop_completed) {
 			return;
 		}
-		close_socket();
+		cancel_pending_work();
 		if (receive_in_flight) {
 			while (receive_in_flight) {
 				run_one_io();
@@ -819,7 +914,7 @@ struct SocketByteSource::State {
 	}
 
 	void close_socket() {
-		if (stop_requested) {
+		if (stop_requested || cancel_requested) {
 			return;
 		}
 		stop_requested = true;
@@ -831,7 +926,7 @@ struct SocketByteSource::State {
 	}
 
 	void start_receive_if_possible() {
-		if (stop_requested || eof || async_error || receive_in_flight) {
+		if (stop_requested || cancel_requested || eof || async_error || receive_in_flight) {
 			return;
 		}
 		if (staged_free_capacity() < receive_buffer.size()) {
@@ -851,7 +946,11 @@ struct SocketByteSource::State {
 					return;
 				}
 				if (error) {
-					async_error = std::make_exception_ptr(make_socket_error("socket read failed", error));
+					if (is_cancelled_socket_error(cancel_requested, error)) {
+						async_error = std::make_exception_ptr(CancelledError("socket receive cancelled"));
+					} else {
+						async_error = std::make_exception_ptr(make_socket_error("socket read failed", error));
+					}
 					return;
 				}
 
@@ -867,7 +966,7 @@ struct SocketByteSource::State {
 	}
 
 	void wait_for_ready_data() {
-		while (!has_readable_data() && !eof && !async_error) {
+		while (!has_readable_data() && !eof && !async_error && !cancel_requested) {
 			start_receive_if_possible();
 			run_one_io();
 		}
@@ -919,6 +1018,18 @@ struct SocketByteSource::State {
 		}
 	}
 
+	void cancel_pending_work() {
+		if (cancel_requested) {
+			return;
+		}
+		cancel_requested = true;
+		if (receive_in_flight) {
+			boost::system::error_code ignored;
+			socket.cancel(ignored);
+		}
+		shutdown_socket();
+	}
+
 	boost::asio::ip::tcp::socket socket;
 	boost::asio::io_context& io_context;
 	std::vector<uint8_t> active_buffer;
@@ -933,6 +1044,8 @@ struct SocketByteSource::State {
 	bool receive_in_flight = false;
 	std::exception_ptr async_error;
 	bool socket_shutdown = false;
+	boost::signals2::scoped_connection cancel_connection;
+	bool cancel_requested = false;
 };
 
 SocketByteSource::SocketByteSource(boost::asio::ip::tcp::socket socket) : state_(std::make_unique<State>(std::move(socket))) {}
@@ -947,6 +1060,14 @@ SocketByteSource::SocketByteSource(SocketByteSource&&) noexcept = default;
 
 SocketByteSource& SocketByteSource::operator=(SocketByteSource&&) noexcept = default;
 
+void SocketByteSource::listenCancelSignal(CancelEvent& event) {
+	if (state_) {
+		state_->cancel_connection = event.connect([this] {
+			cancel_pending_work();
+		});
+	}
+}
+
 std::size_t SocketByteSource::read(uint8_t* buffer, std::size_t length) {
 	return state_->read(buffer, length);
 }
@@ -960,6 +1081,16 @@ void SocketByteSource::close_socket() {
 void SocketByteSource::stop() {
 	if (state_) {
 		state_->stop();
+	}
+}
+
+bool SocketByteSource::is_cancelled() const {
+	return state_ != nullptr && state_->cancel_requested;
+}
+
+void SocketByteSource::cancel_pending_work() {
+	if (state_) {
+		state_->cancel_pending_work();
 	}
 }
 

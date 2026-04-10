@@ -31,7 +31,7 @@ struct QueueTelemetrySample {
 class DirScanner {
 public:
 	explicit DirScanner(RuntimeExecutors& executors);
-	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const;
+	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue, const CancelEvent* cancel_event = nullptr) const;
 
 private:
 	RuntimeExecutors& executors_;
@@ -40,17 +40,21 @@ private:
 class InFlightReadBudget {
 public:
 	explicit InFlightReadBudget(std::size_t max_bytes);
+	void listenCancelSignal(CancelEvent& event);
 	void acquire(std::size_t bytes);
 	bool try_acquire(std::size_t bytes);
 	void release(std::size_t bytes);
 	std::size_t max_bytes() const;
 	std::size_t used_bytes() const;
+	bool is_cancelled() const;
 
 private:
 	std::size_t max_bytes_;
 	std::size_t used_bytes_ = 0;
 	mutable std::mutex mutex_;
 	std::condition_variable cv_;
+	std::atomic<bool> cancelled_{false};
+	boost::signals2::scoped_connection cancel_connection_;
 };
 
 class ReadBudgetLease {
@@ -110,12 +114,15 @@ public:
 	FileReader& operator=(const FileReader&) = delete;
 	FileReader(FileReader&& other);
 	FileReader& operator=(FileReader&& other);
+	void listenCancelSignal(CancelEvent& event);
 	void open();
 	void start_prefetch(std::size_t max_bytes);
 	DataChunk read_next_chunk();
 	std::uint64_t offset() const;
 	bool eof() const;
 	bool is_open() const;
+	bool is_cancelled() const;
+	void cancel_pending_work();
 
 private:
 	struct State;
@@ -128,7 +135,13 @@ private:
 	std::unique_ptr<State> state_;
 };
 
-struct OpenedFileReader {
+struct OpenedFileReader : IQueueDisposable {
+	void Dispose() noexcept override {
+		read_budget_lease.reset();
+		reader.reset();
+		meta = {};
+	}
+
 	FileMeta meta;
 	std::optional<FileReader> reader;
 	ReadBudgetLease read_budget_lease;
@@ -154,7 +167,8 @@ public:
 		RuntimeExecutors& executors,
 		std::size_t submit_concurrency,
 		std::size_t buffer_size,
-		FileIoMode io_mode = FileIoMode::Buffered);
+		FileIoMode io_mode = FileIoMode::Buffered,
+		CancelEvent* cancel_event = nullptr);
 	boost::asio::awaitable<void> open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 	void open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
 
@@ -164,6 +178,7 @@ private:
 	std::size_t submit_concurrency_;
 	std::size_t buffer_size_;
 	FileIoMode io_mode_;
+	CancelEvent* cancel_event_ = nullptr;
 };
 
 class FileReaderPrefetcher {
@@ -172,7 +187,8 @@ public:
 		RuntimeExecutors& executors,
 		std::shared_ptr<InFlightReadBudget> read_budget,
 		std::size_t prefetch_bytes,
-		FileIoMode io_mode = FileIoMode::Buffered);
+		FileIoMode io_mode = FileIoMode::Buffered,
+		CancelEvent* cancel_event = nullptr);
 	boost::asio::awaitable<void> prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const;
 
 private:
@@ -180,6 +196,7 @@ private:
 	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::size_t prefetch_bytes_;
 	FileIoMode io_mode_;
+	CancelEvent* cancel_event_ = nullptr;
 };
 
 class TarPacker {
@@ -189,12 +206,13 @@ public:
 		BoundedQueue<OpenedFileReader>& in_meta,
 		BoundedQueue<DataChunk>& out_tar,
 		std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr,
-		std::atomic<std::uint64_t>* file_counter = nullptr);
+		std::atomic<std::uint64_t>* file_counter = nullptr,
+		const CancelEvent* cancel_event = nullptr);
 
 private:
 	static la_ssize_t archive_write_callback(struct archive*, void* client_data, const void* buffer, size_t length);
 	static int archive_close_callback(struct archive*, void* client_data);
-	void add_entry(struct archive* writer, OpenedFileReader& opened_file, std::atomic<std::uint64_t>* file_counter) const;
+	void add_entry(struct archive* writer, OpenedFileReader& opened_file, std::atomic<std::uint64_t>* file_counter, const CancelEvent* cancel_event) const;
 
 	BufferPool& pool_;
 	std::size_t chunk_size_;
@@ -206,7 +224,8 @@ public:
 	void unpack(
 		BoundedQueue<DataChunk>& in_tar,
 		std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr,
-		std::atomic<std::uint64_t>* file_counter = nullptr);
+		std::atomic<std::uint64_t>* file_counter = nullptr,
+		const CancelEvent* cancel_event = nullptr);
 
 private:
 	static la_ssize_t archive_read_callback(struct archive*, void* client_data, const void** buffer);
@@ -225,10 +244,10 @@ public:
 		const CompressionQueueTelemetry* queue_telemetry = nullptr,
 		std::atomic<int>* active_level = nullptr,
 		bool log_adaptive_decisions = false);
-	void compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd);
+	void compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd, const CancelEvent* cancel_event = nullptr);
 
 private:
-	void compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd);
+	void compress_sync(BoundedQueue<DataChunk>& in_tar, BoundedQueue<DataChunk>& out_zstd, const CancelEvent* cancel_event);
 
 	BufferPool& pool_;
 	RuntimeExecutors& executors_;
@@ -241,7 +260,7 @@ private:
 class ZstdDecompressor {
 public:
 	explicit ZstdDecompressor(BufferPool& pool);
-	void decompress(IByteSource& source, BoundedQueue<DataChunk>& out_tar);
+	void decompress(IByteSource& source, BoundedQueue<DataChunk>& out_tar, const CancelEvent* cancel_event = nullptr);
 
 private:
 	BufferPool& pool_;
@@ -249,18 +268,18 @@ private:
 
 class RawTarWriter {
 public:
-	void write(BoundedQueue<DataChunk>& in_tar, IByteSink& sink);
+	void write(BoundedQueue<DataChunk>& in_tar, IByteSink& sink, const CancelEvent* cancel_event = nullptr);
 };
 
 class QueueWriter {
 public:
-	void write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink);
+	void write(BoundedQueue<DataChunk>& in_queue, IByteSink& sink, const CancelEvent* cancel_event = nullptr);
 };
 
 class RawTarReader {
 public:
 	explicit RawTarReader(BufferPool& pool);
-	void read(IByteSource& source, BoundedQueue<DataChunk>& out_tar);
+	void read(IByteSource& source, BoundedQueue<DataChunk>& out_tar, const CancelEvent* cancel_event = nullptr);
 
 private:
 	BufferPool& pool_;

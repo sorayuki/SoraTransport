@@ -40,8 +40,11 @@ public:
 	~FileByteSink() override;
 	FileByteSink(const FileByteSink&) = delete;
 	FileByteSink& operator=(const FileByteSink&) = delete;
+	void listenCancelSignal(CancelEvent& event);
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
+	bool is_cancelled() const;
+	void cancel_pending_work();
 
 private:
 	struct State;
@@ -73,10 +76,13 @@ public:
 	SocketByteSink& operator=(const SocketByteSink&) = delete;
 	SocketByteSink(SocketByteSink&&) noexcept;
 	SocketByteSink& operator=(SocketByteSink&&) noexcept;
+	void listenCancelSignal(CancelEvent& event);
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
 	void close_socket();
 	void stop();
+	bool is_cancelled() const;
+	void cancel_pending_work();
 
 private:
 	struct State;
@@ -91,9 +97,12 @@ public:
 	SocketByteSource& operator=(const SocketByteSource&) = delete;
 	SocketByteSource(SocketByteSource&&) noexcept;
 	SocketByteSource& operator=(SocketByteSource&&) noexcept;
+	void listenCancelSignal(CancelEvent& event);
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
 	void close_socket();
 	void stop();
+	bool is_cancelled() const;
+	void cancel_pending_work();
 
 private:
 	struct State;

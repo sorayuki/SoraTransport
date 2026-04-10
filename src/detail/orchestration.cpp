@@ -33,11 +33,6 @@ constexpr std::size_t kOpenedQueueDepth = 32;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
 
-class TransferCancelledError : public std::runtime_error {
-public:
-	TransferCancelledError() : std::runtime_error("transfer cancelled") {}
-};
-
 std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
 	if (error.category() == boost::system::system_category()) {
 		return std::runtime_error(message + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
@@ -170,6 +165,7 @@ void set_progress_status(const std::shared_ptr<TransferProgress>& progress, std:
 void complete_progress(
 	const std::shared_ptr<TransferProgress>& progress,
 	bool failed,
+	bool cancelled,
 	std::string status) {
 	if (!progress) {
 		return;
@@ -177,6 +173,8 @@ void complete_progress(
 
 	if (failed) {
 		progress->set_failed(std::move(status));
+	} else if (cancelled) {
+		progress->set_cancelled(std::move(status));
 	} else {
 		progress->set_completed(std::move(status));
 	}
@@ -216,26 +214,26 @@ bool is_transfer_cancelled(const std::exception_ptr& error) {
 	}
 	try {
 		std::rethrow_exception(error);
-	} catch (const TransferCancelledError&) {
+	} catch (const CancelledError&) {
 		return true;
 	} catch (...) {
 		return false;
 	}
 }
 
-bool should_throw_cancelled_error(std::stop_token stop_token, const boost::system::error_code& error) {
-	return stop_token.stop_requested() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
+bool should_throw_cancelled_error(const CancelEvent& cancel_event, const boost::system::error_code& error) {
+	return cancel_event.is_cancelled() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
 }
 
-bool should_report_transfer_error(std::stop_token stop_token, const std::exception_ptr& error) {
-	return !stop_token.stop_requested() && !is_transfer_cancelled(error);
+bool should_report_transfer_error(const CancelEvent& cancel_event, const std::exception_ptr& error) {
+	return !cancel_event.is_cancelled() && !is_transfer_cancelled(error);
 }
 
-asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port, std::stop_token stop_token) {
+asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port, CancelEvent& cancel_event) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::resolver resolver(executor);
 	asio::ip::tcp::socket socket(executor);
-	std::stop_callback on_stop(stop_token, [&resolver, &socket] {
+	auto on_cancel = cancel_event.connect([&resolver, &socket] {
 		resolver.cancel();
 		boost::system::error_code ignored;
 		socket.cancel(ignored);
@@ -244,25 +242,25 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	boost::system::error_code error;
 	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (should_throw_cancelled_error(stop_token, error)) {
-			throw TransferCancelledError();
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
 		}
 		throw make_boost_error("failed to resolve receiver address", error);
 	}
 	co_await asio::async_connect(socket, endpoints, asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (should_throw_cancelled_error(stop_token, error)) {
-			throw TransferCancelledError();
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
 		}
 		throw make_boost_error("failed to connect to sender", error);
 	}
 	co_return socket;
 }
 
-asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port, std::stop_token stop_token) {
+asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port, CancelEvent& cancel_event) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::acceptor acceptor(executor);
-	std::stop_callback on_stop(stop_token, [&acceptor] {
+	auto on_cancel = cancel_event.connect([&acceptor] {
 		boost::system::error_code ignored;
 		acceptor.cancel(ignored);
 		acceptor.close(ignored);
@@ -299,8 +297,8 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 	}
 	auto socket = co_await acceptor.async_accept(asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
-		if (should_throw_cancelled_error(stop_token, error)) {
-			throw TransferCancelledError();
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
 		}
 		throw make_boost_error("failed to accept receiver connection", error);
 	}
@@ -313,20 +311,18 @@ asio::awaitable<void> listen_directory_task(
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint16_t>* bound_port,
-	std::stop_token stop_token,
+	CancelEvent& cancel_event,
 	std::exception_ptr* task_error) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "binding listener");
-		auto socket = co_await accept_socket_async(port, bound_port, stop_token);
+		auto socket = co_await accept_socket_async(port, bound_port, cancel_event);
 		set_progress_status(progress, "receiver connected");
 		std::cerr << "listening on port " << socket.local_endpoint().port() << ", waiting for receiver...\n";
 		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(socket));
-		std::stop_callback sink_stop(stop_token, [&sink] {
-			sink.close_socket();
-		});
+		sink.listenCancelSignal(cancel_event);
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 		const auto enable_adaptive_compression = !options.compression_level.has_value();
@@ -334,15 +330,21 @@ asio::awaitable<void> listen_directory_task(
 		RuntimeExecutors executors(config.worker_threads);
 		BufferPool pool;
 		auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
+		read_budget->listenCancelSignal(cancel_event);
 		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
 		BoundedQueue<OpenedFileReader> opened_queue(std::max(kOpenedQueueDepth, config.file_open_concurrency), executors.executor());
 		BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 		BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
+		meta_queue.listenCancelSignal(cancel_event);
+		opened_queue.listenCancelSignal(cancel_event);
+		prefetched_queue.listenCancelSignal(cancel_event);
+		tar_queue.listenCancelSignal(cancel_event);
+		zstd_queue.listenCancelSignal(cancel_event);
 		CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
 		DirScanner scanner(executors);
-		FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize);
-		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize);
+		FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
+		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
 		TarPacker packer(pool, kPipelineChunkSize);
 		PipelineState state;
 		std::atomic<int> active_compression_level{compression_level};
@@ -366,7 +368,7 @@ asio::awaitable<void> listen_directory_task(
 			},
 			uncompressed_bytes_processed);
 
-		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue), asio::use_future);
+		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue, &cancel_event), asio::use_future);
 		std::vector<std::jthread> opener_threads;
 		opener_threads.reserve(config.file_open_concurrency);
 		for (std::size_t index = 0; index < config.file_open_concurrency; ++index) {
@@ -387,7 +389,7 @@ asio::awaitable<void> listen_directory_task(
 
 		std::jthread sender_thread([&] {
 			try {
-				packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, &files_processed);
+				packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
 				meta_queue.close();
@@ -407,7 +409,7 @@ asio::awaitable<void> listen_directory_task(
 					enable_adaptive_compression ? &compression_telemetry : nullptr,
 					&active_compression_level,
 					options.log_adaptive_compression);
-				compressor.compress(tar_queue, zstd_queue);
+				compressor.compress(tar_queue, zstd_queue, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
@@ -418,7 +420,7 @@ asio::awaitable<void> listen_directory_task(
 		std::jthread sink_thread([&] {
 			try {
 				QueueWriter writer;
-				writer.write(zstd_queue, sink);
+				writer.write(zstd_queue, sink, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
@@ -454,11 +456,13 @@ asio::awaitable<void> listen_directory_task(
 		}
 		finalize_progress_line();
 		state.rethrow_if_failed();
-		complete_progress(progress, false, "send completed");
+		complete_progress(progress, false, false, "send completed");
 	} catch (...) {
 		*task_error = std::current_exception();
-		if (should_report_transfer_error(stop_token, *task_error)) {
-			complete_progress(progress, true, "send failed");
+		if (should_report_transfer_error(cancel_event, *task_error)) {
+			complete_progress(progress, true, false, "send failed");
+		} else if (is_transfer_cancelled(*task_error) || cancel_event.is_cancelled()) {
+			complete_progress(progress, false, true, "cancelled");
 		}
 	}
 
@@ -470,25 +474,24 @@ asio::awaitable<void> receive_directory_task(
 	std::uint16_t port,
 	const std::filesystem::path destination_dir,
 	const std::shared_ptr<TransferProgress>& progress,
-	std::stop_token stop_token,
+	CancelEvent& cancel_event,
 	std::exception_ptr* task_error) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "connecting");
 		std::cerr << "connecting to " << host << ':' << port << "...\n";
-		auto socket = co_await connect_socket_async(std::move(host), port, stop_token);
+		auto socket = co_await connect_socket_async(std::move(host), port, cancel_event);
 		set_progress_status(progress, "receiving");
 		std::cerr << "connected, receiving transfer...\n";
 		SocketByteSource source(std::move(socket));
-		std::stop_callback source_stop(stop_token, [&source] {
-			source.close_socket();
-		});
+		source.listenCancelSignal(cancel_event);
 		auto config = make_runtime_config();
 
 		RuntimeExecutors executors(config.worker_threads);
 		BufferPool pool;
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
+		tar_queue.listenCancelSignal(cancel_event);
 		PipelineState state;
 		TarUnpacker unpacker(destination_dir);
 		print_receive_progress_legend();
@@ -506,7 +509,7 @@ asio::awaitable<void> receive_directory_task(
 		std::jthread input_thread([&] {
 			try {
 				ZstdDecompressor decompressor(pool);
-				decompressor.decompress(source, tar_queue);
+				decompressor.decompress(source, tar_queue, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
@@ -515,7 +518,7 @@ asio::awaitable<void> receive_directory_task(
 
 		std::jthread unpacker_thread([&] {
 			try {
-				unpacker.unpack(tar_queue, &uncompressed_bytes_processed, &files_processed);
+				unpacker.unpack(tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
 				tar_queue.close();
@@ -534,11 +537,13 @@ asio::awaitable<void> receive_directory_task(
 		}
 		finalize_progress_line();
 		state.rethrow_if_failed();
-		complete_progress(progress, false, "receive completed");
+		complete_progress(progress, false, false, "receive completed");
 	} catch (...) {
 		*task_error = std::current_exception();
-		if (should_report_transfer_error(stop_token, *task_error)) {
-			complete_progress(progress, true, "receive failed");
+		if (should_report_transfer_error(cancel_event, *task_error)) {
+			complete_progress(progress, true, false, "receive failed");
+		} else if (is_transfer_cancelled(*task_error) || cancel_event.is_cancelled()) {
+			complete_progress(progress, false, true, "cancelled");
 		}
 	}
 
@@ -547,22 +552,30 @@ asio::awaitable<void> receive_directory_task(
 
 } // namespace
 
-void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
+void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options, CancelEvent* cancel_event) {
+	CancelEvent local_cancel_event;
+	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	auto config = make_runtime_config(options);
 	const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 	const auto enable_adaptive_compression = mode == CompressionMode::Zstd && !options.compression_level.has_value();
 	RuntimeExecutors executors(config.worker_threads);
 	BufferPool pool;
 	auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
+	read_budget->listenCancelSignal(effective_cancel_event);
 	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
 	BoundedQueue<OpenedFileReader> opened_queue(std::max(kOpenedQueueDepth, config.file_open_concurrency), executors.executor());
 	BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 	BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
+	meta_queue.listenCancelSignal(effective_cancel_event);
+	opened_queue.listenCancelSignal(effective_cancel_event);
+	prefetched_queue.listenCancelSignal(effective_cancel_event);
+	tar_queue.listenCancelSignal(effective_cancel_event);
+	zstd_queue.listenCancelSignal(effective_cancel_event);
 	CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
 	DirScanner scanner(executors);
-	FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize, file_io_mode);
-	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, file_io_mode);
+	FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
+	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
 	TarPacker packer(pool, kPipelineChunkSize);
 	PipelineState state;
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
@@ -592,7 +605,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 		uncompressed_bytes_processed);
 
 	FileByteSink sink(output_file, config.max_in_flight_write_ops);
-	auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue), asio::use_future);
+	sink.listenCancelSignal(effective_cancel_event);
+	auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue, &effective_cancel_event), asio::use_future);
 	std::vector<std::jthread> opener_threads;
 	opener_threads.reserve(config.file_open_concurrency);
 	for (std::size_t index = 0; index < config.file_open_concurrency; ++index) {
@@ -600,7 +614,9 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 			try {
 				opener.open_sync(meta_queue, opened_queue);
 			} catch (...) {
-				state.fail(std::current_exception());
+				if (!is_transfer_cancelled(std::current_exception())) {
+					state.fail(std::current_exception());
+				}
 				meta_queue.close();
 				opened_queue.close();
 				prefetched_queue.close();
@@ -613,9 +629,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 
 	std::jthread writer_thread([&] {
 		try {
-			packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed);
+			packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, nullptr, &effective_cancel_event);
 		} catch (...) {
-			state.fail(std::current_exception());
+			if (!is_transfer_cancelled(std::current_exception())) {
+				state.fail(std::current_exception());
+			}
 			meta_queue.close();
 			opened_queue.close();
 			prefetched_queue.close();
@@ -634,13 +652,15 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 					enable_adaptive_compression ? &compression_telemetry : nullptr,
 					&active_compression_level,
 					options.log_adaptive_compression);
-				compressor.compress(tar_queue, zstd_queue);
+				compressor.compress(tar_queue, zstd_queue, &effective_cancel_event);
 			} else {
 				QueueWriter writer;
-				writer.write(tar_queue, sink);
+				writer.write(tar_queue, sink, &effective_cancel_event);
 			}
 		} catch (...) {
-			state.fail(std::current_exception());
+			if (!is_transfer_cancelled(std::current_exception())) {
+				state.fail(std::current_exception());
+			}
 			tar_queue.close();
 			zstd_queue.close();
 		}
@@ -652,9 +672,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 		}
 		try {
 			QueueWriter writer;
-			writer.write(zstd_queue, sink);
+			writer.write(zstd_queue, sink, &effective_cancel_event);
 		} catch (...) {
-			state.fail(std::current_exception());
+			if (!is_transfer_cancelled(std::current_exception())) {
+				state.fail(std::current_exception());
+			}
 			tar_queue.close();
 			zstd_queue.close();
 		}
@@ -668,7 +690,9 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 		opened_queue.close();
 		prefetch_future.get();
 	} catch (...) {
-		state.fail(std::current_exception());
+		if (!is_transfer_cancelled(std::current_exception())) {
+			state.fail(std::current_exception());
+		}
 		meta_queue.close();
 		opened_queue.close();
 		prefetched_queue.close();
@@ -684,13 +708,19 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	}
 	finalize_progress_line();
 	state.rethrow_if_failed();
+	if (effective_cancel_event.is_cancelled()) {
+		throw CancelledError("transfer cancelled");
+	}
 }
 
-void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options) {
+void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options, CancelEvent* cancel_event) {
+	CancelEvent local_cancel_event;
+	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	auto config = make_runtime_config(options);
 	RuntimeExecutors executors(config.worker_threads);
 	BufferPool pool;
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
+	tar_queue.listenCancelSignal(effective_cancel_event);
 	PipelineState state;
 	TarUnpacker unpacker(destination_dir);
 	FileByteSource source(input_file, file_io_mode);
@@ -710,22 +740,26 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 		try {
 			if (mode == CompressionMode::Zstd) {
 				ZstdDecompressor decompressor(pool);
-				decompressor.decompress(source, tar_queue);
+				decompressor.decompress(source, tar_queue, &effective_cancel_event);
 			} else {
 				RawTarReader reader(pool);
-				reader.read(source, tar_queue);
+				reader.read(source, tar_queue, &effective_cancel_event);
 			}
 		} catch (...) {
-			state.fail(std::current_exception());
+			if (!is_transfer_cancelled(std::current_exception())) {
+				state.fail(std::current_exception());
+			}
 			tar_queue.close();
 		}
 	});
 
 	std::jthread unpacker_thread([&] {
 		try {
-			unpacker.unpack(tar_queue, &uncompressed_bytes_processed);
+			unpacker.unpack(tar_queue, &uncompressed_bytes_processed, nullptr, &effective_cancel_event);
 		} catch (...) {
-			state.fail(std::current_exception());
+			if (!is_transfer_cancelled(std::current_exception())) {
+				state.fail(std::current_exception());
+			}
 			tar_queue.close();
 		}
 	});
@@ -738,10 +772,13 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	}
 	finalize_progress_line();
 	state.rethrow_if_failed();
+	if (effective_cancel_event.is_cancelled()) {
+		throw CancelledError("transfer cancelled");
+	}
 }
 
 void listen_directory(const std::filesystem::path& source_dir, std::uint16_t port, RuntimeOptions options) {
-	listen_directory(source_dir, port, options, {}, nullptr, {});
+	listen_directory(source_dir, port, options, {}, nullptr, {}, nullptr);
 }
 
 void listen_directory(
@@ -750,18 +787,24 @@ void listen_directory(
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint16_t>* bound_port,
-	std::stop_token stop_token) {
+	std::stop_token stop_token,
+	CancelEvent* cancel_event) {
+	CancelEvent local_cancel_event;
+	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
+	std::stop_callback on_stop(stop_token, [&effective_cancel_event] {
+		effective_cancel_event.emit();
+	});
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, stop_token, &task_error), asio::detached);
+	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, effective_cancel_event, &task_error), asio::detached);
 	io_context.run();
-	if (task_error && should_report_transfer_error(stop_token, task_error)) {
+	if (task_error && should_report_transfer_error(effective_cancel_event, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }
 
 void receive_directory(std::string_view host, std::uint16_t port, const std::filesystem::path& destination_dir) {
-	receive_directory(host, port, destination_dir, {}, {});
+	receive_directory(host, port, destination_dir, {}, {}, nullptr);
 }
 
 void receive_directory(
@@ -769,12 +812,18 @@ void receive_directory(
 	std::uint16_t port,
 	const std::filesystem::path& destination_dir,
 	const std::shared_ptr<TransferProgress>& progress,
-	std::stop_token stop_token) {
+	std::stop_token stop_token,
+	CancelEvent* cancel_event) {
+	CancelEvent local_cancel_event;
+	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
+	std::stop_callback on_stop(stop_token, [&effective_cancel_event] {
+		effective_cancel_event.emit();
+	});
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, stop_token, &task_error), asio::detached);
+	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, effective_cancel_event, &task_error), asio::detached);
 	io_context.run();
-	if (task_error && should_report_transfer_error(stop_token, task_error)) {
+	if (task_error && should_report_transfer_error(effective_cancel_event, task_error)) {
 		std::rethrow_exception(task_error);
 	}
 }

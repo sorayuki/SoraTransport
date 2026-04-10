@@ -11,6 +11,7 @@ struct TransferProgressSnapshot {
 	std::uint64_t processed_files = 0;
 	bool completed = false;
 	bool failed = false;
+	bool cancelled = false;
 	std::string status_text;
 };
 
@@ -21,6 +22,7 @@ public:
 	void set_status(std::string status_text);
 	void set_completed(std::string status_text = "completed");
 	void set_failed(std::string status_text);
+	void set_cancelled(std::string status_text = "cancelled");
 	TransferProgressSnapshot snapshot() const;
 
 private:
@@ -28,6 +30,7 @@ private:
 	std::atomic<std::uint64_t> processed_files_{0};
 	std::atomic<bool> completed_{false};
 	std::atomic<bool> failed_{false};
+	std::atomic<bool> cancelled_{false};
 	mutable std::mutex mutex_;
 	std::string status_text_ = "idle";
 };
@@ -37,26 +40,30 @@ void pack_directory_to_file(
 	const std::filesystem::path& output_file,
 	CompressionMode mode,
 	FileIoMode file_io_mode = FileIoMode::Buffered,
-	RuntimeOptions options = {});
+	RuntimeOptions options = {},
+	CancelEvent* cancel_event = nullptr);
 void unpack_file_to_directory(
 	const std::filesystem::path& input_file,
 	const std::filesystem::path& destination_dir,
 	CompressionMode mode,
 	FileIoMode file_io_mode = FileIoMode::Buffered,
-	RuntimeOptions options = {});
+	RuntimeOptions options = {},
+	CancelEvent* cancel_event = nullptr);
 void listen_directory(
 	const std::filesystem::path& source_dir,
 	std::uint16_t port,
 	RuntimeOptions options = {},
 	const std::shared_ptr<TransferProgress>& progress = {},
 	std::atomic<std::uint16_t>* bound_port = nullptr,
-	std::stop_token stop_token = {});
+	std::stop_token stop_token = {},
+	CancelEvent* cancel_event = nullptr);
 void receive_directory(
 	std::string_view host,
 	std::uint16_t port,
 	const std::filesystem::path& destination_dir,
 	const std::shared_ptr<TransferProgress>& progress = {},
-	std::stop_token stop_token = {});
+	std::stop_token stop_token = {},
+	CancelEvent* cancel_event = nullptr);
 int run_soratransport_cli(int argc, char** argv);
 int run_fasttar_cli(int argc, char** argv);
 

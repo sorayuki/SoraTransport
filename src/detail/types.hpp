@@ -9,7 +9,10 @@
 #endif
 
 #include <boost/asio.hpp>
+#include <boost/signals2.hpp>
 
+#include <atomic>
+#include <concepts>
 #include <coroutine>
 #include <condition_variable>
 #include <cstddef>
@@ -21,12 +24,84 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace soratransport {
 
-struct DataChunk {
+class CancelledError : public std::runtime_error {
+public:
+	explicit CancelledError(std::string message = "operation cancelled")
+		: std::runtime_error(std::move(message)) {}
+};
+
+class AbandonedError : public CancelledError {
+public:
+	explicit AbandonedError(std::string message = "queue abandoned")
+		: CancelledError(std::move(message)) {}
+};
+
+struct IQueueDisposable {
+	virtual ~IQueueDisposable() = default;
+	virtual void Dispose() noexcept = 0;
+};
+
+class CancelEvent {
+public:
+	CancelEvent() = default;
+	CancelEvent(const CancelEvent&) = delete;
+	CancelEvent& operator=(const CancelEvent&) = delete;
+
+	template <typename Slot>
+	boost::signals2::scoped_connection connect(Slot&& slot) {
+		boost::signals2::scoped_connection connection;
+		bool invoke_now = false;
+		{
+			std::lock_guard lock(mutex_);
+			if (cancelled_.load(std::memory_order_acquire)) {
+				invoke_now = true;
+			} else {
+				connection = boost::signals2::scoped_connection(signal_.connect(std::forward<Slot>(slot)));
+			}
+		}
+		if (invoke_now) {
+			slot();
+		}
+		return connection;
+	}
+
+	void emit() {
+		if (cancelled_.exchange(true, std::memory_order_acq_rel)) {
+			return;
+		}
+		std::lock_guard lock(mutex_);
+		signal_();
+	}
+
+	bool is_cancelled() const {
+		return cancelled_.load(std::memory_order_acquire);
+	}
+
+private:
+	std::atomic<bool> cancelled_{false};
+	mutable std::mutex mutex_;
+	boost::signals2::signal<void()> signal_;
+};
+
+struct DataChunk : IQueueDisposable {
+	DataChunk() = default;
+	DataChunk(std::shared_ptr<uint8_t> bytes, std::size_t byte_count, std::uint64_t byte_offset, bool eof)
+		: data(std::move(bytes)), length(byte_count), offset(byte_offset), is_eof(eof) {}
+
+	void Dispose() noexcept override {
+		data.reset();
+		length = 0;
+		offset = 0;
+		is_eof = false;
+	}
+
 	std::shared_ptr<uint8_t> data;
 	std::size_t length = 0;
 	std::uint64_t offset = 0;
@@ -38,7 +113,9 @@ struct FileTimestamp {
 	long nanoseconds = 0;
 };
 
-struct FileMeta {
+struct FileMeta : IQueueDisposable {
+	void Dispose() noexcept override {}
+
 	std::filesystem::path full_path;
 	std::filesystem::file_status status;
 	std::uint64_t size = 0;
@@ -59,22 +136,33 @@ enum class CompressionMode {
 template <typename T>
 class BoundedQueue {
 public:
+	static_assert(std::derived_from<T, IQueueDisposable>, "BoundedQueue elements must implement IQueueDisposable");
+
 	explicit BoundedQueue(std::size_t capacity, boost::asio::any_io_executor executor)
 		: capacity_(capacity), executor_(std::move(executor)) {}
 
+	void listenCancelSignal(CancelEvent& event) {
+		cancel_connection_ = event.connect([this] {
+			abandon();
+		});
+	}
+
 	template <typename CompletionToken>
 	auto async_push(T value, CompletionToken&& token) {
-		return boost::asio::async_initiate<CompletionToken, void(bool)>(
+		return boost::asio::async_initiate<CompletionToken, void(PushResult)>(
 			[this, value = std::move(value)](auto handler) mutable {
 				std::unique_ptr<PendingPopBase> pending_pop;
 				bool complete_now = false;
-				bool was_closed = false;
+				std::exception_ptr error;
 				auto associated_executor = boost::asio::get_associated_executor(handler, executor_);
 
 				{
 					std::lock_guard lock(sync_mutex_);
-					if (closed_) {
-						was_closed = true;
+					if (status_ == QueueStatus::Abandoned) {
+						error = std::make_exception_ptr(AbandonedError());
+						complete_now = true;
+					} else if (status_ == QueueStatus::Closed) {
+						error = std::make_exception_ptr(std::runtime_error("queue closed"));
 						complete_now = true;
 					} else if (!pending_pops_.empty()) {
 						pending_pop = std::move(pending_pops_.front());
@@ -94,14 +182,14 @@ public:
 				}
 
 				if (pending_pop) {
-					pending_pop->complete(std::optional<T>(std::move(value)));
+					pending_pop->complete(PopResult{nullptr, std::optional<T>(std::move(value))});
 				}
 
 				if (complete_now) {
 					boost::asio::post(
 						associated_executor,
-						[handler = std::move(handler), was_closed]() mutable {
-							handler(was_closed);
+						[handler = std::move(handler), error = std::move(error)]() mutable {
+							handler(PushResult{std::move(error)});
 						});
 				}
 			},
@@ -110,10 +198,11 @@ public:
 
 	template <typename CompletionToken>
 	auto async_pop(CompletionToken&& token) {
-		return boost::asio::async_initiate<CompletionToken, void(std::optional<T>)>(
+		return boost::asio::async_initiate<CompletionToken, void(PopResult)>(
 			[this](auto handler) mutable {
 				std::optional<T> immediate_value;
 				bool complete_now = false;
+				std::exception_ptr error;
 				auto associated_executor = boost::asio::get_associated_executor(handler, executor_);
 
 				{
@@ -124,8 +213,11 @@ public:
 						promote_one_locked();
 						complete_now = true;
 						sync_not_full_.notify_one();
-					} else if (closed_) {
+					} else if (status_ == QueueStatus::Closed) {
 						immediate_value = std::nullopt;
+						complete_now = true;
+					} else if (status_ == QueueStatus::Abandoned) {
+						error = std::make_exception_ptr(AbandonedError());
 						complete_now = true;
 					} else {
 						pending_pops_.push_back(std::make_unique<PendingPopModel<decltype(handler)>>(
@@ -138,8 +230,8 @@ public:
 				if (complete_now) {
 					boost::asio::post(
 						associated_executor,
-						[handler = std::move(handler), immediate_value = std::move(immediate_value)]() mutable {
-							handler(std::move(immediate_value));
+						[handler = std::move(handler), error = std::move(error), immediate_value = std::move(immediate_value)]() mutable {
+							handler(PopResult{std::move(error), std::move(immediate_value)});
 						});
 				}
 			},
@@ -147,22 +239,28 @@ public:
 	}
 
 	boost::asio::awaitable<void> async_push_await(T value) {
-		auto was_closed = co_await async_push(std::move(value), boost::asio::use_awaitable);
-		if (was_closed) {
-			throw std::runtime_error("queue closed");
+		auto result = co_await async_push(std::move(value), boost::asio::use_awaitable);
+		if (result.error) {
+			std::rethrow_exception(result.error);
 		}
 		co_return;
 	}
 
 	boost::asio::awaitable<std::optional<T>> async_pop_await() {
-		auto value = co_await async_pop(boost::asio::use_awaitable);
-		co_return std::move(value);
+		auto result = co_await async_pop(boost::asio::use_awaitable);
+		if (result.error) {
+			std::rethrow_exception(result.error);
+		}
+		co_return std::move(result.value);
 	}
 
 	void push(T value) {
 		std::unique_lock lock(sync_mutex_);
-		sync_not_full_.wait(lock, [&] { return closed_ || queue_.size() < capacity_; });
-		if (closed_) {
+		sync_not_full_.wait(lock, [&] { return status_ != QueueStatus::Open || queue_.size() < capacity_; });
+		if (status_ == QueueStatus::Abandoned) {
+			throw AbandonedError();
+		}
+		if (status_ == QueueStatus::Closed) {
 			throw std::runtime_error("queue closed");
 		}
 		queue_.push_back(std::move(value));
@@ -173,8 +271,11 @@ public:
 
 	std::optional<T> pop() {
 		std::unique_lock lock(sync_mutex_);
-		sync_not_empty_.wait(lock, [&] { return closed_ || !queue_.empty(); });
+		sync_not_empty_.wait(lock, [&] { return status_ != QueueStatus::Open || !queue_.empty(); });
 		if (queue_.empty()) {
+			if (status_ == QueueStatus::Abandoned) {
+				throw AbandonedError();
+			}
 			return std::nullopt;
 		}
 		T value = std::move(queue_.front());
@@ -190,17 +291,56 @@ public:
 		std::deque<std::unique_ptr<PendingPopBase>> pending_pops;
 		{
 			std::lock_guard lock(sync_mutex_);
-			closed_ = true;
+			if (status_ != QueueStatus::Open) {
+				return;
+			}
+			status_ = QueueStatus::Closed;
 			pending_pushes.swap(pending_pushes_);
 			pending_pops.swap(pending_pops_);
 		}
 		sync_not_full_.notify_all();
 		sync_not_empty_.notify_all();
 		for (auto& waiter : pending_pushes) {
-			waiter->complete(true);
+			if (waiter->value.has_value()) {
+				waiter->value->Dispose();
+				waiter->value.reset();
+			}
+			waiter->complete(PushResult{std::make_exception_ptr(std::runtime_error("queue closed"))});
 		}
 		for (auto& waiter : pending_pops) {
-			waiter->complete(std::nullopt);
+			waiter->complete(PopResult{nullptr, std::nullopt});
+		}
+	}
+
+	void abandon() {
+		std::deque<std::unique_ptr<PendingPushBase>> pending_pushes;
+		std::deque<std::unique_ptr<PendingPopBase>> pending_pops;
+		std::deque<T> abandoned_items;
+		{
+			std::lock_guard lock(sync_mutex_);
+			if (status_ == QueueStatus::Abandoned) {
+				return;
+			}
+			status_ = QueueStatus::Abandoned;
+			pending_pushes.swap(pending_pushes_);
+			pending_pops.swap(pending_pops_);
+			abandoned_items.swap(queue_);
+		}
+		sync_not_full_.notify_all();
+		sync_not_empty_.notify_all();
+		for (auto& item : abandoned_items) {
+			item.Dispose();
+		}
+		auto error = std::make_exception_ptr(AbandonedError());
+		for (auto& waiter : pending_pushes) {
+			if (waiter->value.has_value()) {
+				waiter->value->Dispose();
+				waiter->value.reset();
+			}
+			waiter->complete(PushResult{error});
+		}
+		for (auto& waiter : pending_pops) {
+			waiter->complete(PopResult{error, std::nullopt});
 		}
 	}
 
@@ -214,10 +354,25 @@ public:
 	}
 
 private:
+	struct PushResult {
+		std::exception_ptr error;
+	};
+
+	struct PopResult {
+		std::exception_ptr error;
+		std::optional<T> value;
+	};
+
+	enum class QueueStatus {
+		Open,
+		Closed,
+		Abandoned,
+	};
+
 	struct PendingPushBase {
 		explicit PendingPushBase(T item) : value(std::move(item)) {}
 		virtual ~PendingPushBase() = default;
-		virtual void complete(bool closed) = 0;
+		virtual void complete(PushResult result) = 0;
 
 		std::optional<T> value;
 	};
@@ -229,9 +384,9 @@ private:
 			  executor(boost::asio::get_associated_executor(handler, fallback_executor)),
 			  handler(std::move(handler)) {}
 
-		void complete(bool closed) override {
-			boost::asio::post(executor, [handler = std::move(handler), closed]() mutable {
-				handler(closed);
+		void complete(PushResult result) override {
+			boost::asio::post(executor, [handler = std::move(handler), result = std::move(result)]() mutable {
+				handler(std::move(result));
 			});
 		}
 
@@ -241,7 +396,7 @@ private:
 
 	struct PendingPopBase {
 		virtual ~PendingPopBase() = default;
-		virtual void complete(std::optional<T> value) = 0;
+		virtual void complete(PopResult result) = 0;
 	};
 
 	template <typename Handler>
@@ -250,9 +405,9 @@ private:
 			: executor(boost::asio::get_associated_executor(handler, fallback_executor)),
 			  handler(std::move(handler)) {}
 
-		void complete(std::optional<T> value) override {
-			boost::asio::post(executor, [handler = std::move(handler), value = std::move(value)]() mutable {
-				handler(std::move(value));
+		void complete(PopResult result) override {
+			boost::asio::post(executor, [handler = std::move(handler), result = std::move(result)]() mutable {
+				handler(std::move(result));
 			});
 		}
 
@@ -261,7 +416,7 @@ private:
 	};
 
 	void promote_one_locked() {
-		if (closed_ || pending_pushes_.empty()) {
+		if (status_ != QueueStatus::Open || pending_pushes_.empty()) {
 			return;
 		}
 
@@ -270,15 +425,15 @@ private:
 		if (!pending_pops_.empty()) {
 			auto pop_waiter = std::move(pending_pops_.front());
 			pending_pops_.pop_front();
-			pop_waiter->complete(std::optional<T>(std::move(*push_waiter->value)));
-			push_waiter->complete(false);
+			pop_waiter->complete(PopResult{nullptr, std::optional<T>(std::move(*push_waiter->value))});
+			push_waiter->complete(PushResult{nullptr});
 			return;
 		}
 
 		if (queue_.size() < capacity_) {
 			queue_.push_back(std::move(*push_waiter->value));
 			sync_not_empty_.notify_one();
-			push_waiter->complete(false);
+			push_waiter->complete(PushResult{nullptr});
 		} else {
 			pending_pushes_.push_front(std::move(push_waiter));
 		}
@@ -293,7 +448,7 @@ private:
 				pending_pops_.pop_front();
 				auto value = std::move(queue_.front());
 				queue_.pop_front();
-				pop_waiter->complete(std::optional<T>(std::move(value)));
+				pop_waiter->complete(PopResult{nullptr, std::optional<T>(std::move(value))});
 			}
 			promote_one_locked();
 		}
@@ -302,12 +457,13 @@ private:
 	std::size_t capacity_;
 	boost::asio::any_io_executor executor_;
 	std::deque<T> queue_;
-	bool closed_ = false;
+	QueueStatus status_ = QueueStatus::Open;
 	mutable std::mutex sync_mutex_;
 	std::condition_variable sync_not_empty_;
 	std::condition_variable sync_not_full_;
 	std::deque<std::unique_ptr<PendingPushBase>> pending_pushes_;
 	std::deque<std::unique_ptr<PendingPopBase>> pending_pops_;
+	boost::signals2::scoped_connection cancel_connection_;
 };
 
 } // namespace soratransport

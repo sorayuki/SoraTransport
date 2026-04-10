@@ -14,6 +14,7 @@ struct TarWriteContext {
 	BufferPool* pool = nullptr;
 	std::uint64_t offset = 0;
 	std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr;
+	const CancelEvent* cancel_event = nullptr;
 };
 
 struct TarReadContext {
@@ -21,6 +22,7 @@ struct TarReadContext {
 	std::optional<DataChunk> current_chunk;
 	std::uint64_t offset = 0;
 	std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr;
+	const CancelEvent* cancel_event = nullptr;
 };
 
 int permissions_to_mode(std::filesystem::perms permissions) {
@@ -63,6 +65,12 @@ void throw_archive_error(struct archive* handle, std::string_view prefix) {
 	throw std::runtime_error(std::string(prefix) + ": " + archive_error_string(handle));
 }
 
+void throw_if_cancelled(const CancelEvent* cancel_event) {
+	if (cancel_event != nullptr && cancel_event->is_cancelled()) {
+		throw CancelledError();
+	}
+}
+
 std::filesystem::path normalize_relative_path(const std::filesystem::path& input) {
 	auto normalized = input.lexically_normal();
 	if (normalized.empty()) {
@@ -88,8 +96,9 @@ void TarPacker::pack(
 	BoundedQueue<OpenedFileReader>& in_meta,
 	BoundedQueue<DataChunk>& out_tar,
 	std::atomic<std::uint64_t>* uncompressed_bytes_counter,
-	std::atomic<std::uint64_t>* file_counter) {
-	TarWriteContext context{&out_tar, &pool_, 0, uncompressed_bytes_counter};
+	std::atomic<std::uint64_t>* file_counter,
+	const CancelEvent* cancel_event) {
+	TarWriteContext context{&out_tar, &pool_, 0, uncompressed_bytes_counter, cancel_event};
 
 	auto* writer = archive_write_new();
 	if (writer == nullptr) {
@@ -105,8 +114,9 @@ void TarPacker::pack(
 		}
 
 		while (auto meta = in_meta.pop()) {
+			throw_if_cancelled(cancel_event);
 			meta->read_budget_lease.reset();
-			add_entry(writer, *meta, file_counter);
+			add_entry(writer, *meta, file_counter, cancel_event);
 		}
 
 		if (archive_write_close(writer) != ARCHIVE_OK) {
@@ -123,6 +133,7 @@ void TarPacker::pack(
 
 la_ssize_t TarPacker::archive_write_callback(struct archive*, void* client_data, const void* buffer, size_t length) {
 	auto* context = static_cast<TarWriteContext*>(client_data);
+	throw_if_cancelled(context->cancel_event);
 	auto owned_buffer = context->pool->acquire(length);
 	std::memcpy(owned_buffer.get(), buffer, length);
 	context->out_tar->push(DataChunk{std::move(owned_buffer), length, context->offset, false});
@@ -138,8 +149,9 @@ int TarPacker::archive_close_callback(struct archive*, void*) {
 }
 
 
-void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file, std::atomic<std::uint64_t>* file_counter) const {
+void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file, std::atomic<std::uint64_t>* file_counter, const CancelEvent* cancel_event) const {
 	auto& meta = opened_file.meta;
+	throw_if_cancelled(cancel_event);
 	auto* entry = archive_entry_new();
 	if (entry == nullptr) {
 		throw std::runtime_error("failed to allocate archive entry");
@@ -187,6 +199,7 @@ void TarPacker::add_entry(struct archive* writer, OpenedFileReader& opened_file,
 
 		auto& reader = *opened_file.reader;
 		while (!reader.eof()) {
+			throw_if_cancelled(cancel_event);
 			auto chunk = reader.read_next_chunk();
 			if (chunk.length == 0) {
 				archive_entry_free(entry);
@@ -211,8 +224,9 @@ TarUnpacker::TarUnpacker(const std::filesystem::path& destination_root) : destin
 void TarUnpacker::unpack(
 	BoundedQueue<DataChunk>& in_tar,
 	std::atomic<std::uint64_t>* uncompressed_bytes_counter,
-	std::atomic<std::uint64_t>* file_counter) {
-	TarReadContext context{&in_tar, std::nullopt, 0, uncompressed_bytes_counter};
+	std::atomic<std::uint64_t>* file_counter,
+	const CancelEvent* cancel_event) {
+	TarReadContext context{&in_tar, std::nullopt, 0, uncompressed_bytes_counter, cancel_event};
 	auto* reader = archive_read_new();
 	auto* disk_writer = archive_write_disk_new();
 	if (reader == nullptr) {
@@ -235,6 +249,7 @@ void TarUnpacker::unpack(
 
 		archive_entry* entry = nullptr;
 		while (true) {
+			throw_if_cancelled(cancel_event);
 			const auto status = archive_read_next_header(reader, &entry);
 			if (status == ARCHIVE_EOF) {
 				break;
@@ -262,6 +277,7 @@ void TarUnpacker::unpack(
 			size_t length = 0;
 			la_int64_t offset = 0;
 			while (true) {
+				throw_if_cancelled(cancel_event);
 				const auto block_status = archive_read_data_block(reader, &buffer, &length, &offset);
 				if (block_status == ARCHIVE_EOF) {
 					break;
@@ -295,6 +311,7 @@ void TarUnpacker::unpack(
 
 la_ssize_t TarUnpacker::archive_read_callback(struct archive*, void* client_data, const void** buffer) {
 	auto* context = static_cast<TarReadContext*>(client_data);
+	throw_if_cancelled(context->cancel_event);
 	context->current_chunk = context->in_tar->pop();
 	if (!context->current_chunk.has_value()) {
 		*buffer = nullptr;

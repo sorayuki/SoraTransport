@@ -104,6 +104,16 @@ std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t ali
 	return std::max<std::size_t>(alignment, aligned_size);
 }
 
+void throw_if_cancelled(const CancelEvent* cancel_event) {
+	if (cancel_event != nullptr && cancel_event->is_cancelled()) {
+		throw CancelledError();
+	}
+}
+
+bool is_cancelled_win32_error(bool cancel_requested, DWORD error) {
+	return cancel_requested && (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED);
+}
+
 class ConcurrentDirectoryWorkQueue {
 public:
 	void push(std::filesystem::path path) {
@@ -187,6 +197,13 @@ std::string archive_path_for_entry(
 
 InFlightReadBudget::InFlightReadBudget(std::size_t max_bytes) : max_bytes_(std::max<std::size_t>(1, max_bytes)) {}
 
+void InFlightReadBudget::listenCancelSignal(CancelEvent& event) {
+	cancel_connection_ = event.connect([this] {
+		cancelled_.store(true, std::memory_order_release);
+		cv_.notify_all();
+	});
+}
+
 void InFlightReadBudget::acquire(std::size_t bytes) {
 	if (bytes == 0) {
 		return;
@@ -196,7 +213,12 @@ void InFlightReadBudget::acquire(std::size_t bytes) {
 	}
 
 	std::unique_lock lock(mutex_);
-	cv_.wait(lock, [&] { return used_bytes_ + bytes <= max_bytes_; });
+	cv_.wait(lock, [&] {
+		return cancelled_.load(std::memory_order_acquire) || used_bytes_ + bytes <= max_bytes_;
+	});
+	if (cancelled_.load(std::memory_order_acquire)) {
+		throw CancelledError("read budget acquisition cancelled");
+	}
 	used_bytes_ += bytes;
 }
 
@@ -209,6 +231,9 @@ bool InFlightReadBudget::try_acquire(std::size_t bytes) {
 	}
 
 	std::lock_guard lock(mutex_);
+	if (cancelled_.load(std::memory_order_acquire)) {
+		throw CancelledError("read budget acquisition cancelled");
+	}
 	if (used_bytes_ + bytes > max_bytes_) {
 		return false;
 	}
@@ -237,6 +262,10 @@ std::size_t InFlightReadBudget::used_bytes() const {
 	return used_bytes_;
 }
 
+bool InFlightReadBudget::is_cancelled() const {
+	return cancelled_.load(std::memory_order_acquire);
+}
+
 struct FileReader::State {
 	struct ReadSlot : OverlappedSlotBase {
 		std::uint64_t offset = 0;
@@ -261,11 +290,14 @@ struct FileReader::State {
 	std::size_t next_slot_to_consume = 0;
 	std::size_t in_flight_reads = 0;
 	bool prefetch_started = false;
+	std::atomic<bool> cancel_requested{false};
+	boost::signals2::scoped_connection cancel_connection;
 };
 
 DirScanner::DirScanner(RuntimeExecutors& executors) : executors_(executors) {}
 
-boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue) const {
+boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue, const CancelEvent* cancel_event) const {
+	throw_if_cancelled(cancel_event);
 	if (!std::filesystem::exists(root_dir)) {
 		throw std::runtime_error("source directory does not exist: " + path_to_utf8_string(root_dir));
 	}
@@ -286,10 +318,12 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 		directories.push_back(root_dir);
 
 		while (!directories.empty()) {
+			throw_if_cancelled(cancel_event);
 			auto current_dir = std::move(directories.front());
 			directories.pop_front();
 
 			for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
+				throw_if_cancelled(cancel_event);
 				FileMeta meta;
 				meta.full_path = entry.path();
 				populate_file_meta(meta);
@@ -340,6 +374,19 @@ FileReader& FileReader::operator=(FileReader&& other) {
 	return *this;
 }
 
+void FileReader::listenCancelSignal(CancelEvent& event) {
+	if (!state_) {
+		return;
+	}
+	auto* state = state_.get();
+	state_->cancel_connection = event.connect([state] {
+		state->cancel_requested.store(true, std::memory_order_release);
+		if (state->handle != INVALID_HANDLE_VALUE) {
+			::CancelIoEx(state->handle, nullptr);
+		}
+	});
+}
+
 void FileReader::close() {
 	if (!state_) {
 		return;
@@ -368,9 +415,26 @@ std::string FileReader::path_for_error() const {
 	return state_ == nullptr ? std::string() : path_to_utf8_string(state_->path);
 }
 
+bool FileReader::is_cancelled() const {
+	return state_ != nullptr && state_->cancel_requested.load(std::memory_order_acquire);
+}
+
+void FileReader::cancel_pending_work() {
+	if (!state_) {
+		return;
+	}
+	state_->cancel_requested.store(true, std::memory_order_release);
+	if (state_->handle != INVALID_HANDLE_VALUE) {
+		::CancelIoEx(state_->handle, nullptr);
+	}
+}
+
 bool FileReader::issue_next_read() {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
 	}
 	if (state_->next_issue_offset >= state_->aligned_data_end || state_->in_flight_reads >= state_->slots.size()) {
 		return false;
@@ -445,6 +509,9 @@ void FileReader::prime_prefetch_window(std::size_t max_bytes) {
 	if (!state_ || state_->aligned_data_end == 0 || max_bytes == 0) {
 		return;
 	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
 
 	std::size_t issued_bytes = 0;
 	while (state_->in_flight_reads < state_->slots.size()) {
@@ -462,6 +529,9 @@ void FileReader::prime_prefetch_window(std::size_t max_bytes) {
 void FileReader::open() {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
 	}
 	if (state_->handle != INVALID_HANDLE_VALUE) {
 		return;
@@ -502,6 +572,9 @@ void FileReader::start_prefetch(std::size_t max_bytes) {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
 	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
 	if (state_->handle == INVALID_HANDLE_VALUE) {
 		throw std::runtime_error("file reader is not open: " + path_for_error());
 	}
@@ -515,6 +588,9 @@ void FileReader::start_prefetch(std::size_t max_bytes) {
 DataChunk FileReader::read_next_chunk() {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
 	}
 	if (state_->handle == INVALID_HANDLE_VALUE) {
 		throw std::runtime_error("file reader is not open: " + path_for_error());
@@ -556,11 +632,17 @@ DataChunk FileReader::read_next_chunk() {
 			if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
 				const auto error = ::GetLastError();
 				::CloseHandle(overlapped.hEvent);
+				if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
+					throw CancelledError("file reader cancelled");
+				}
 				throw std::runtime_error("failed to read input tail block: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
 			}
 			if (!::GetOverlappedResult(state_->handle, &overlapped, &bytes_read, TRUE)) {
 				const auto error = ::GetLastError();
 				::CloseHandle(overlapped.hEvent);
+				if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
+					throw CancelledError("file reader cancelled");
+				}
 				throw std::runtime_error("failed to complete input tail block read: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
 			}
 			::CloseHandle(overlapped.hEvent);
@@ -587,6 +669,9 @@ DataChunk FileReader::read_next_chunk() {
 		slot.buffer.reset();
 		slot.requested_length = 0;
 		slot.offset = 0;
+		if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
+			throw CancelledError("file reader cancelled");
+		}
 		throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
 	}
 	slot.in_flight = false;
@@ -630,12 +715,14 @@ FileReaderOpener::FileReaderOpener(
 	RuntimeExecutors& executors,
 	std::size_t submit_concurrency,
 	std::size_t buffer_size,
-	FileIoMode io_mode)
+	FileIoMode io_mode,
+	CancelEvent* cancel_event)
 	: pool_(pool),
 	  executors_(executors),
 	  submit_concurrency_(std::max<std::size_t>(1, submit_concurrency)),
 	  buffer_size_(std::max<std::size_t>(1, buffer_size)),
-	  io_mode_(io_mode) {}
+	  io_mode_(io_mode),
+	  cancel_event_(cancel_event) {}
 
 boost::asio::awaitable<void> FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
 	try {
@@ -650,10 +737,14 @@ boost::asio::awaitable<void> FileReaderOpener::open(BoundedQueue<FileMeta>& in_m
 
 void FileReaderOpener::open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
 	while (auto meta = in_meta.pop()) {
+		throw_if_cancelled(cancel_event_);
 		OpenedFileReader opened_file;
 		opened_file.meta = std::move(*meta);
 		if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
 			auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
+			if (cancel_event_ != nullptr) {
+				reader.listenCancelSignal(*cancel_event_);
+			}
 			reader.open();
 			opened_file.reader.emplace(std::move(reader));
 		}
@@ -665,20 +756,24 @@ FileReaderPrefetcher::FileReaderPrefetcher(
 	RuntimeExecutors& executors,
 	std::shared_ptr<InFlightReadBudget> read_budget,
 	std::size_t prefetch_bytes,
-	FileIoMode io_mode)
+	FileIoMode io_mode,
+	CancelEvent* cancel_event)
 	: executors_(executors),
 	  read_budget_(std::move(read_budget)),
 	  prefetch_bytes_(std::max<std::size_t>(1, prefetch_bytes)),
-	  io_mode_(io_mode) {}
+	  io_mode_(io_mode),
+	  cancel_event_(cancel_event) {}
 
 boost::asio::awaitable<void> FileReaderPrefetcher::prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const {
 	try {
 		while (auto opened_file = co_await in_opened.async_pop_await()) {
+			throw_if_cancelled(cancel_event_);
 			if (opened_file->reader.has_value()) {
 				const auto budget_bytes = compute_reader_prefetch_bytes(opened_file->meta, prefetch_bytes_, io_mode_);
 				if (budget_bytes > 0) {
 					read_budget_->acquire(budget_bytes);
 					try {
+						throw_if_cancelled(cancel_event_);
 						opened_file->reader->start_prefetch(budget_bytes);
 						opened_file->read_budget_lease = ReadBudgetLease(read_budget_, budget_bytes);
 						co_await out_prefetched.async_push_await(std::move(*opened_file));
