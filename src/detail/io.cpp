@@ -8,20 +8,16 @@
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <cwchar>
 #include <deque>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
 
-#include <winioctl.h>
-
 namespace soratransport {
 
 namespace {
 
-constexpr std::size_t kDirectIoBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kBufferedWriteBatchSize = 8 * 1024 * 1024;
 constexpr std::size_t kSocketIoBufferSize = 1 * 1024 * 1024;
 constexpr std::size_t kSocketIoReceiveBufferSize = kSocketIoBufferSize / 2;
@@ -38,31 +34,6 @@ bool is_cancelled_socket_error(bool cancel_requested, const boost::system::error
 	using boost::asio::error::bad_descriptor;
 	using boost::asio::error::operation_aborted;
 	return cancel_requested && (error == operation_aborted || error == bad_descriptor);
-}
-
-std::wstring make_volume_device_path(const std::filesystem::path& path) {
-	const auto absolute_path = std::filesystem::absolute(path);
-	const auto root_name = absolute_path.root_name().wstring();
-	if (root_name.size() < 2 || root_name[1] != L':') {
-		return L"";
-	}
-	return L"\\\\.\\" + root_name;
-}
-
-void write_all(HANDLE handle, std::span<const uint8_t> bytes, const std::string& path) {
-	std::size_t written_total = 0;
-	while (written_total < bytes.size()) {
-		const auto remaining = bytes.size() - written_total;
-		const auto chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-		DWORD bytes_written = 0;
-		if (!::WriteFile(handle, bytes.data() + written_total, chunk, &bytes_written, nullptr)) {
-			throw make_win32_error("failed to write output file: " + path);
-		}
-		if (bytes_written == 0) {
-			throw std::runtime_error("failed to make forward progress while writing output file: " + path);
-		}
-		written_total += bytes_written;
-	}
 }
 
 std::size_t read_some(HANDLE handle, uint8_t* buffer, std::size_t length, const std::string& path) {
@@ -85,59 +56,6 @@ std::size_t read_some(HANDLE handle, uint8_t* buffer, std::size_t length, const 
 	return total_bytes_read;
 }
 
-void write_exact_at(HANDLE handle, const uint8_t* buffer, std::size_t length, std::uint64_t offset, const std::string& path) {
-	std::size_t written_total = 0;
-	while (written_total < length) {
-		OVERLAPPED overlapped{};
-		overlapped.Offset = static_cast<DWORD>((offset + written_total) & 0xffffffffull);
-		overlapped.OffsetHigh = static_cast<DWORD>(((offset + written_total) >> 32) & 0xffffffffull);
-		const auto remaining = length - written_total;
-		const auto chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-		DWORD bytes_written = 0;
-		if (!::WriteFile(handle, buffer + written_total, chunk, &bytes_written, &overlapped)) {
-			throw make_win32_error("failed to write output file: " + path);
-		}
-		if (bytes_written != chunk) {
-			throw std::runtime_error("unexpected short write to output file: " + path);
-		}
-		written_total += bytes_written;
-	}
-}
-
-std::size_t read_exact_at(HANDLE handle, uint8_t* buffer, std::size_t length, std::uint64_t offset, const std::string& path) {
-	std::size_t total_bytes_read = 0;
-	while (total_bytes_read < length) {
-		OVERLAPPED overlapped{};
-		overlapped.Offset = static_cast<DWORD>((offset + total_bytes_read) & 0xffffffffull);
-		overlapped.OffsetHigh = static_cast<DWORD>(((offset + total_bytes_read) >> 32) & 0xffffffffull);
-		const auto remaining = length - total_bytes_read;
-		const auto chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-		DWORD bytes_read = 0;
-		if (!::ReadFile(handle, buffer + total_bytes_read, chunk, &bytes_read, &overlapped)) {
-			throw make_win32_error("failed to read input file: " + path);
-		}
-		if (bytes_read == 0) {
-			break;
-		}
-		total_bytes_read += bytes_read;
-		if (bytes_read < chunk) {
-			break;
-		}
-	}
-	return total_bytes_read;
-}
-
-void set_file_size(HANDLE handle, std::uint64_t size, const std::string& path) {
-	LARGE_INTEGER target_size{};
-	target_size.QuadPart = static_cast<LONGLONG>(size);
-	if (!::SetFilePointerEx(handle, target_size, nullptr, FILE_BEGIN)) {
-		throw make_win32_error("failed to seek file: " + path);
-	}
-	if (!::SetEndOfFile(handle)) {
-		throw make_win32_error("failed to resize file: " + path);
-	}
-}
-
 void flush_file_buffers_if_supported(HANDLE handle, const std::string& path, std::string_view action) {
 	if (::FlushFileBuffers(handle)) {
 		return;
@@ -151,88 +69,7 @@ void flush_file_buffers_if_supported(HANDLE handle, const std::string& path, std
 	throw make_win32_error(std::string(action) + ": " + path, error);
 }
 
-void resize_file_buffered(const std::filesystem::path& path, std::uint64_t size) {
-	const auto handle = ::CreateFileW(
-		path.c_str(),
-		GENERIC_WRITE,
-		0,
-		nullptr,
-		OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-		nullptr);
-	if (handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to reopen output file for resize: " + path_to_utf8_string(path));
-	}
-	try {
-		set_file_size(handle, size, path_to_utf8_string(path));
-		flush_file_buffers_if_supported(handle, path_to_utf8_string(path), "failed to flush resized output file");
-		::CloseHandle(handle);
-	} catch (...) {
-		::CloseHandle(handle);
-		throw;
-	}
-}
-
 } // namespace
-
-FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path) {
-	FileIoAlignmentInfo info;
-	const auto absolute_path = std::filesystem::absolute(path);
-	std::wstring volume_path(MAX_PATH, L'\0');
-	if (!::GetVolumePathNameW(absolute_path.c_str(), volume_path.data(), static_cast<DWORD>(volume_path.size()))) {
-		return info;
-	}
-	volume_path.resize(std::wcslen(volume_path.c_str()));
-
-	DWORD sectors_per_cluster = 0;
-	DWORD bytes_per_sector = 0;
-	DWORD number_of_free_clusters = 0;
-	DWORD total_number_of_clusters = 0;
-	if (::GetDiskFreeSpaceW(
-			volume_path.c_str(),
-			&sectors_per_cluster,
-			&bytes_per_sector,
-			&number_of_free_clusters,
-			&total_number_of_clusters)) {
-		info.logical_sector_size = std::max<std::size_t>(kFileIoAlignment, bytes_per_sector);
-		info.physical_sector_size = info.logical_sector_size;
-		info.required_alignment = info.logical_sector_size;
-	}
-
-	const auto volume_device = make_volume_device_path(absolute_path);
-	if (!volume_device.empty()) {
-		const auto handle = ::CreateFileW(
-			volume_device.c_str(),
-			0,
-			FILE_SHARE_READ | FILE_SHARE_WRITE,
-			nullptr,
-			OPEN_EXISTING,
-			0,
-			nullptr);
-		if (handle != INVALID_HANDLE_VALUE) {
-			STORAGE_PROPERTY_QUERY query{};
-			query.PropertyId = StorageAccessAlignmentProperty;
-			query.QueryType = PropertyStandardQuery;
-			STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR descriptor{};
-			DWORD bytes_returned = 0;
-			if (::DeviceIoControl(
-					handle,
-					IOCTL_STORAGE_QUERY_PROPERTY,
-					&query,
-					static_cast<DWORD>(sizeof(query)),
-					&descriptor,
-					static_cast<DWORD>(sizeof(descriptor)),
-					&bytes_returned,
-					nullptr) && descriptor.BytesPerPhysicalSector > 0) {
-				info.physical_sector_size = std::max<std::size_t>(info.logical_sector_size, descriptor.BytesPerPhysicalSector);
-				info.required_alignment = std::max(info.required_alignment, info.physical_sector_size);
-			}
-			::CloseHandle(handle);
-		}
-	}
-
-	return info;
-}
 
 struct FileByteSink::State {
 	struct WriteSlot : OverlappedSlotBase {
@@ -241,12 +78,8 @@ struct FileByteSink::State {
 	};
 
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	std::filesystem::path path;
 	std::string display_path;
 	bool closed = false;
-	FileIoMode mode = FileIoMode::Buffered;
-	std::size_t io_alignment = kFileIoAlignment;
-	std::uint64_t logical_size = 0;
 	std::size_t write_buffer_capacity = 0;
 	std::size_t max_in_flight_write_ops = 1;
 	std::uint64_t physical_size = 0;
@@ -260,22 +93,11 @@ struct FileByteSink::State {
 
 struct FileByteSource::State {
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	std::filesystem::path path;
 	std::string display_path;
-	FileIoMode mode = FileIoMode::Buffered;
-	std::size_t io_alignment = kFileIoAlignment;
-	std::uint64_t logical_offset = 0;
-	std::uint64_t size = 0;
-	std::shared_ptr<uint8_t> aligned_buffer;
-	std::size_t aligned_buffer_capacity = 0;
-	std::size_t aligned_buffer_size = 0;
-	std::size_t aligned_buffer_offset = 0;
 };
 
 FileByteSink::FileByteSink(const std::filesystem::path& output_path, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
-	state_->path = output_path;
 	state_->display_path = path_to_utf8_string(output_path);
-	state_->mode = FileIoMode::Buffered;
 	state_->max_in_flight_write_ops = std::max<std::size_t>(1, max_in_flight_write_ops);
 	const auto flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
 	state_->handle = ::CreateFileW(
@@ -319,10 +141,6 @@ void FileByteSink::listenCancelSignal(CancelEvent& event) {
 	});
 }
 
-void FileByteSink::flush_pending_writes() {
-	submit_active_write(false);
-}
-
 void FileByteSink::write(std::span<const uint8_t> bytes) {
 	if (!state_ || state_->closed || state_->handle == INVALID_HANDLE_VALUE) {
 		throw std::runtime_error("output file is closed");
@@ -330,11 +148,10 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 	if (state_->cancel_requested.load(std::memory_order_acquire)) {
 		throw CancelledError("output file write cancelled");
 	}
-	state_->logical_size += bytes.size();
 	while (!bytes.empty()) {
 		auto& active_slot = state_->write_slots[state_->active_slot_index];
 		if (active_slot.size == state_->write_buffer_capacity) {
-			submit_active_write(false);
+			submit_active_write();
 		}
 
 		const auto available = state_->write_buffer_capacity - active_slot.size;
@@ -344,12 +161,12 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 		bytes = bytes.subspan(chunk);
 
 		if (active_slot.size == state_->write_buffer_capacity) {
-			submit_active_write(false);
+			submit_active_write();
 		}
 	}
 }
 
-void FileByteSink::submit_active_write(bool finalize) {
+void FileByteSink::submit_active_write() {
 	if (!state_) {
 		return;
 	}
@@ -448,7 +265,7 @@ void FileByteSink::close() {
 	if (state_->cancel_requested.load(std::memory_order_acquire)) {
 		throw CancelledError("output file write cancelled");
 	}
-	submit_active_write(true);
+	submit_active_write();
 	wait_for_all_writes();
 	state_->closed = true;
 	try {
@@ -479,38 +296,18 @@ void FileByteSink::cancel_pending_work() {
 	}
 }
 
-FileByteSource::FileByteSource(const std::filesystem::path& input_path, FileIoMode mode) : state_(std::make_unique<State>()) {
-	state_->path = input_path;
+FileByteSource::FileByteSource(const std::filesystem::path& input_path) : state_(std::make_unique<State>()) {
 	state_->display_path = path_to_utf8_string(input_path);
-	state_->mode = mode;
-	if (mode == FileIoMode::Direct) {
-		state_->io_alignment = query_file_io_alignment(input_path).required_alignment;
-	}
-	const auto flags = mode == FileIoMode::Direct
-		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING
-		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
 	state_->handle = ::CreateFileW(
 		input_path.c_str(),
 		GENERIC_READ,
 		FILE_SHARE_READ,
 		nullptr,
 		OPEN_EXISTING,
-		flags,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
 		nullptr);
 	if (state_->handle == INVALID_HANDLE_VALUE) {
 		throw make_win32_error("failed to open input file: " + state_->display_path);
-	}
-	LARGE_INTEGER file_size{};
-	if (!::GetFileSizeEx(state_->handle, &file_size)) {
-		const auto error = ::GetLastError();
-		::CloseHandle(state_->handle);
-		state_->handle = INVALID_HANDLE_VALUE;
-		throw make_win32_error("failed to query input file size: " + state_->display_path, error);
-	}
-	state_->size = static_cast<std::uint64_t>(file_size.QuadPart);
-	if (mode == FileIoMode::Direct) {
-		state_->aligned_buffer_capacity = static_cast<std::size_t>(round_up(kDirectIoBufferSize, state_->io_alignment));
-		state_->aligned_buffer = make_aligned_buffer(state_->aligned_buffer_capacity, state_->io_alignment);
 	}
 }
 
@@ -528,46 +325,7 @@ std::size_t FileByteSource::read(uint8_t* buffer, std::size_t length) {
 	if (length == 0) {
 		return 0;
 	}
-	if (state_->mode == FileIoMode::Buffered) {
-		return read_some(state_->handle, buffer, length, state_->display_path);
-	}
-
-	std::size_t copied_total = 0;
-	while (copied_total < length) {
-		if (state_->aligned_buffer_offset < state_->aligned_buffer_size) {
-			const auto available = state_->aligned_buffer_size - state_->aligned_buffer_offset;
-			const auto chunk = std::min<std::size_t>(available, length - copied_total);
-			std::memcpy(buffer + copied_total, state_->aligned_buffer.get() + state_->aligned_buffer_offset, chunk);
-			state_->aligned_buffer_offset += chunk;
-			state_->logical_offset += chunk;
-			copied_total += chunk;
-			continue;
-		}
-
-		if (state_->logical_offset >= state_->size) {
-			break;
-		}
-
-		const auto remaining = state_->size - state_->logical_offset;
-		std::size_t request_size = 0;
-		if (remaining >= state_->io_alignment) {
-			request_size = static_cast<std::size_t>(std::min<std::uint64_t>(round_down(remaining, state_->io_alignment), state_->aligned_buffer_capacity));
-			if (request_size == 0) {
-				request_size = state_->io_alignment;
-			}
-		} else {
-			request_size = state_->io_alignment;
-		}
-
-		const auto bytes_read = read_exact_at(state_->handle, state_->aligned_buffer.get(), request_size, state_->logical_offset, state_->display_path);
-		if (bytes_read == 0) {
-			break;
-		}
-		state_->aligned_buffer_size = bytes_read;
-		state_->aligned_buffer_offset = 0;
-	}
-
-	return copied_total;
+	return read_some(state_->handle, buffer, length, state_->display_path);
 }
 
 struct SocketByteSink::State {

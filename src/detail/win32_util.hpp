@@ -9,7 +9,6 @@
 #include <string_view>
 #include <system_error>
 
-#include <malloc.h>
 #include <windows.h>
 
 namespace soratransport {
@@ -38,34 +37,6 @@ inline std::string utf16_to_utf8(std::wstring_view text) {
 	std::string result(static_cast<std::size_t>(size), '\0');
 	::WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
 	return result;
-}
-
-// ── Alignment math utilities ─────────────────────────────────────────
-
-inline std::uint64_t round_down(std::uint64_t value, std::size_t alignment) {
-	return value - (value % alignment);
-}
-
-inline std::uint64_t round_up(std::uint64_t value, std::size_t alignment) {
-	if (value == 0) {
-		return 0;
-	}
-	const auto remainder = value % alignment;
-	return remainder == 0 ? value : value + (alignment - remainder);
-}
-
-inline bool is_aligned(const void* pointer, std::size_t alignment) {
-	return (reinterpret_cast<std::uintptr_t>(pointer) % alignment) == 0;
-}
-
-// ── Buffer allocation utilities ──────────────────────────────────────
-
-inline std::shared_ptr<uint8_t> make_aligned_buffer(std::size_t size, std::size_t alignment) {
-	auto* pointer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
-	if (pointer == nullptr) {
-		throw std::bad_alloc();
-	}
-	return {pointer, [](uint8_t* value) { _aligned_free(value); }};
 }
 
 inline std::shared_ptr<uint8_t> make_heap_buffer(std::size_t size) {

@@ -39,14 +39,12 @@ void pack_directory_to_file(
 	const std::filesystem::path& source_dir,
 	const std::filesystem::path& output_file,
 	CompressionMode mode,
-	FileIoMode file_io_mode = FileIoMode::Buffered,
 	RuntimeOptions options = {},
 	CancelEvent* cancel_event = nullptr);
 void unpack_file_to_directory(
 	const std::filesystem::path& input_file,
 	const std::filesystem::path& destination_dir,
 	CompressionMode mode,
-	FileIoMode file_io_mode = FileIoMode::Buffered,
 	RuntimeOptions options = {},
 	CancelEvent* cancel_event = nullptr);
 void listen_directory(

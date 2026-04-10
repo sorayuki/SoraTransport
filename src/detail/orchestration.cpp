@@ -336,8 +336,8 @@ asio::awaitable<void> listen_directory_task(
 		tar_queue.listenCancelSignal(cancel_event);
 		zstd_queue.listenCancelSignal(cancel_event);
 		CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
-		DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
-		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
+		DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, &cancel_event);
+		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, &cancel_event);
 		TarPacker packer(pool, kPipelineChunkSize);
 		PipelineState state;
 		std::atomic<int> active_compression_level{compression_level};
@@ -522,7 +522,7 @@ asio::awaitable<void> receive_directory_task(
 
 } // namespace
 
-void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options, CancelEvent* cancel_event) {
+void pack_directory_to_file(const std::filesystem::path& source_dir, const std::filesystem::path& output_file, CompressionMode mode, RuntimeOptions options, CancelEvent* cancel_event) {
 	CancelEvent local_cancel_event;
 	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	auto config = make_runtime_config(options);
@@ -541,8 +541,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	zstd_queue.listenCancelSignal(effective_cancel_event);
 	CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
-	DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
-	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
+	DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, &effective_cancel_event);
+	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, &effective_cancel_event);
 	TarPacker packer(pool, kPipelineChunkSize);
 	PipelineState state;
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
@@ -655,7 +655,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	}
 }
 
-void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, FileIoMode file_io_mode, RuntimeOptions options, CancelEvent* cancel_event) {
+void unpack_file_to_directory(const std::filesystem::path& input_file, const std::filesystem::path& destination_dir, CompressionMode mode, RuntimeOptions options, CancelEvent* cancel_event) {
 	CancelEvent local_cancel_event;
 	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	auto config = make_runtime_config(options);
@@ -665,7 +665,7 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	PipelineState state;
 	TarUnpacker unpacker(destination_dir);
-	FileByteSource source(input_file, file_io_mode);
+	FileByteSource source(input_file);
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	print_unpack_progress_legend();
 

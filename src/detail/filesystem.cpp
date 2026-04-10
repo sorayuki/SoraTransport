@@ -148,11 +148,6 @@ void populate_file_meta(FileMeta& meta) {
 #endif
 }
 
-std::size_t make_direct_request_size(std::size_t preferred_size, std::size_t alignment) {
-	const auto aligned_size = static_cast<std::size_t>(round_down(preferred_size, alignment));
-	return std::max<std::size_t>(alignment, aligned_size);
-}
-
 void throw_if_cancelled(const CancelEvent* cancel_event) {
 	if (cancel_event != nullptr && cancel_event->is_cancelled()) {
 		throw CancelledError();
@@ -161,21 +156,6 @@ void throw_if_cancelled(const CancelEvent* cancel_event) {
 
 bool is_cancelled_win32_error(bool cancel_requested, DWORD error) {
 	return cancel_requested && (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED);
-}
-
-FileIoMode resolve_effective_reader_io_mode(
-	FileIoMode requested_io_mode,
-	std::uint64_t size,
-	std::size_t chunk_size) {
-	return requested_io_mode == FileIoMode::Direct && size >= chunk_size * kOverlappedReadQueueDepth
-		? FileIoMode::Direct
-		: FileIoMode::Buffered;
-}
-
-DWORD reader_open_flags_for_mode(FileIoMode io_mode) {
-	return io_mode == FileIoMode::Direct
-		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING
-		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
 }
 
 std::size_t compute_reader_prefetch_bytes(
@@ -187,14 +167,9 @@ std::size_t compute_reader_prefetch_bytes(
 		return 0;
 	}
 
-	auto per_slot_capacity = std::max<std::size_t>(1, buffer_size);
-	if (opened_file.reader->io_mode() == FileIoMode::Direct) {
-		per_slot_capacity = make_direct_request_size(buffer_size, opened_file.reader->io_alignment());
-	}
-
 	return static_cast<std::size_t>(std::min<std::uint64_t>(
 		opened_file.meta.size,
-		static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
+		static_cast<std::uint64_t>(std::max<std::size_t>(1, buffer_size)) * kOverlappedReadQueueDepth));
 }
 
 bool is_future_ready(std::future<OpenedFileReader>& future) {
@@ -205,18 +180,8 @@ OpenedFileReader open_regular_file(
 	BufferPool& pool,
 	FileMeta meta,
 	std::size_t buffer_size,
-	FileIoMode requested_io_mode,
-	const std::optional<FileIoAlignmentInfo>& shared_alignment,
 	CancelEvent* cancel_event) {
 	throw_if_cancelled(cancel_event);
-
-	const auto effective_io_mode = resolve_effective_reader_io_mode(
-		requested_io_mode,
-		meta.size,
-		std::max<std::size_t>(1, buffer_size));
-	const auto io_alignment = effective_io_mode == FileIoMode::Direct
-		? shared_alignment.value_or(FileIoAlignmentInfo{}).required_alignment
-		: kFileIoAlignment;
 
 	UniqueWin32Handle handle(::CreateFileW(
 		meta.full_path.c_str(),
@@ -224,7 +189,7 @@ OpenedFileReader open_regular_file(
 		FILE_SHARE_READ,
 		nullptr,
 		OPEN_EXISTING,
-		reader_open_flags_for_mode(effective_io_mode),
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED,
 		nullptr));
 	if (!handle.valid()) {
 		throw make_win32_error("failed to open input file: " + path_to_utf8_string(meta.full_path));
@@ -240,9 +205,7 @@ OpenedFileReader open_regular_file(
 		opened_file.meta.full_path,
 		opened_file.meta.size,
 		buffer_size,
-		handle.release(),
-		effective_io_mode,
-		io_alignment);
+		handle.release());
 	if (cancel_event != nullptr) {
 		reader.listenCancelSignal(*cancel_event);
 	}
@@ -357,25 +320,17 @@ struct FileReader::State {
 	State(
 		std::filesystem::path input_path,
 		std::uint64_t input_size,
-		HANDLE input_handle,
-		FileIoMode input_mode,
-		std::size_t input_alignment)
+		HANDLE input_handle)
 		: path(std::move(input_path)),
 		  size(input_size),
-		  io_alignment(input_alignment),
-		  handle(input_handle),
-		  io_mode(input_mode) {}
+		  handle(input_handle) {}
 
 	std::filesystem::path path;
 	std::uint64_t offset = 0;
 	std::uint64_t size = 0;
-	std::uint64_t aligned_data_end = 0;
 	std::uint64_t next_issue_offset = 0;
 	std::size_t chunk_size = 0;
-	std::size_t io_alignment = kFileIoAlignment;
 	HANDLE handle = INVALID_HANDLE_VALUE;
-	FileIoMode io_mode = FileIoMode::Buffered;
-	bool tail_read_complete = false;
 	std::array<ReadSlot, kOverlappedReadQueueDepth> slots;
 	std::size_t next_slot_to_issue = 0;
 	std::size_t next_slot_to_consume = 0;
@@ -390,13 +345,11 @@ DirScanner::DirScanner(
 	RuntimeExecutors& executors,
 	std::size_t submit_concurrency,
 	std::size_t buffer_size,
-	FileIoMode io_mode,
 	CancelEvent* cancel_event)
 	: pool_(pool),
 	  executors_(executors),
 	  submit_concurrency_(std::max<std::size_t>(1, submit_concurrency)),
 	  buffer_size_(std::max<std::size_t>(1, buffer_size)),
-	  io_mode_(io_mode),
 	  cancel_event_(cancel_event) {}
 
 boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const {
@@ -413,7 +366,6 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 	try {
 		std::map<std::size_t, std::future<OpenedFileReader>> pending_results;
 		std::map<std::size_t, OpenedFileReader> ready_results;
-		std::optional<FileIoAlignmentInfo> shared_alignment;
 		std::size_t next_sequence = 0;
 		std::size_t next_emit_sequence = 0;
 
@@ -483,19 +435,14 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 				}
 
 				if (meta.status.type() == std::filesystem::file_type::regular) {
-					if (io_mode_ == FileIoMode::Direct && !shared_alignment.has_value()) {
-						shared_alignment = query_file_io_alignment(meta.full_path);
-					}
 					const auto sequence = next_sequence++;
 					pending_results.emplace(
 						sequence,
-						executors_.post([this, meta = std::move(meta), shared_alignment]() mutable {
+						executors_.post([this, meta = std::move(meta)]() mutable {
 							return open_regular_file(
 								pool_,
 								std::move(meta),
 								buffer_size_,
-								io_mode_,
-								shared_alignment,
 								cancel_event_);
 						}));
 				} else {
@@ -527,10 +474,8 @@ FileReader::FileReader(
 	const std::filesystem::path& path,
 	std::uint64_t size,
 	std::size_t buffer_size,
-	HANDLE handle,
-	FileIoMode io_mode,
-	std::size_t io_alignment)
-	: pool_(pool), state_(std::make_unique<State>(path, size, handle, io_mode, io_alignment)) {
+	HANDLE handle)
+	: pool_(pool), state_(std::make_unique<State>(path, size, handle)) {
 	state_->chunk_size = std::max<std::size_t>(1, buffer_size);
 	initialize_open_state();
 }
@@ -612,16 +557,14 @@ bool FileReader::issue_next_read() {
 	if (state_->cancel_requested.load(std::memory_order_acquire)) {
 		throw CancelledError("file reader cancelled");
 	}
-	if (state_->next_issue_offset >= state_->aligned_data_end || state_->in_flight_reads >= state_->slots.size()) {
+	if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
 		return false;
 	}
 
 	const auto request_limit = static_cast<std::size_t>(std::min<std::uint64_t>(
 		state_->chunk_size,
-		state_->aligned_data_end - state_->next_issue_offset));
-	const auto request_length = state_->io_mode == FileIoMode::Direct
-		? make_direct_request_size(request_limit, state_->io_alignment)
-		: request_limit;
+		state_->size - state_->next_issue_offset));
+	const auto request_length = request_limit;
 
 	auto slot_index = state_->slots.size();
 	for (std::size_t probe = 0; probe < state_->slots.size(); ++probe) {
@@ -641,9 +584,7 @@ bool FileReader::issue_next_read() {
 	slot.requested_length = request_length;
 
 	try {
-		slot.buffer = state_->io_mode == FileIoMode::Direct
-			? make_aligned_buffer(slot.requested_length, state_->io_alignment)
-			: pool_.acquire(slot.requested_length);
+		slot.buffer = pool_.acquire(slot.requested_length);
 	} catch (...) {
 		slot.requested_length = 0;
 		slot.offset = 0;
@@ -682,7 +623,7 @@ bool FileReader::issue_next_read() {
 }
 
 void FileReader::prime_prefetch_window(std::size_t max_bytes) {
-	if (!state_ || state_->aligned_data_end == 0 || max_bytes == 0) {
+	if (!state_ || state_->size == 0 || max_bytes == 0) {
 		return;
 	}
 	if (state_->cancel_requested.load(std::memory_order_acquire)) {
@@ -713,12 +654,10 @@ void FileReader::initialize_open_state() {
 		throw std::runtime_error("file reader is missing an input handle: " + path_for_error());
 	}
 	state_->offset = 0;
-	state_->aligned_data_end = state_->io_mode == FileIoMode::Direct ? round_down(state_->size, state_->io_alignment) : state_->size;
 	state_->next_issue_offset = 0;
 	state_->next_slot_to_issue = 0;
 	state_->next_slot_to_consume = 0;
 	state_->in_flight_reads = 0;
-	state_->tail_read_complete = false;
 	state_->prefetch_started = false;
 }
 
@@ -759,55 +698,6 @@ DataChunk FileReader::read_next_chunk() {
 		issue_next_read();
 	}
 	if (state_->in_flight_reads == 0) {
-		if (state_->offset < state_->size && !state_->tail_read_complete) {
-			const auto tail_request_size = state_->io_mode == FileIoMode::Direct ? state_->io_alignment : static_cast<std::size_t>(state_->size - state_->offset);
-			std::shared_ptr<uint8_t> buffer;
-			try {
-				buffer = state_->io_mode == FileIoMode::Direct
-					? make_aligned_buffer(tail_request_size, state_->io_alignment)
-					: pool_.acquire(tail_request_size);
-			} catch (...) {
-				throw;
-			}
-			OVERLAPPED overlapped{};
-			overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-			if (overlapped.hEvent == nullptr) {
-				throw make_win32_error("failed to create tail read event for input file: " + path_for_error());
-			}
-			overlapped.Offset = static_cast<DWORD>(state_->offset & 0xffffffffull);
-			overlapped.OffsetHigh = static_cast<DWORD>((state_->offset >> 32) & 0xffffffffull);
-			DWORD bytes_read = 0;
-			const auto ok = ::ReadFile(
-				state_->handle,
-				buffer.get(),
-				static_cast<DWORD>(tail_request_size),
-				nullptr,
-				&overlapped);
-			if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
-				const auto error = ::GetLastError();
-				::CloseHandle(overlapped.hEvent);
-				if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
-					throw CancelledError("file reader cancelled");
-				}
-				throw std::runtime_error("failed to read input tail block: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
-			}
-			if (!::GetOverlappedResult(state_->handle, &overlapped, &bytes_read, TRUE)) {
-				const auto error = ::GetLastError();
-				::CloseHandle(overlapped.hEvent);
-				if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
-					throw CancelledError("file reader cancelled");
-				}
-				throw std::runtime_error("failed to complete input tail block read: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
-			}
-			::CloseHandle(overlapped.hEvent);
-			if (bytes_read == 0) {
-				throw std::runtime_error("unexpected empty tail read from input file: " + path_for_error());
-			}
-			const auto read_offset = state_->offset;
-			state_->offset += bytes_read;
-			state_->tail_read_complete = true;
-			return DataChunk{std::move(buffer), bytes_read, read_offset, true};
-		}
 		return DataChunk{pool_.acquire(0), 0, current_offset, true};
 	}
 
@@ -856,14 +746,6 @@ std::uint64_t FileReader::offset() const {
 	return state_ == nullptr ? 0 : state_->offset;
 }
 
-FileIoMode FileReader::io_mode() const {
-	return state_ == nullptr ? FileIoMode::Buffered : state_->io_mode;
-}
-
-std::size_t FileReader::io_alignment() const {
-	return state_ == nullptr ? kFileIoAlignment : state_->io_alignment;
-}
-
 bool FileReader::eof() const {
 	return state_ == nullptr || state_->offset >= state_->size;
 }
@@ -876,12 +758,10 @@ FileReaderPrefetcher::FileReaderPrefetcher(
 	RuntimeExecutors& executors,
 	std::shared_ptr<InFlightReadBudget> read_budget,
 	std::size_t prefetch_bytes,
-	FileIoMode io_mode,
 	CancelEvent* cancel_event)
 	: executors_(executors),
 	  read_budget_(std::move(read_budget)),
 	  prefetch_bytes_(std::max<std::size_t>(1, prefetch_bytes)),
-	  io_mode_(io_mode),
 	  cancel_event_(cancel_event) {}
 
 boost::asio::awaitable<void> FileReaderPrefetcher::prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const {

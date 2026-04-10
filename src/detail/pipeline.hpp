@@ -100,9 +100,7 @@ public:
 		const std::filesystem::path& path,
 		std::uint64_t size,
 		std::size_t buffer_size,
-		HANDLE handle,
-		FileIoMode io_mode = FileIoMode::Buffered,
-		std::size_t io_alignment = kFileIoAlignment);
+		HANDLE handle);
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
@@ -115,8 +113,6 @@ public:
 	bool eof() const;
 	bool is_open() const;
 	bool is_cancelled() const;
-	FileIoMode io_mode() const;
-	std::size_t io_alignment() const;
 	void cancel_pending_work();
 
 private:
@@ -150,7 +146,6 @@ public:
 		RuntimeExecutors& executors,
 		std::size_t submit_concurrency,
 		std::size_t buffer_size,
-		FileIoMode io_mode = FileIoMode::Buffered,
 		CancelEvent* cancel_event = nullptr);
 	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const;
 
@@ -159,7 +154,6 @@ private:
 	RuntimeExecutors& executors_;
 	std::size_t submit_concurrency_;
 	std::size_t buffer_size_;
-	FileIoMode io_mode_;
 	CancelEvent* cancel_event_ = nullptr;
 };
 
@@ -182,7 +176,6 @@ public:
 		RuntimeExecutors& executors,
 		std::shared_ptr<InFlightReadBudget> read_budget,
 		std::size_t prefetch_bytes,
-		FileIoMode io_mode = FileIoMode::Buffered,
 		CancelEvent* cancel_event = nullptr);
 	boost::asio::awaitable<void> prefetch(BoundedQueue<OpenedFileReader>& in_opened, BoundedQueue<OpenedFileReader>& out_prefetched) const;
 
@@ -190,7 +183,6 @@ private:
 	RuntimeExecutors& executors_;
 	std::shared_ptr<InFlightReadBudget> read_budget_;
 	std::size_t prefetch_bytes_;
-	FileIoMode io_mode_;
 	CancelEvent* cancel_event_ = nullptr;
 };
 

@@ -6,21 +6,6 @@
 
 namespace soratransport {
 
-enum class FileIoMode {
-	Buffered,
-	Direct,
-};
-
-struct FileIoAlignmentInfo {
-	std::size_t logical_sector_size = 4 * 1024;
-	std::size_t physical_sector_size = 4 * 1024;
-	std::size_t required_alignment = 4 * 1024;
-};
-
-inline constexpr std::size_t kFileIoAlignment = 4 * 1024;
-
-FileIoAlignmentInfo query_file_io_alignment(const std::filesystem::path& path);
-
 class IByteSink {
 public:
 	virtual ~IByteSink() = default;
@@ -48,8 +33,7 @@ public:
 
 private:
 	struct State;
-	void flush_pending_writes();
-	void submit_active_write(bool finalize);
+	void submit_active_write();
 	void wait_for_one_write();
 	void wait_for_all_writes();
 	std::unique_ptr<State> state_;
@@ -57,7 +41,7 @@ private:
 
 class FileByteSource final : public IByteSource {
 public:
-	explicit FileByteSource(const std::filesystem::path& input_path, FileIoMode mode = FileIoMode::Buffered);
+	explicit FileByteSource(const std::filesystem::path& input_path);
 	~FileByteSource() override;
 	FileByteSource(const FileByteSource&) = delete;
 	FileByteSource& operator=(const FileByteSource&) = delete;
