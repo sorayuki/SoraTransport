@@ -89,7 +89,8 @@ void print_unpack_progress_legend() {
 	std::cerr
 		<< "progress legend (unpack):\n"
 		<< "  rate: uncompressed tar stream throughput per second\n"
-		<< "  q{s/u}: queue usage current/capacity, s/u = source -> unpacker\n";
+		<< "  q{s/u}: queue usage current/capacity, s/u = source -> unpacker\n"
+		<< "  wb: in-flight extracted write budget used/limit\n";
 }
 
 void print_listen_progress_legend() {
@@ -109,7 +110,8 @@ void print_receive_progress_legend() {
 	std::cerr
 		<< "progress legend (receive):\n"
 		<< "  rate: uncompressed tar stream throughput per second\n"
-		<< "  q{n/u}: queue usage current/capacity, n/u = network source -> unpacker\n";
+		<< "  q{n/u}: queue usage current/capacity, n/u = network source -> unpacker\n"
+		<< "  wb: in-flight extracted write budget used/limit\n";
 }
 
 void clear_progress_line() {
@@ -460,10 +462,18 @@ asio::awaitable<void> receive_directory_task(
 
 		RuntimeExecutors executors(config.worker_threads);
 		BufferPool pool;
+		auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
+		write_budget->listenCancelSignal(cancel_event);
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 		tar_queue.listenCancelSignal(cancel_event);
 		PipelineState state;
-		TarUnpacker unpacker(destination_dir);
+		TarUnpacker unpacker(
+			destination_dir,
+			pool,
+			executors,
+			write_budget,
+			config.max_in_flight_write_ops,
+			config.max_parallel_extract_files);
 		print_receive_progress_legend();
 		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
 
@@ -471,7 +481,9 @@ asio::awaitable<void> receive_directory_task(
 			[&](std::uint64_t bytes_per_second) {
 				std::ostringstream out;
 				out << "[receive] " << format_rate(bytes_per_second)
-					<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}';
+					<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}'
+					<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
+					<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 				return out.str();
 			},
 			uncompressed_bytes_processed);
@@ -661,10 +673,18 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 	auto config = make_runtime_config(options);
 	RuntimeExecutors executors(config.worker_threads);
 	BufferPool pool;
+	auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
+	write_budget->listenCancelSignal(effective_cancel_event);
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	PipelineState state;
-	TarUnpacker unpacker(destination_dir);
+	TarUnpacker unpacker(
+		destination_dir,
+		pool,
+		executors,
+		write_budget,
+		config.max_in_flight_write_ops,
+		config.max_parallel_extract_files);
 	FileByteSource source(input_file);
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	print_unpack_progress_legend();
@@ -673,7 +693,9 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 		[&](std::uint64_t bytes_per_second) {
 			std::ostringstream out;
 			out << "[unpack] " << format_rate(bytes_per_second)
-				<< " q{" << queue_usage("s/u", tar_queue.size(), tar_queue.capacity()) << '}';
+				<< " q{" << queue_usage("s/u", tar_queue.size(), tar_queue.capacity()) << '}'
+				<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
+				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 			return out.str();
 		},
 		uncompressed_bytes_processed);

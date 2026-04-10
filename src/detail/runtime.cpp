@@ -15,8 +15,9 @@ constexpr std::size_t kPipelineBufferSize = 1024 * 1024;
 constexpr std::size_t kLargePipelineBufferSize = 4 * 1024 * 1024;
 constexpr std::size_t kLargeBufferSize = 16 * 1024 * 1024;
 constexpr std::size_t kTargetInFlightReadBytes = 96 * 1024 * 1024;
-constexpr std::size_t kDefaultTarQueueDepth = 16;
+constexpr std::size_t kDefaultTarQueueDepth = 48;
 constexpr std::size_t kDefaultMaxInFlightWriteOps = 3;
+constexpr std::size_t kDefaultMaxParallelExtractFiles = 48;
 constexpr std::size_t kMaxDefaultWorkerThreads = 12;
 constexpr std::size_t kOpenConcurrencyMultiplier = 4;
 constexpr std::size_t kMaxDefaultOpenConcurrency = 48;
@@ -39,7 +40,9 @@ RuntimeConfig make_runtime_config(RuntimeOptions options) {
 		kMaxDefaultOpenConcurrency);
 	config.tar_queue_depth = kDefaultTarQueueDepth;
 	config.max_in_flight_read_bytes = options.max_in_flight_read_bytes.value_or(kTargetInFlightReadBytes);
+	config.max_in_flight_write_bytes = config.max_in_flight_read_bytes;
 	config.max_in_flight_write_ops = std::max<std::size_t>(1, options.max_in_flight_write_ops.value_or(kDefaultMaxInFlightWriteOps));
+	config.max_parallel_extract_files = std::max<std::size_t>(config.worker_threads, kDefaultMaxParallelExtractFiles);
 	return config;
 }
 

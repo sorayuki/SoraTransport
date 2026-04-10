@@ -304,6 +304,77 @@ bool InFlightReadBudget::is_cancelled() const {
 	return cancelled_.load(std::memory_order_acquire);
 }
 
+InFlightWriteBudget::InFlightWriteBudget(std::size_t max_bytes) : max_bytes_(std::max<std::size_t>(1, max_bytes)) {}
+
+void InFlightWriteBudget::listenCancelSignal(CancelEvent& event) {
+	cancel_connection_ = event.connect([this] {
+		cancelled_.store(true, std::memory_order_release);
+		cv_.notify_all();
+	});
+}
+
+void InFlightWriteBudget::acquire(std::size_t bytes) {
+	if (bytes == 0) {
+		return;
+	}
+	if (bytes > max_bytes_) {
+		throw std::runtime_error("requested write buffer exceeds configured in-flight write budget");
+	}
+
+	std::unique_lock lock(mutex_);
+	cv_.wait(lock, [&] {
+		return cancelled_.load(std::memory_order_acquire) || used_bytes_ + bytes <= max_bytes_;
+	});
+	if (cancelled_.load(std::memory_order_acquire)) {
+		throw CancelledError("write budget acquisition cancelled");
+	}
+	used_bytes_ += bytes;
+}
+
+bool InFlightWriteBudget::try_acquire(std::size_t bytes) {
+	if (bytes == 0) {
+		return true;
+	}
+	if (bytes > max_bytes_) {
+		throw std::runtime_error("requested write buffer exceeds configured in-flight write budget");
+	}
+
+	std::lock_guard lock(mutex_);
+	if (cancelled_.load(std::memory_order_acquire)) {
+		throw CancelledError("write budget acquisition cancelled");
+	}
+	if (used_bytes_ + bytes > max_bytes_) {
+		return false;
+	}
+	used_bytes_ += bytes;
+	return true;
+}
+
+void InFlightWriteBudget::release(std::size_t bytes) {
+	if (bytes == 0) {
+		return;
+	}
+
+	{
+		std::lock_guard lock(mutex_);
+		used_bytes_ -= std::min(used_bytes_, bytes);
+	}
+	cv_.notify_all();
+}
+
+std::size_t InFlightWriteBudget::max_bytes() const {
+	return max_bytes_;
+}
+
+std::size_t InFlightWriteBudget::used_bytes() const {
+	std::lock_guard lock(mutex_);
+	return used_bytes_;
+}
+
+bool InFlightWriteBudget::is_cancelled() const {
+	return cancelled_.load(std::memory_order_acquire);
+}
+
 DirScanner::DirScanner(
 	BufferPool& pool,
 	RuntimeExecutors& executors,

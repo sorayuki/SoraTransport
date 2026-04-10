@@ -49,6 +49,26 @@ private:
 	boost::signals2::scoped_connection cancel_connection_;
 };
 
+class InFlightWriteBudget {
+public:
+	explicit InFlightWriteBudget(std::size_t max_bytes);
+	void listenCancelSignal(CancelEvent& event);
+	void acquire(std::size_t bytes);
+	bool try_acquire(std::size_t bytes);
+	void release(std::size_t bytes);
+	std::size_t max_bytes() const;
+	std::size_t used_bytes() const;
+	bool is_cancelled() const;
+
+private:
+	std::size_t max_bytes_;
+	std::size_t used_bytes_ = 0;
+	mutable std::mutex mutex_;
+	std::condition_variable cv_;
+	std::atomic<bool> cancelled_{false};
+	boost::signals2::scoped_connection cancel_connection_;
+};
+
 class ReadBudgetLease {
 public:
 	ReadBudgetLease() = default;
@@ -90,6 +110,50 @@ public:
 
 private:
 	std::shared_ptr<InFlightReadBudget> budget_;
+	std::size_t bytes_ = 0;
+};
+
+class WriteBudgetLease {
+public:
+	WriteBudgetLease() = default;
+	WriteBudgetLease(std::shared_ptr<InFlightWriteBudget> budget, std::size_t bytes)
+		: budget_(std::move(budget)), bytes_(bytes) {}
+	~WriteBudgetLease() {
+		reset();
+	}
+
+	WriteBudgetLease(const WriteBudgetLease&) = delete;
+	WriteBudgetLease& operator=(const WriteBudgetLease&) = delete;
+
+	WriteBudgetLease(WriteBudgetLease&& other) noexcept
+		: budget_(std::move(other.budget_)), bytes_(other.bytes_) {
+		other.bytes_ = 0;
+	}
+
+	WriteBudgetLease& operator=(WriteBudgetLease&& other) noexcept {
+		if (this != &other) {
+			reset();
+			budget_ = std::move(other.budget_);
+			bytes_ = other.bytes_;
+			other.bytes_ = 0;
+		}
+		return *this;
+	}
+
+	void reset() {
+		if (budget_ && bytes_ > 0) {
+			budget_->release(bytes_);
+		}
+		budget_.reset();
+		bytes_ = 0;
+	}
+
+	std::size_t bytes() const {
+		return bytes_;
+	}
+
+private:
+	std::shared_ptr<InFlightWriteBudget> budget_;
 	std::size_t bytes_ = 0;
 };
 
@@ -199,7 +263,13 @@ private:
 
 class TarUnpacker {
 public:
-	explicit TarUnpacker(const std::filesystem::path& destination_root);
+	TarUnpacker(
+		const std::filesystem::path& destination_root,
+		BufferPool& pool,
+		RuntimeExecutors& executors,
+		std::shared_ptr<InFlightWriteBudget> write_budget,
+		std::size_t max_in_flight_write_ops,
+		std::size_t max_parallel_extract_files);
 	void unpack(
 		BoundedQueue<DataChunk>& in_tar,
 		std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr,
@@ -212,6 +282,11 @@ private:
 	std::filesystem::path resolve_output_path(const char* raw_path) const;
 
 	std::filesystem::path destination_root_;
+	BufferPool& pool_;
+	RuntimeExecutors& executors_;
+	std::shared_ptr<InFlightWriteBudget> write_budget_;
+	std::size_t max_in_flight_write_ops_ = 1;
+	std::size_t max_parallel_extract_files_ = 1;
 };
 
 class ZstdCompressor {
