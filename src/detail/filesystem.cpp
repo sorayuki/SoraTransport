@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <map>
 #include <stdexcept>
 #include <system_error>
@@ -45,7 +46,49 @@ std::string path_to_preserved_generic_utf8_string(const std::filesystem::path& p
 }
 #endif
 
-void populate_file_meta(FileMeta& meta) {
+struct UniqueWin32Handle {
+	explicit UniqueWin32Handle(HANDLE input_handle = INVALID_HANDLE_VALUE) noexcept : handle(input_handle) {}
+	~UniqueWin32Handle() {
+		reset();
+	}
+
+	UniqueWin32Handle(const UniqueWin32Handle&) = delete;
+	UniqueWin32Handle& operator=(const UniqueWin32Handle&) = delete;
+
+	UniqueWin32Handle(UniqueWin32Handle&& other) noexcept : handle(other.release()) {}
+
+	UniqueWin32Handle& operator=(UniqueWin32Handle&& other) noexcept {
+		if (this != &other) {
+			reset(other.release());
+		}
+		return *this;
+	}
+
+	void reset(HANDLE new_handle = INVALID_HANDLE_VALUE) noexcept {
+		if (handle != INVALID_HANDLE_VALUE) {
+			::CloseHandle(handle);
+		}
+		handle = new_handle;
+	}
+
+	HANDLE get() const noexcept {
+		return handle;
+	}
+
+	HANDLE release() noexcept {
+		const auto released = handle;
+		handle = INVALID_HANDLE_VALUE;
+		return released;
+	}
+
+	bool valid() const noexcept {
+		return handle != INVALID_HANDLE_VALUE;
+	}
+
+	HANDLE handle = INVALID_HANDLE_VALUE;
+};
+
+void populate_file_status(FileMeta& meta) {
 	meta.status = std::filesystem::symlink_status(meta.full_path);
 	meta.size = 0;
 	if (std::filesystem::is_regular_file(meta.status)) {
@@ -55,32 +98,38 @@ void populate_file_meta(FileMeta& meta) {
 			meta.size = 0;
 		}
 	}
+}
 
-	const auto handle = ::CreateFileW(
+void populate_file_meta_from_handle(FileMeta& meta, HANDLE handle) {
+	FILE_BASIC_INFO basic_info{};
+	if (::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic_info, static_cast<DWORD>(sizeof(basic_info)))) {
+		meta.windows_file_attributes = basic_info.FileAttributes;
+		maybe_set_timestamp(meta.creation_time, basic_info.CreationTime);
+		maybe_set_timestamp(meta.last_access_time, basic_info.LastAccessTime);
+		maybe_set_timestamp(meta.last_write_time, basic_info.LastWriteTime);
+		maybe_set_timestamp(meta.change_time, basic_info.ChangeTime);
+	}
+
+	FILE_STANDARD_INFO standard_info{};
+	if (::GetFileInformationByHandleEx(handle, FileStandardInfo, &standard_info, static_cast<DWORD>(sizeof(standard_info)))
+		&& std::filesystem::is_regular_file(meta.status)) {
+		meta.size = static_cast<std::uint64_t>(std::max<LONGLONG>(0, standard_info.EndOfFile.QuadPart));
+	}
+}
+
+void populate_file_meta(FileMeta& meta) {
+	populate_file_status(meta);
+
+	UniqueWin32Handle handle(::CreateFileW(
 		meta.full_path.c_str(),
 		FILE_READ_ATTRIBUTES,
 		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		nullptr,
 		OPEN_EXISTING,
 		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-		nullptr);
-	if (handle != INVALID_HANDLE_VALUE) {
-		FILE_BASIC_INFO basic_info{};
-		if (::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic_info, static_cast<DWORD>(sizeof(basic_info)))) {
-			meta.windows_file_attributes = basic_info.FileAttributes;
-			maybe_set_timestamp(meta.creation_time, basic_info.CreationTime);
-			maybe_set_timestamp(meta.last_access_time, basic_info.LastAccessTime);
-			maybe_set_timestamp(meta.last_write_time, basic_info.LastWriteTime);
-			maybe_set_timestamp(meta.change_time, basic_info.ChangeTime);
-		}
-
-		FILE_STANDARD_INFO standard_info{};
-		if (::GetFileInformationByHandleEx(handle, FileStandardInfo, &standard_info, static_cast<DWORD>(sizeof(standard_info)))
-			&& std::filesystem::is_regular_file(meta.status)) {
-			meta.size = static_cast<std::uint64_t>(std::max<LONGLONG>(0, standard_info.EndOfFile.QuadPart));
-		}
-
-		::CloseHandle(handle);
+		nullptr));
+	if (handle.valid()) {
+		populate_file_meta_from_handle(meta, handle.get());
 	} else {
 		const auto attributes = ::GetFileAttributesW(meta.full_path.c_str());
 		if (attributes != INVALID_FILE_ATTRIBUTES) {
@@ -114,58 +163,91 @@ bool is_cancelled_win32_error(bool cancel_requested, DWORD error) {
 	return cancel_requested && (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED);
 }
 
-class ConcurrentDirectoryWorkQueue {
-public:
-	void push(std::filesystem::path path) {
-		{
-			std::lock_guard lock(mutex_);
-			queue_.push(std::move(path));
-		}
-		cv_.notify_one();
-	}
+FileIoMode resolve_effective_reader_io_mode(
+	FileIoMode requested_io_mode,
+	std::uint64_t size,
+	std::size_t chunk_size) {
+	return requested_io_mode == FileIoMode::Direct && size >= chunk_size * kOverlappedReadQueueDepth
+		? FileIoMode::Direct
+		: FileIoMode::Buffered;
+}
 
-	bool pop(std::filesystem::path& path) {
-		std::unique_lock lock(mutex_);
-		cv_.wait(lock, [&] { return closed_ || !queue_.empty(); });
-		if (queue_.empty()) {
-			return false;
-		}
-		path = std::move(queue_.front());
-		queue_.pop();
-		return true;
-	}
-
-	void close() {
-		{
-			std::lock_guard lock(mutex_);
-			closed_ = true;
-		}
-		cv_.notify_all();
-	}
-
-private:
-	std::queue<std::filesystem::path> queue_;
-	bool closed_ = false;
-	std::mutex mutex_;
-	std::condition_variable cv_;
-};
+DWORD reader_open_flags_for_mode(FileIoMode io_mode) {
+	return io_mode == FileIoMode::Direct
+		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING
+		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
+}
 
 std::size_t compute_reader_prefetch_bytes(
-	const FileMeta& meta,
-	std::size_t buffer_size,
-	FileIoMode io_mode) {
-	if (!std::filesystem::is_regular_file(meta.status) || meta.size == 0) {
+	const OpenedFileReader& opened_file,
+	std::size_t buffer_size) {
+	if (!opened_file.reader.has_value()
+		|| !std::filesystem::is_regular_file(opened_file.meta.status)
+		|| opened_file.meta.size == 0) {
 		return 0;
 	}
 
 	auto per_slot_capacity = std::max<std::size_t>(1, buffer_size);
-	if (io_mode == FileIoMode::Direct) {
-		per_slot_capacity = make_direct_request_size(buffer_size, query_file_io_alignment(meta.full_path).required_alignment);
+	if (opened_file.reader->io_mode() == FileIoMode::Direct) {
+		per_slot_capacity = make_direct_request_size(buffer_size, opened_file.reader->io_alignment());
 	}
 
 	return static_cast<std::size_t>(std::min<std::uint64_t>(
-		meta.size,
+		opened_file.meta.size,
 		static_cast<std::uint64_t>(per_slot_capacity) * kOverlappedReadQueueDepth));
+}
+
+bool is_future_ready(std::future<OpenedFileReader>& future) {
+	return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
+
+OpenedFileReader open_regular_file(
+	BufferPool& pool,
+	FileMeta meta,
+	std::size_t buffer_size,
+	FileIoMode requested_io_mode,
+	const std::optional<FileIoAlignmentInfo>& shared_alignment,
+	CancelEvent* cancel_event) {
+	throw_if_cancelled(cancel_event);
+
+	const auto effective_io_mode = resolve_effective_reader_io_mode(
+		requested_io_mode,
+		meta.size,
+		std::max<std::size_t>(1, buffer_size));
+	const auto io_alignment = effective_io_mode == FileIoMode::Direct
+		? shared_alignment.value_or(FileIoAlignmentInfo{}).required_alignment
+		: kFileIoAlignment;
+
+	UniqueWin32Handle handle(::CreateFileW(
+		meta.full_path.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ,
+		nullptr,
+		OPEN_EXISTING,
+		reader_open_flags_for_mode(effective_io_mode),
+		nullptr));
+	if (!handle.valid()) {
+		throw make_win32_error("failed to open input file: " + path_to_utf8_string(meta.full_path));
+	}
+
+	populate_file_meta_from_handle(meta, handle.get());
+	throw_if_cancelled(cancel_event);
+
+	OpenedFileReader opened_file;
+	opened_file.meta = std::move(meta);
+	auto reader = FileReader(
+		pool,
+		opened_file.meta.full_path,
+		opened_file.meta.size,
+		buffer_size,
+		handle.release(),
+		effective_io_mode,
+		io_alignment);
+	if (cancel_event != nullptr) {
+		reader.listenCancelSignal(*cancel_event);
+	}
+	opened_file.reader.emplace(std::move(reader));
+	return opened_file;
 }
 
 std::filesystem::path archive_root_name_for_directory(const std::filesystem::path& root_dir) {
@@ -272,8 +354,17 @@ struct FileReader::State {
 		std::size_t requested_length = 0;
 	};
 
-	State(std::filesystem::path input_path, std::uint64_t input_size, FileIoMode input_mode)
-		: path(std::move(input_path)), size(input_size), io_mode(input_mode) {}
+	State(
+		std::filesystem::path input_path,
+		std::uint64_t input_size,
+		HANDLE input_handle,
+		FileIoMode input_mode,
+		std::size_t input_alignment)
+		: path(std::move(input_path)),
+		  size(input_size),
+		  io_alignment(input_alignment),
+		  handle(input_handle),
+		  io_mode(input_mode) {}
 
 	std::filesystem::path path;
 	std::uint64_t offset = 0;
@@ -294,10 +385,22 @@ struct FileReader::State {
 	boost::signals2::scoped_connection cancel_connection;
 };
 
-DirScanner::DirScanner(RuntimeExecutors& executors) : executors_(executors) {}
+DirScanner::DirScanner(
+	BufferPool& pool,
+	RuntimeExecutors& executors,
+	std::size_t submit_concurrency,
+	std::size_t buffer_size,
+	FileIoMode io_mode,
+	CancelEvent* cancel_event)
+	: pool_(pool),
+	  executors_(executors),
+	  submit_concurrency_(std::max<std::size_t>(1, submit_concurrency)),
+	  buffer_size_(std::max<std::size_t>(1, buffer_size)),
+	  io_mode_(io_mode),
+	  cancel_event_(cancel_event) {}
 
-boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue, const CancelEvent* cancel_event) const {
-	throw_if_cancelled(cancel_event);
+boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const {
+	throw_if_cancelled(cancel_event_);
 	if (!std::filesystem::exists(root_dir)) {
 		throw std::runtime_error("source directory does not exist: " + path_to_utf8_string(root_dir));
 	}
@@ -308,25 +411,66 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 	const auto archive_root_name = archive_root_name_for_directory(root_dir);
 
 	try {
-		FileMeta root_meta;
-		root_meta.full_path = root_dir;
-		populate_file_meta(root_meta);
-		root_meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
-		co_await out_queue.async_push_await(std::move(root_meta));
+		std::map<std::size_t, std::future<OpenedFileReader>> pending_results;
+		std::map<std::size_t, OpenedFileReader> ready_results;
+		std::optional<FileIoAlignmentInfo> shared_alignment;
+		std::size_t next_sequence = 0;
+		std::size_t next_emit_sequence = 0;
+
+		auto emit_ready = [&](bool wait_for_next) -> boost::asio::awaitable<void> {
+			while (true) {
+				auto ready_it = ready_results.find(next_emit_sequence);
+				if (ready_it != ready_results.end()) {
+					auto opened_file = std::move(ready_it->second);
+					ready_results.erase(ready_it);
+					++next_emit_sequence;
+					co_await out_queue.async_push_await(std::move(opened_file));
+					continue;
+				}
+
+				auto pending_it = pending_results.find(next_emit_sequence);
+				if (pending_it == pending_results.end()) {
+					break;
+				}
+				if (!wait_for_next && !is_future_ready(pending_it->second)) {
+					break;
+				}
+
+				ready_results.emplace(next_emit_sequence, pending_it->second.get());
+				pending_results.erase(pending_it);
+			}
+		};
+
+		auto enqueue_ready = [&](OpenedFileReader opened_file) {
+			ready_results.emplace(next_sequence++, std::move(opened_file));
+		};
+
+		auto throttle_reorder_window = [&]() -> boost::asio::awaitable<void> {
+			while (next_sequence - next_emit_sequence >= submit_concurrency_) {
+				co_await emit_ready(true);
+			}
+		};
+
+		OpenedFileReader root_entry;
+		root_entry.meta.full_path = root_dir;
+		populate_file_meta(root_entry.meta);
+		root_entry.meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
+		enqueue_ready(std::move(root_entry));
+		co_await emit_ready(false);
 
 		std::deque<std::filesystem::path> directories;
 		directories.push_back(root_dir);
 
 		while (!directories.empty()) {
-			throw_if_cancelled(cancel_event);
+			throw_if_cancelled(cancel_event_);
 			auto current_dir = std::move(directories.front());
 			directories.pop_front();
 
 			for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
-				throw_if_cancelled(cancel_event);
+				throw_if_cancelled(cancel_event_);
 				FileMeta meta;
 				meta.full_path = entry.path();
-				populate_file_meta(meta);
+				populate_file_status(meta);
 				meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
 				if (meta.relative_path_in_tar.empty()) {
 					continue;
@@ -334,11 +478,40 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 				if (meta.status.type() == std::filesystem::file_type::symlink) {
 					continue;
 				}
-				co_await out_queue.async_push_await(std::move(meta));
 				if (entry.is_directory()) {
 					directories.push_back(entry.path());
 				}
+
+				if (meta.status.type() == std::filesystem::file_type::regular) {
+					if (io_mode_ == FileIoMode::Direct && !shared_alignment.has_value()) {
+						shared_alignment = query_file_io_alignment(meta.full_path);
+					}
+					const auto sequence = next_sequence++;
+					pending_results.emplace(
+						sequence,
+						executors_.post([this, meta = std::move(meta), shared_alignment]() mutable {
+							return open_regular_file(
+								pool_,
+								std::move(meta),
+								buffer_size_,
+								io_mode_,
+								shared_alignment,
+								cancel_event_);
+						}));
+				} else {
+					OpenedFileReader opened_file;
+					opened_file.meta = std::move(meta);
+					populate_file_meta(opened_file.meta);
+					ready_results.emplace(next_sequence++, std::move(opened_file));
+				}
+
+				co_await emit_ready(false);
+				co_await throttle_reorder_window();
 			}
+		}
+
+		while (!pending_results.empty() || !ready_results.empty()) {
+			co_await emit_ready(true);
 		}
 	} catch (...) {
 		out_queue.close();
@@ -354,9 +527,12 @@ FileReader::FileReader(
 	const std::filesystem::path& path,
 	std::uint64_t size,
 	std::size_t buffer_size,
-	FileIoMode io_mode)
-	: pool_(pool), state_(std::make_unique<State>(path, size, io_mode)) {
+	HANDLE handle,
+	FileIoMode io_mode,
+	std::size_t io_alignment)
+	: pool_(pool), state_(std::make_unique<State>(path, size, handle, io_mode, io_alignment)) {
 	state_->chunk_size = std::max<std::size_t>(1, buffer_size);
+	initialize_open_state();
 }
 
 FileReader::~FileReader() {
@@ -526,39 +702,17 @@ void FileReader::prime_prefetch_window(std::size_t max_bytes) {
 	}
 }
 
-void FileReader::open() {
+void FileReader::initialize_open_state() {
 	if (!state_) {
 		throw std::runtime_error("file reader is closed");
 	}
 	if (state_->cancel_requested.load(std::memory_order_acquire)) {
 		throw CancelledError("file reader cancelled");
 	}
-	if (state_->handle != INVALID_HANDLE_VALUE) {
-		return;
-	}
-	const auto effective_io_mode = state_->io_mode == FileIoMode::Direct && state_->size >= state_->chunk_size * state_->slots.size()
-		? FileIoMode::Direct
-		: FileIoMode::Buffered;
-	const auto flags = effective_io_mode == FileIoMode::Direct
-		? FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING
-		: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED;
-
-	state_->handle = ::CreateFileW(
-		state_->path.c_str(),
-		GENERIC_READ,
-		FILE_SHARE_READ,
-		nullptr,
-		OPEN_EXISTING,
-		flags,
-		nullptr);
 	if (state_->handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to open input file: " + path_for_error());
+		throw std::runtime_error("file reader is missing an input handle: " + path_for_error());
 	}
 	state_->offset = 0;
-	state_->io_mode = effective_io_mode;
-	if (state_->io_mode == FileIoMode::Direct) {
-		state_->io_alignment = query_file_io_alignment(state_->path).required_alignment;
-	}
 	state_->aligned_data_end = state_->io_mode == FileIoMode::Direct ? round_down(state_->size, state_->io_alignment) : state_->size;
 	state_->next_issue_offset = 0;
 	state_->next_slot_to_issue = 0;
@@ -702,54 +856,20 @@ std::uint64_t FileReader::offset() const {
 	return state_ == nullptr ? 0 : state_->offset;
 }
 
+FileIoMode FileReader::io_mode() const {
+	return state_ == nullptr ? FileIoMode::Buffered : state_->io_mode;
+}
+
+std::size_t FileReader::io_alignment() const {
+	return state_ == nullptr ? kFileIoAlignment : state_->io_alignment;
+}
+
 bool FileReader::eof() const {
 	return state_ == nullptr || state_->offset >= state_->size;
 }
 
 bool FileReader::is_open() const {
 	return state_ != nullptr && state_->handle != INVALID_HANDLE_VALUE;
-}
-
-FileReaderOpener::FileReaderOpener(
-	BufferPool& pool,
-	RuntimeExecutors& executors,
-	std::size_t submit_concurrency,
-	std::size_t buffer_size,
-	FileIoMode io_mode,
-	CancelEvent* cancel_event)
-	: pool_(pool),
-	  executors_(executors),
-	  submit_concurrency_(std::max<std::size_t>(1, submit_concurrency)),
-	  buffer_size_(std::max<std::size_t>(1, buffer_size)),
-	  io_mode_(io_mode),
-	  cancel_event_(cancel_event) {}
-
-boost::asio::awaitable<void> FileReaderOpener::open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
-	try {
-		open_sync(in_meta, out_opened);
-		out_opened.close();
-	} catch (...) {
-		out_opened.close();
-		throw;
-	}
-	co_return;
-}
-
-void FileReaderOpener::open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const {
-	while (auto meta = in_meta.pop()) {
-		throw_if_cancelled(cancel_event_);
-		OpenedFileReader opened_file;
-		opened_file.meta = std::move(*meta);
-		if (opened_file.meta.status.type() == std::filesystem::file_type::regular) {
-			auto reader = FileReader(pool_, opened_file.meta.full_path, opened_file.meta.size, buffer_size_, io_mode_);
-			if (cancel_event_ != nullptr) {
-				reader.listenCancelSignal(*cancel_event_);
-			}
-			reader.open();
-			opened_file.reader.emplace(std::move(reader));
-		}
-		out_opened.push(std::move(opened_file));
-	}
 }
 
 FileReaderPrefetcher::FileReaderPrefetcher(
@@ -769,7 +889,7 @@ boost::asio::awaitable<void> FileReaderPrefetcher::prefetch(BoundedQueue<OpenedF
 		while (auto opened_file = co_await in_opened.async_pop_await()) {
 			throw_if_cancelled(cancel_event_);
 			if (opened_file->reader.has_value()) {
-				const auto budget_bytes = compute_reader_prefetch_bytes(opened_file->meta, prefetch_bytes_, io_mode_);
+				const auto budget_bytes = compute_reader_prefetch_bytes(*opened_file, prefetch_bytes_);
 				if (budget_bytes > 0) {
 					read_budget_->acquire(budget_bytes);
 					try {

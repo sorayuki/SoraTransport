@@ -28,7 +28,6 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
-constexpr std::size_t kMetaQueueDepth = 256;
 constexpr std::size_t kOpenedQueueDepth = 32;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
@@ -70,18 +69,16 @@ void print_pack_progress_legend(CompressionMode mode) {
 		<< "  rate: uncompressed tar stream throughput per second\n";
 	if (mode == CompressionMode::Zstd) {
 		std::cerr
-			<< "  q{s/o o/p p/t t/z z/s}: queue usage current/capacity\n"
-			<< "    s/o = scanner -> opener\n"
-			<< "    o/p = opener -> prefetcher\n"
+			<< "  q{s/p p/t t/z z/s}: queue usage current/capacity\n"
+			<< "    s/p = scanner -> prefetcher\n"
 			<< "    p/t = prefetcher -> tar packer\n"
 			<< "    t/z = tar packer -> zstd compressor\n"
 			<< "    z/s = zstd compressor -> sink writer\n"
 			<< "  lvl: active zstd compression level\n";
 	} else {
 		std::cerr
-			<< "  q{s/o o/p p/t t/s}: queue usage current/capacity\n"
-			<< "    s/o = scanner -> opener\n"
-			<< "    o/p = opener -> prefetcher\n"
+			<< "  q{s/p p/t t/s}: queue usage current/capacity\n"
+			<< "    s/p = scanner -> prefetcher\n"
 			<< "    p/t = prefetcher -> tar packer\n"
 			<< "    t/s = tar packer -> sink writer\n";
 	}
@@ -99,9 +96,8 @@ void print_listen_progress_legend() {
 	std::cerr
 		<< "progress legend (listen):\n"
 		<< "  rate: uncompressed tar stream throughput per second\n"
-		<< "  q{s/o o/p p/t t/z z/n}: queue usage current/capacity\n"
-		<< "    s/o = scanner -> opener\n"
-		<< "    o/p = opener -> prefetcher\n"
+		<< "  q{s/p p/t t/z z/n}: queue usage current/capacity\n"
+		<< "    s/p = scanner -> prefetcher\n"
 		<< "    p/t = prefetcher -> tar packer\n"
 		<< "    t/z = tar packer -> zstd compressor\n"
 		<< "    z/n = zstd compressor -> network sender\n"
@@ -331,19 +327,16 @@ asio::awaitable<void> listen_directory_task(
 		BufferPool pool;
 		auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
 		read_budget->listenCancelSignal(cancel_event);
-		BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
 		BoundedQueue<OpenedFileReader> opened_queue(std::max(kOpenedQueueDepth, config.file_open_concurrency), executors.executor());
 		BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 		BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
-		meta_queue.listenCancelSignal(cancel_event);
 		opened_queue.listenCancelSignal(cancel_event);
 		prefetched_queue.listenCancelSignal(cancel_event);
 		tar_queue.listenCancelSignal(cancel_event);
 		zstd_queue.listenCancelSignal(cancel_event);
 		CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
-		DirScanner scanner(executors);
-		FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
+		DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
 		FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, FileIoMode::Buffered, &cancel_event);
 		TarPacker packer(pool, kPipelineChunkSize);
 		PipelineState state;
@@ -355,8 +348,7 @@ asio::awaitable<void> listen_directory_task(
 			[&](std::uint64_t bytes_per_second) {
 				std::ostringstream out;
 				out << "[listen] " << format_rate(bytes_per_second)
-					<< " q{" << queue_usage("s/o", meta_queue.size(), meta_queue.capacity())
-					<< ' ' << queue_usage("o/p", opened_queue.size(), opened_queue.capacity())
+					<< " q{" << queue_usage("s/p", opened_queue.size(), opened_queue.capacity())
 					<< ' ' << queue_usage("p/t", prefetched_queue.size(), prefetched_queue.capacity())
 					<< ' ' << queue_usage("t/z", tar_queue.size(), tar_queue.capacity())
 					<< ' ' << queue_usage("z/n", zstd_queue.size(), zstd_queue.capacity())
@@ -368,23 +360,7 @@ asio::awaitable<void> listen_directory_task(
 			},
 			uncompressed_bytes_processed);
 
-		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue, &cancel_event), asio::use_future);
-		std::vector<std::jthread> opener_threads;
-		opener_threads.reserve(config.file_open_concurrency);
-		for (std::size_t index = 0; index < config.file_open_concurrency; ++index) {
-			opener_threads.emplace_back([&] {
-				try {
-					opener.open_sync(meta_queue, opened_queue);
-				} catch (...) {
-					state.fail(std::current_exception());
-					meta_queue.close();
-					opened_queue.close();
-					prefetched_queue.close();
-					tar_queue.close();
-					zstd_queue.close();
-				}
-			});
-		}
+		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, opened_queue), asio::use_future);
 		auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
 
 		std::jthread sender_thread([&] {
@@ -392,7 +368,6 @@ asio::awaitable<void> listen_directory_task(
 				packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
-				meta_queue.close();
 				opened_queue.close();
 				prefetched_queue.close();
 				tar_queue.close();
@@ -430,14 +405,9 @@ asio::awaitable<void> listen_directory_task(
 
 		try {
 			scanner_future.get();
-			for (auto& opener_thread : opener_threads) {
-				join_and_capture(opener_thread, state);
-			}
-			opened_queue.close();
 			prefetch_future.get();
 		} catch (...) {
 			state.fail(std::current_exception());
-			meta_queue.close();
 			opened_queue.close();
 			prefetched_queue.close();
 			tar_queue.close();
@@ -562,19 +532,16 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 	BufferPool pool;
 	auto read_budget = std::make_shared<InFlightReadBudget>(config.max_in_flight_read_bytes);
 	read_budget->listenCancelSignal(effective_cancel_event);
-	BoundedQueue<FileMeta> meta_queue(kMetaQueueDepth, executors.executor());
 	BoundedQueue<OpenedFileReader> opened_queue(std::max(kOpenedQueueDepth, config.file_open_concurrency), executors.executor());
 	BoundedQueue<OpenedFileReader> prefetched_queue(kPrefetchQueueDepth, executors.executor());
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 	BoundedQueue<DataChunk> zstd_queue(config.tar_queue_depth, executors.executor());
-	meta_queue.listenCancelSignal(effective_cancel_event);
 	opened_queue.listenCancelSignal(effective_cancel_event);
 	prefetched_queue.listenCancelSignal(effective_cancel_event);
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	zstd_queue.listenCancelSignal(effective_cancel_event);
 	CompressionQueueTelemetry compression_telemetry{&tar_queue, &zstd_queue};
-	DirScanner scanner(executors);
-	FileReaderOpener opener(pool, executors, config.file_open_concurrency, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
+	DirScanner scanner(pool, executors, config.file_open_concurrency, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
 	FileReaderPrefetcher prefetcher(executors, read_budget, kPipelineChunkSize, file_io_mode, &effective_cancel_event);
 	TarPacker packer(pool, kPipelineChunkSize);
 	PipelineState state;
@@ -586,8 +553,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 		[&](std::uint64_t bytes_per_second) {
 			std::ostringstream out;
 			out << "[pack] " << format_rate(bytes_per_second)
-				<< " q{" << queue_usage("s/o", meta_queue.size(), meta_queue.capacity())
-				<< ' ' << queue_usage("o/p", opened_queue.size(), opened_queue.capacity())
+				<< " q{" << queue_usage("s/p", opened_queue.size(), opened_queue.capacity())
 				<< ' ' << queue_usage("p/t", prefetched_queue.size(), prefetched_queue.capacity());
 			if (mode == CompressionMode::Zstd) {
 				out << ' ' << queue_usage("t/z", tar_queue.size(), tar_queue.capacity())
@@ -606,25 +572,7 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 
 	FileByteSink sink(output_file, config.max_in_flight_write_ops);
 	sink.listenCancelSignal(effective_cancel_event);
-	auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, meta_queue, &effective_cancel_event), asio::use_future);
-	std::vector<std::jthread> opener_threads;
-	opener_threads.reserve(config.file_open_concurrency);
-	for (std::size_t index = 0; index < config.file_open_concurrency; ++index) {
-		opener_threads.emplace_back([&] {
-			try {
-				opener.open_sync(meta_queue, opened_queue);
-			} catch (...) {
-				if (!is_transfer_cancelled(std::current_exception())) {
-					state.fail(std::current_exception());
-				}
-				meta_queue.close();
-				opened_queue.close();
-				prefetched_queue.close();
-				tar_queue.close();
-				zstd_queue.close();
-			}
-		});
-	}
+	auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, opened_queue), asio::use_future);
 	auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
 
 	std::jthread writer_thread([&] {
@@ -634,7 +582,6 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 			if (!is_transfer_cancelled(std::current_exception())) {
 				state.fail(std::current_exception());
 			}
-			meta_queue.close();
 			opened_queue.close();
 			prefetched_queue.close();
 			tar_queue.close();
@@ -684,16 +631,11 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 
 	try {
 		scanner_future.get();
-		for (auto& opener_thread : opener_threads) {
-			join_and_capture(opener_thread, state);
-		}
-		opened_queue.close();
 		prefetch_future.get();
 	} catch (...) {
 		if (!is_transfer_cancelled(std::current_exception())) {
 			state.fail(std::current_exception());
 		}
-		meta_queue.close();
 		opened_queue.close();
 		prefetched_queue.close();
 		tar_queue.close();

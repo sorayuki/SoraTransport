@@ -6,6 +6,7 @@
 #include <archive_entry.h>
 
 #include <atomic>
+#include <windows.h>
 
 namespace soratransport {
 
@@ -26,15 +27,6 @@ struct QueueTelemetrySample {
 		}
 		return static_cast<double>(size) / static_cast<double>(capacity);
 	}
-};
-
-class DirScanner {
-public:
-	explicit DirScanner(RuntimeExecutors& executors);
-	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<FileMeta>& out_queue, const CancelEvent* cancel_event = nullptr) const;
-
-private:
-	RuntimeExecutors& executors_;
 };
 
 class InFlightReadBudget {
@@ -108,26 +100,30 @@ public:
 		const std::filesystem::path& path,
 		std::uint64_t size,
 		std::size_t buffer_size,
-		FileIoMode io_mode = FileIoMode::Buffered);
+		HANDLE handle,
+		FileIoMode io_mode = FileIoMode::Buffered,
+		std::size_t io_alignment = kFileIoAlignment);
 	~FileReader();
 	FileReader(const FileReader&) = delete;
 	FileReader& operator=(const FileReader&) = delete;
 	FileReader(FileReader&& other);
 	FileReader& operator=(FileReader&& other);
 	void listenCancelSignal(CancelEvent& event);
-	void open();
 	void start_prefetch(std::size_t max_bytes);
 	DataChunk read_next_chunk();
 	std::uint64_t offset() const;
 	bool eof() const;
 	bool is_open() const;
 	bool is_cancelled() const;
+	FileIoMode io_mode() const;
+	std::size_t io_alignment() const;
 	void cancel_pending_work();
 
 private:
 	struct State;
 	bool issue_next_read();
 	void prime_prefetch_window(std::size_t max_bytes);
+	void initialize_open_state();
 	void close();
 	std::string path_for_error() const;
 
@@ -147,6 +143,26 @@ struct OpenedFileReader : IQueueDisposable {
 	ReadBudgetLease read_budget_lease;
 };
 
+class DirScanner {
+public:
+	DirScanner(
+		BufferPool& pool,
+		RuntimeExecutors& executors,
+		std::size_t submit_concurrency,
+		std::size_t buffer_size,
+		FileIoMode io_mode = FileIoMode::Buffered,
+		CancelEvent* cancel_event = nullptr);
+	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const;
+
+private:
+	BufferPool& pool_;
+	RuntimeExecutors& executors_;
+	std::size_t submit_concurrency_;
+	std::size_t buffer_size_;
+	FileIoMode io_mode_;
+	CancelEvent* cancel_event_ = nullptr;
+};
+
 struct CompressionQueueTelemetry {
 	const BoundedQueue<DataChunk>* upstream_queue = nullptr;
 	const BoundedQueue<DataChunk>* downstream_queue = nullptr;
@@ -158,27 +174,6 @@ struct CompressionQueueTelemetry {
 	QueueTelemetrySample downstream() const {
 		return downstream_queue == nullptr ? QueueTelemetrySample{} : QueueTelemetrySample{downstream_queue->size(), downstream_queue->capacity()};
 	}
-};
-
-class FileReaderOpener {
-public:
-	FileReaderOpener(
-		BufferPool& pool,
-		RuntimeExecutors& executors,
-		std::size_t submit_concurrency,
-		std::size_t buffer_size,
-		FileIoMode io_mode = FileIoMode::Buffered,
-		CancelEvent* cancel_event = nullptr);
-	boost::asio::awaitable<void> open(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
-	void open_sync(BoundedQueue<FileMeta>& in_meta, BoundedQueue<OpenedFileReader>& out_opened) const;
-
-private:
-	BufferPool& pool_;
-	RuntimeExecutors& executors_;
-	std::size_t submit_concurrency_;
-	std::size_t buffer_size_;
-	FileIoMode io_mode_;
-	CancelEvent* cancel_event_ = nullptr;
 };
 
 class FileReaderPrefetcher {
