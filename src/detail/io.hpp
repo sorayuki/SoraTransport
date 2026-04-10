@@ -3,8 +3,11 @@
 #include "runtime.hpp"
 
 #include <span>
+#include <windows.h>
 
 namespace soratransport {
+
+inline constexpr std::size_t kOverlappedFileReadQueueDepth = 8;
 
 class IByteSink {
 public:
@@ -17,6 +20,40 @@ class IByteSource {
 public:
 	virtual ~IByteSource() = default;
 	virtual std::size_t read(uint8_t* buffer, std::size_t length) = 0;
+};
+
+class OverlappedFileReader {
+public:
+	OverlappedFileReader(
+		BufferPool& pool,
+		const std::filesystem::path& path,
+		std::uint64_t size,
+		std::size_t buffer_size,
+		HANDLE handle);
+	~OverlappedFileReader();
+	OverlappedFileReader(const OverlappedFileReader&) = delete;
+	OverlappedFileReader& operator=(const OverlappedFileReader&) = delete;
+	OverlappedFileReader(OverlappedFileReader&& other);
+	OverlappedFileReader& operator=(OverlappedFileReader&& other);
+	void listenCancelSignal(CancelEvent& event);
+	void start_prefetch(std::size_t max_bytes);
+	DataChunk read_next_chunk();
+	std::uint64_t offset() const;
+	bool eof() const;
+	bool is_open() const;
+	bool is_cancelled() const;
+	void cancel_pending_work();
+
+private:
+	struct State;
+	bool issue_next_read();
+	void prime_prefetch_window(std::size_t max_bytes);
+	void initialize_open_state();
+	void close();
+	std::string path_for_error() const;
+
+	BufferPool* pool_ = nullptr;
+	std::unique_ptr<State> state_;
 };
 
 class FileByteSink final : public IByteSink {

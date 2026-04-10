@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -19,6 +18,7 @@ namespace soratransport {
 namespace {
 
 constexpr std::size_t kBufferedWriteBatchSize = 8 * 1024 * 1024;
+constexpr std::size_t kFileByteSourceChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kSocketIoBufferSize = 1 * 1024 * 1024;
 constexpr std::size_t kSocketIoReceiveBufferSize = kSocketIoBufferSize / 2;
 constexpr auto kSocketIoMaxBufferedSendDelay = std::chrono::milliseconds(100);
@@ -36,24 +36,54 @@ bool is_cancelled_socket_error(bool cancel_requested, const boost::system::error
 	return cancel_requested && (error == operation_aborted || error == bad_descriptor);
 }
 
-std::size_t read_some(HANDLE handle, uint8_t* buffer, std::size_t length, const std::string& path) {
-	std::size_t total_bytes_read = 0;
-	while (total_bytes_read < length) {
-		const auto remaining = length - total_bytes_read;
-		const auto chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
-		DWORD bytes_read = 0;
-		if (!::ReadFile(handle, buffer + total_bytes_read, chunk, &bytes_read, nullptr)) {
-			throw make_win32_error("failed to read input file: " + path);
-		}
-		if (bytes_read == 0) {
-			break;
-		}
-		total_bytes_read += bytes_read;
-		if (bytes_read < chunk) {
-			break;
-		}
+bool is_cancelled_win32_error(bool cancel_requested, DWORD error) {
+	return cancel_requested && (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED);
+}
+
+struct UniqueWin32Handle {
+	explicit UniqueWin32Handle(HANDLE input_handle = INVALID_HANDLE_VALUE) noexcept : handle(input_handle) {}
+	~UniqueWin32Handle() {
+		reset();
 	}
-	return total_bytes_read;
+
+	UniqueWin32Handle(const UniqueWin32Handle&) = delete;
+	UniqueWin32Handle& operator=(const UniqueWin32Handle&) = delete;
+
+	UniqueWin32Handle(UniqueWin32Handle&& other) noexcept : handle(other.release()) {}
+
+	UniqueWin32Handle& operator=(UniqueWin32Handle&& other) noexcept {
+		if (this != &other) {
+			reset(other.release());
+		}
+		return *this;
+	}
+
+	void reset(HANDLE new_handle = INVALID_HANDLE_VALUE) noexcept {
+		if (handle != INVALID_HANDLE_VALUE) {
+			::CloseHandle(handle);
+		}
+		handle = new_handle;
+	}
+
+	HANDLE get() const noexcept {
+		return handle;
+	}
+
+	HANDLE release() noexcept {
+		const auto released = handle;
+		handle = INVALID_HANDLE_VALUE;
+		return released;
+	}
+
+	HANDLE handle = INVALID_HANDLE_VALUE;
+};
+
+std::uint64_t get_file_size(HANDLE handle, const std::string& display_path) {
+	LARGE_INTEGER size{};
+	if (!::GetFileSizeEx(handle, &size)) {
+		throw make_win32_error("failed to query input file size: " + display_path);
+	}
+	return static_cast<std::uint64_t>(std::max<LONGLONG>(0, size.QuadPart));
 }
 
 void flush_file_buffers_if_supported(HANDLE handle, const std::string& path, std::string_view action) {
@@ -70,6 +100,35 @@ void flush_file_buffers_if_supported(HANDLE handle, const std::string& path, std
 }
 
 } // namespace
+
+struct OverlappedFileReader::State {
+	struct ReadSlot : OverlappedSlotBase {
+		std::uint64_t offset = 0;
+		std::size_t requested_length = 0;
+	};
+
+	State(
+		std::filesystem::path input_path,
+		std::uint64_t input_size,
+		HANDLE input_handle)
+		: path(std::move(input_path)),
+		  size(input_size),
+		  handle(input_handle) {}
+
+	std::filesystem::path path;
+	std::uint64_t offset = 0;
+	std::uint64_t size = 0;
+	std::uint64_t next_issue_offset = 0;
+	std::size_t chunk_size = 0;
+	HANDLE handle = INVALID_HANDLE_VALUE;
+	std::array<ReadSlot, kOverlappedFileReadQueueDepth> slots;
+	std::size_t next_slot_to_issue = 0;
+	std::size_t next_slot_to_consume = 0;
+	std::size_t in_flight_reads = 0;
+	bool prefetch_started = false;
+	std::atomic<bool> cancel_requested{false};
+	boost::signals2::scoped_connection cancel_connection;
+};
 
 struct FileByteSink::State {
 	struct WriteSlot : OverlappedSlotBase {
@@ -92,9 +151,317 @@ struct FileByteSink::State {
 };
 
 struct FileByteSource::State {
-	HANDLE handle = INVALID_HANDLE_VALUE;
 	std::string display_path;
+	BufferPool pool;
+	std::optional<OverlappedFileReader> reader;
+	std::optional<DataChunk> current_chunk;
+	std::size_t current_chunk_offset = 0;
+
+	explicit State(const std::filesystem::path& input_path)
+		: display_path(path_to_utf8_string(input_path)) {
+		UniqueWin32Handle handle(::CreateFileW(
+			input_path.c_str(),
+			GENERIC_READ,
+			FILE_SHARE_READ,
+			nullptr,
+			OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED,
+			nullptr));
+		if (handle.get() == INVALID_HANDLE_VALUE) {
+			throw make_win32_error("failed to open input file: " + display_path);
+		}
+		const auto input_size = get_file_size(handle.get(), display_path);
+		reader.emplace(pool, input_path, input_size, kFileByteSourceChunkSize, handle.release());
+		reader->start_prefetch(kFileByteSourceChunkSize * kOverlappedFileReadQueueDepth);
+	}
 };
+
+OverlappedFileReader::OverlappedFileReader(
+	BufferPool& pool,
+	const std::filesystem::path& path,
+	std::uint64_t size,
+	std::size_t buffer_size,
+	HANDLE handle)
+	: pool_(&pool), state_(std::make_unique<State>(path, size, handle)) {
+	state_->chunk_size = std::max<std::size_t>(1, buffer_size);
+	initialize_open_state();
+}
+
+OverlappedFileReader::~OverlappedFileReader() {
+	close();
+}
+
+OverlappedFileReader::OverlappedFileReader(OverlappedFileReader&& other)
+	: pool_(other.pool_), state_(std::move(other.state_)) {
+	other.pool_ = nullptr;
+}
+
+OverlappedFileReader& OverlappedFileReader::operator=(OverlappedFileReader&& other) {
+	if (this != &other) {
+		close();
+		pool_ = other.pool_;
+		state_ = std::move(other.state_);
+		other.pool_ = nullptr;
+	}
+	return *this;
+}
+
+void OverlappedFileReader::listenCancelSignal(CancelEvent& event) {
+	if (!state_) {
+		return;
+	}
+	auto* state = state_.get();
+	state_->cancel_connection = event.connect([state] {
+		state->cancel_requested.store(true, std::memory_order_release);
+		if (state->handle != INVALID_HANDLE_VALUE) {
+			::CancelIoEx(state->handle, nullptr);
+		}
+	});
+}
+
+void OverlappedFileReader::close() {
+	if (!state_) {
+		return;
+	}
+
+	if (state_->handle != INVALID_HANDLE_VALUE) {
+		for (auto& slot : state_->slots) {
+			if (slot.in_flight) {
+				::CancelIoEx(state_->handle, &slot.overlapped);
+				DWORD ignored = 0;
+				::GetOverlappedResult(state_->handle, &slot.overlapped, &ignored, TRUE);
+				slot.in_flight = false;
+			}
+			slot.buffer.reset();
+			slot.requested_length = 0;
+			slot.offset = 0;
+		}
+		::CloseHandle(state_->handle);
+		state_->handle = INVALID_HANDLE_VALUE;
+	}
+
+	state_.reset();
+}
+
+std::string OverlappedFileReader::path_for_error() const {
+	return state_ == nullptr ? std::string() : path_to_utf8_string(state_->path);
+}
+
+bool OverlappedFileReader::is_cancelled() const {
+	return state_ != nullptr && state_->cancel_requested.load(std::memory_order_acquire);
+}
+
+void OverlappedFileReader::cancel_pending_work() {
+	if (!state_) {
+		return;
+	}
+	state_->cancel_requested.store(true, std::memory_order_release);
+	if (state_->handle != INVALID_HANDLE_VALUE) {
+		::CancelIoEx(state_->handle, nullptr);
+	}
+}
+
+bool OverlappedFileReader::issue_next_read() {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
+	if (state_->next_issue_offset >= state_->size || state_->in_flight_reads >= state_->slots.size()) {
+		return false;
+	}
+
+	const auto request_length = static_cast<std::size_t>(std::min<std::uint64_t>(
+		state_->chunk_size,
+		state_->size - state_->next_issue_offset));
+
+	auto slot_index = state_->slots.size();
+	for (std::size_t probe = 0; probe < state_->slots.size(); ++probe) {
+		const auto index = (state_->next_slot_to_issue + probe) % state_->slots.size();
+		const auto& candidate = state_->slots[index];
+		if (!candidate.in_flight && !candidate.buffer) {
+			slot_index = index;
+			break;
+		}
+	}
+	if (slot_index == state_->slots.size()) {
+		return false;
+	}
+
+	auto& slot = state_->slots[slot_index];
+	slot.offset = state_->next_issue_offset;
+	slot.requested_length = request_length;
+
+	try {
+		slot.buffer = pool_->acquire(slot.requested_length);
+	} catch (...) {
+		slot.requested_length = 0;
+		slot.offset = 0;
+		throw;
+	}
+
+	slot.overlapped = {};
+	slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
+	slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
+	slot.overlapped.hEvent = slot.event_handle;
+	::ResetEvent(slot.event_handle);
+
+	DWORD bytes_read = 0;
+	const auto ok = ::ReadFile(
+		state_->handle,
+		slot.buffer.get(),
+		static_cast<DWORD>(slot.requested_length),
+		&bytes_read,
+		&slot.overlapped);
+
+	if (!ok) {
+		const auto error = ::GetLastError();
+		if (error != ERROR_IO_PENDING) {
+			slot.buffer.reset();
+			slot.requested_length = 0;
+			slot.offset = 0;
+			throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
+		}
+	}
+
+	slot.in_flight = true;
+	state_->next_slot_to_issue = (slot_index + 1) % state_->slots.size();
+	state_->next_issue_offset += slot.requested_length;
+	++state_->in_flight_reads;
+	return true;
+}
+
+void OverlappedFileReader::prime_prefetch_window(std::size_t max_bytes) {
+	if (!state_ || state_->size == 0 || max_bytes == 0) {
+		return;
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
+
+	std::size_t issued_bytes = 0;
+	while (state_->in_flight_reads < state_->slots.size()) {
+		const auto before = state_->next_issue_offset;
+		if (!issue_next_read()) {
+			break;
+		}
+		issued_bytes += static_cast<std::size_t>(state_->next_issue_offset - before);
+		if (issued_bytes >= max_bytes) {
+			break;
+		}
+	}
+}
+
+void OverlappedFileReader::initialize_open_state() {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
+	if (state_->handle == INVALID_HANDLE_VALUE) {
+		throw std::runtime_error("file reader is missing an input handle: " + path_for_error());
+	}
+	state_->offset = 0;
+	state_->next_issue_offset = 0;
+	state_->next_slot_to_issue = 0;
+	state_->next_slot_to_consume = 0;
+	state_->in_flight_reads = 0;
+	state_->prefetch_started = false;
+}
+
+void OverlappedFileReader::start_prefetch(std::size_t max_bytes) {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
+	if (state_->handle == INVALID_HANDLE_VALUE) {
+		throw std::runtime_error("file reader is not open: " + path_for_error());
+	}
+	if (state_->prefetch_started) {
+		return;
+	}
+	state_->prefetch_started = true;
+	prime_prefetch_window(max_bytes);
+}
+
+DataChunk OverlappedFileReader::read_next_chunk() {
+	if (!state_) {
+		throw std::runtime_error("file reader is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		throw CancelledError("file reader cancelled");
+	}
+	if (state_->handle == INVALID_HANDLE_VALUE) {
+		throw std::runtime_error("file reader is not open: " + path_for_error());
+	}
+
+	const auto current_offset = state_->offset;
+	if (current_offset >= state_->size) {
+		return DataChunk{pool_->acquire(0), 0, current_offset, true};
+	}
+
+	if (state_->in_flight_reads == 0) {
+		issue_next_read();
+	}
+	if (state_->in_flight_reads == 0) {
+		return DataChunk{pool_->acquire(0), 0, current_offset, true};
+	}
+
+	auto& slot = state_->slots[state_->next_slot_to_consume];
+	if (!slot.in_flight) {
+		throw std::runtime_error("file reader consume slot is not in flight");
+	}
+	DWORD bytes_read = 0;
+	if (!::GetOverlappedResult(state_->handle, &slot.overlapped, &bytes_read, TRUE)) {
+		const auto error = ::GetLastError();
+		slot.in_flight = false;
+		slot.buffer.reset();
+		slot.requested_length = 0;
+		slot.offset = 0;
+		if (is_cancelled_win32_error(state_->cancel_requested.load(std::memory_order_acquire), error)) {
+			throw CancelledError("file reader cancelled");
+		}
+		throw std::runtime_error("failed to read input file: " + path_for_error() + ": " + std::system_category().message(static_cast<int>(error)));
+	}
+	slot.in_flight = false;
+	state_->next_slot_to_consume = (state_->next_slot_to_consume + 1) % state_->slots.size();
+	--state_->in_flight_reads;
+
+	if (bytes_read != slot.requested_length) {
+		slot.buffer.reset();
+		slot.requested_length = 0;
+		slot.offset = 0;
+		throw std::runtime_error("unexpected short read from input file: " + path_for_error());
+	}
+
+	state_->offset = slot.offset + bytes_read;
+	auto data = std::move(slot.buffer);
+	const auto read_offset = slot.offset;
+	slot.requested_length = 0;
+	slot.offset = 0;
+
+	if (state_->offset < state_->size) {
+		issue_next_read();
+	}
+
+	return DataChunk{std::move(data), bytes_read, read_offset, state_->offset >= state_->size};
+}
+
+std::uint64_t OverlappedFileReader::offset() const {
+	return state_ == nullptr ? 0 : state_->offset;
+}
+
+bool OverlappedFileReader::eof() const {
+	return state_ == nullptr || state_->offset >= state_->size;
+}
+
+bool OverlappedFileReader::is_open() const {
+	return state_ != nullptr && state_->handle != INVALID_HANDLE_VALUE;
+}
 
 FileByteSink::FileByteSink(const std::filesystem::path& output_path, std::size_t max_in_flight_write_ops) : state_(std::make_unique<State>()) {
 	state_->display_path = path_to_utf8_string(output_path);
@@ -296,36 +663,44 @@ void FileByteSink::cancel_pending_work() {
 	}
 }
 
-FileByteSource::FileByteSource(const std::filesystem::path& input_path) : state_(std::make_unique<State>()) {
-	state_->display_path = path_to_utf8_string(input_path);
-	state_->handle = ::CreateFileW(
-		input_path.c_str(),
-		GENERIC_READ,
-		FILE_SHARE_READ,
-		nullptr,
-		OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-		nullptr);
-	if (state_->handle == INVALID_HANDLE_VALUE) {
-		throw make_win32_error("failed to open input file: " + state_->display_path);
-	}
-}
+FileByteSource::FileByteSource(const std::filesystem::path& input_path) : state_(std::make_unique<State>(input_path)) {}
 
-FileByteSource::~FileByteSource() {
-	if (state_ && state_->handle != INVALID_HANDLE_VALUE) {
-		::CloseHandle(state_->handle);
-		state_->handle = INVALID_HANDLE_VALUE;
-	}
-}
+FileByteSource::~FileByteSource() = default;
 
 std::size_t FileByteSource::read(uint8_t* buffer, std::size_t length) {
-	if (!state_ || state_->handle == INVALID_HANDLE_VALUE) {
+	if (!state_ || !state_->reader.has_value() || !state_->reader->is_open()) {
 		throw std::runtime_error("input file is closed");
 	}
 	if (length == 0) {
 		return 0;
 	}
-	return read_some(state_->handle, buffer, length, state_->display_path);
+
+	std::size_t copied_total = 0;
+	while (copied_total < length) {
+		if (!state_->current_chunk.has_value() || state_->current_chunk_offset >= state_->current_chunk->length) {
+			state_->current_chunk = state_->reader->read_next_chunk();
+			state_->current_chunk_offset = 0;
+			if (state_->current_chunk->length == 0) {
+				break;
+			}
+		}
+
+		const auto available = state_->current_chunk->length - state_->current_chunk_offset;
+		const auto chunk = std::min<std::size_t>(available, length - copied_total);
+		std::memcpy(
+			buffer + copied_total,
+			state_->current_chunk->data.get() + state_->current_chunk_offset,
+			chunk);
+		state_->current_chunk_offset += chunk;
+		copied_total += chunk;
+
+		if (state_->current_chunk_offset >= state_->current_chunk->length) {
+			state_->current_chunk.reset();
+			state_->current_chunk_offset = 0;
+		}
+	}
+
+	return copied_total;
 }
 
 struct SocketByteSink::State {

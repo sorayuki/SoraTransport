@@ -116,15 +116,7 @@ public:
 	void cancel_pending_work();
 
 private:
-	struct State;
-	bool issue_next_read();
-	void prime_prefetch_window(std::size_t max_bytes);
-	void initialize_open_state();
-	void close();
-	std::string path_for_error() const;
-
-	BufferPool& pool_;
-	std::unique_ptr<State> state_;
+	std::unique_ptr<OverlappedFileReader> reader_;
 };
 
 struct OpenedFileReader : IQueueDisposable {
