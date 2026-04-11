@@ -1,6 +1,6 @@
 这是一份针对 SoraTransport 与 fasttar 的当前架构设计文档。
 
-当前实现采用“协程控制平面 + 线程化流水线数据面”的方案。网络连接仍然由 Boost.Asio 协程处理；真正的数据搬运则由阶段线程、单共享线程池、有界队列和阻塞式字节源/汇协作完成。相比更早期的设想，当前设计重点已经转向清晰的阶段边界、稳定的资源控制和易维护的 Windows I/O 实现。
+当前实现采用“协程控制平面 + 线程化流水线数据面 + 可取消运行时”的方案。网络连接仍然由 Boost.Asio 协程处理；真正的数据搬运则由阶段线程、单共享线程池、有界队列和阻塞式字节源/汇协作完成。相比更早期的设想，当前设计重点已经转向清晰的阶段边界、稳定的资源控制、统一的 Windows overlapped I/O 路径，以及 GUI/CLI 共用的一套取消与进度接口。
 
 ## 1. 总体架构
 
@@ -13,40 +13,37 @@
     │
     ▼
 (1) DirScanner
-    │  产出 FileMeta
-    ▼
-[MetaQueue]
-    │
-    ▼
-(2) FileReaderOpener
-    │  并发 open FileReader，但保持输入输出顺序
+    │  递归遍历目录，填充 FileMeta，并发打开普通文件
     ▼
 [OpenedQueue]
     │
     ▼
-(3) FileReaderPrefetcher
+(2) FileReaderPrefetcher
     │  在读预算允许范围内执行初始预读
     ▼
 [PrefetchedQueue]
     │
     ▼
-(4) TarPacker
+(3) TarPacker
     │  顺序消费 FileReader，驱动 libarchive
     ▼
 [TarQueue]
     │
-    ├── (5a) RawTarWriter
+    ├── (4a) QueueWriter
+    │        │  仅 raw tar 路径使用（当前主要是 fasttar -n）
+    │        ▼
+    │   FileByteSink
     │
-    └── (5b) ZstdCompressor
+    └── (4b) ZstdCompressor
               │  独立压缩节点
               ▼
-         [ZstdQueue]
-              │
-              ▼
-         QueueWriter
-              │
-              ▼
-         FileByteSink / SocketByteSink
+          [ZstdQueue]
+               │
+               ▼
+          QueueWriter
+               │
+               ▼
+          FileByteSink / SocketByteSink
 ```
 
 ### 1.2 主动接收端 / 本地解包数据流
@@ -69,53 +66,46 @@ FileByteSource / SocketByteSource
 
 ### 2.1 DirScanner
 
-- 并发递归遍历目录
-- 生成 `FileMeta`
+- 递归遍历目录，并保留根目录条目
+- 为所有条目填充 `FileMeta`
 - 将相对路径统一转换为 UTF-8 generic path，供 tar 条目名使用
-- 不负责打开文件，也不负责读取文件内容
+- 普通文件会在线程池中并发打开，并以 `OpenedFileReader` 的形式顺序输出
+- 目录等非普通文件直接输出元数据；symlink 当前仍跳过
+- 同时采集 Windows 时间戳和文件属性，供 tar 元数据写回
 
-### 2.2 FileReaderOpener
-
-- 输入是 `FileMeta`
-- 输出是 `OpenedFileReader`
-- 在线程池中并发创建并 `open()` `FileReader`
-- 通过序号重排保证输出顺序和输入顺序一致
-- 不负责预算申请，也不负责初始预读
-
-### 2.3 FileReaderPrefetcher
+### 2.2 FileReaderPrefetcher
 
 - 输入是已经 open 的 `OpenedFileReader`
 - 输出是已经完成初始预读的 `OpenedFileReader`
 - 使用 `InFlightReadBudget` 控制预读占用的总内存预算
 - 预算会跟随对象进入 `prefetched_queue (p/t)`，并在对象被 `TarPacker` 取出时立即释放
 
-### 2.4 FileReader
+### 2.3 FileReader
 
 当前 `FileReader` 的设计是“一个实例只负责一个文件、对外只允许顺序消费”。
 
-- 构造时绑定文件路径、文件大小、chunk 大小和 I/O 模式
-- `open()` 只打开一次文件
+- 构造时直接绑定文件路径、文件大小、chunk 大小和已打开的文件句柄
 - `start_prefetch(max_bytes)` 触发初始预读窗口
 - `read_next_chunk()` 每次按顺序返回一个块
-- 析构或 `close()` 时关闭文件
+- 析构时关闭文件
 
 实现特征：
 
 - 使用 Windows `ReadFile + OVERLAPPED`
 - 内部维护固定 8 个 read slot
-- 支持 `Buffered` 与 `Direct` 模式
-- Direct 模式会处理对齐和尾块读取
+- 具体 overlapped 读取细节封装在 `OverlappedFileReader`
 
-### 2.5 TarPacker
+### 2.4 TarPacker
 
 - 输入是 `OpenedFileReader`
 - 为每个文件写 tar header
 - 对普通文件顺序调用 `read_next_chunk()`
 - 通过 libarchive callback 推送 tar 数据块
+- 在真正写 tar payload 前会先释放预读预算租约
 
 当前 `TarPacker` 是单线程顺序打包器，不承担额外并发调度。
 
-### 2.6 ZstdCompressor / ZstdDecompressor
+### 2.5 ZstdCompressor / ZstdDecompressor
 
 - `ZstdCompressor` 负责将 tar 数据流转成 zstd 数据流
 - `ZstdCompressor` 现在是独立节点：输入 `TarQueue`，输出 `ZstdQueue`
@@ -126,11 +116,12 @@ FileByteSource / SocketByteSource
 - 下游高压或上游低压时升档
 - 压缩工作会投递到共享线程池执行
 
-### 2.7 TarUnpacker
+### 2.6 TarUnpacker
 
 - 通过 libarchive 读取 tar 数据流
 - 负责目录创建、条目恢复和磁盘写入
 - 当前直接使用 `archive_write_disk`
+- 解包时会校验条目路径必须是相对路径，防止越界写入目标目录
 
 ## 3. 并发模型
 
@@ -141,42 +132,56 @@ FileByteSource / SocketByteSource
 
 网络侧额外使用 Boost.Asio `io_context` 驱动 `listen -> accept` 和 `receive -> connect` 协程，但数据面主体仍然是线程和阻塞同步原语。
 
-默认情况下，共享线程池大小等于硬件核心数。
+默认情况下，共享线程池大小取 `min(hardware_concurrency, 12)`；文件打开并发度则按 `worker_threads * 4` 计算，并再限制到最多 48。
+
+### 3.1 取消与进度
+
+- `CancelEvent` 作为统一取消信号源
+- `BoundedQueue`、`InFlightReadBudget`、文件/套接字 I/O 对象都会监听取消信号
+- GUI 和网络入口通过 `std::stop_token -> CancelEvent` 桥接来中断运行中的传输
+- `TransferProgress` 为 GUI 与网络模式提供统一的状态、字节数和文件数快照
 
 ## 4. 背压与资源控制
 
 当前实现的资源控制主要依赖几个有界结构：
 
-- `BoundedQueue<FileMeta>`：限制待处理元数据积压
 - `BoundedQueue<OpenedFileReader>`：限制已打开文件数
 - `BoundedQueue<OpenedFileReader>`：限制已预读文件数
 - `BoundedQueue<DataChunk>`：限制 tar 数据在压缩或写出前的积压
+- `BoundedQueue<DataChunk>`：在压缩路径上再限制 zstd 数据积压
 
 当前默认深度：
 
-- `meta_queue = 256`
-- `opened_queue = 32`
+- `opened_queue = max(32, file_open_concurrency)`
 - `prefetched_queue = 64`
 - `tar_queue = 16`
+- `zstd_queue = 16`
 
 另一个关键控制点是 `InFlightReadBudget`：
 
 - 限制所有初始预读总占用
 - 防止多个文件同时预读时内存失控
+- 默认预算是 `96 MiB`
+- 默认输出并发写请求数是 `3`
 
 ## 5. I/O 设计
 
 ### 5.1 输入路径
 
-- `FileByteSource` 支持 `Buffered` / `Direct`
-- `FileReader` 支持 `Buffered` / `Direct`
-- Direct 路径会查询设备对齐信息
+- `FileReader` 与 `FileByteSource` 当前都走统一的 Windows overlapped 文件读取路径
+- 输入侧不再对 CLI 暴露 `Buffered` / `Direct` 模式切换
+- 解包文件输入通过 `FileByteSource -> OverlappedFileReader` 顺序消费
 
 ### 5.2 输出路径
 
 - `FileByteSink` 当前固定为 buffered + overlapped 写出
 - 通过多写槽和 `max_in_flight_write_ops` 控制在途写请求数
 - 输出侧当前不再暴露 direct write 接口
+
+### 5.3 网络路径
+
+- `SocketByteSink` / `SocketByteSource` 也接入统一取消语义
+- 网络发送端固定走 zstd 压缩路径；raw tar 只在本地 `fasttar -n` 路径使用
 
 ## 6. 实现取舍
 
@@ -192,25 +197,29 @@ FileByteSource / SocketByteSource
 - 不再使用 mmap 快路径
 - 不再对单文件做乱序并发分块读取
 - 不再为 reader/compression/scanner 维护多个独立执行器
-- 不再让 `FileReaderOpener` 同时承担 open 与预算控制
+- 不再保留独立的 `FileReaderOpener` 阶段
+- 不再对外暴露 Direct I/O / Buffered I/O 选择
 
 这些简化换来的是更清晰的生命周期管理、更少的耦合点和更容易诊断的问题边界。
 
 ## 7. 命令行与工具目标
 
-当前工程包含三个可执行目标：
+当前工程包含四个可执行目标：
 
 - `soratransport`
-  - `pack [-d|-b] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>`
-  - `unpack [-d|-b] [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>`
-  - `listen [-r <MiB>] [-l <level>] <source-dir> <port>`
+  - `pack [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>`
+  - `unpack [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>`
+  - `listen [-r <MiB>] [-l <level>] [--log-adaptive] <source-dir> <port>`
   - `receive <host> <port> <destination-dir>`
 - `fasttar`
-  - `pack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar|output.tar.zst>`
-  - `unpack [-d|-b] [-z|-n] [-r <MiB>] [-w <count>] <input.tar|input.tar.zst> <destination-dir>`
+  - `pack [-z|-n] [-r <MiB>] [-w <count>] [-l <level>] [--log-adaptive] <source-dir> <output.tar|output.tar.zst>`
+  - `unpack [-z|-n] [-r <MiB>] [-w <count>] <input.tar|input.tar.zst> <destination-dir>`
 - `fs_benchmark`
   - 默认扫描 `D:/dev/boost_1_90_0/dist`
   - 可选 `--read-files`，通过真实的 open + prefetch + consume 流水线验证读取性能
+- `soratransport_app`
+  - 基于 FLTK 的 Windows GUI
+  - 复用 `listen_directory` / `receive_directory`、`TransferProgress` 与 `CancelEvent`
 
 其中 `-l <level>` 的语义是“显式锁定压缩级别”，不是“提供一个自适应起始值”。
 
