@@ -55,7 +55,18 @@ void close_transport_socket(TransportWebSocket& websocket) {
 }
 
 template <typename Rep, typename Period>
-bool wait_for_stop_or_timeout(std::stop_token stop_token, std::chrono::duration<Rep, Period> timeout) {
+bool wait_for_stop_or_timeout(
+	std::stop_token stop_token,
+	const CancelEvent* cancel_event,
+	std::chrono::duration<Rep, Period> timeout) {
+	if (stop_token.stop_requested() || (cancel_event != nullptr && cancel_event->is_cancelled())) {
+		return true;
+	}
+
+	constexpr auto kStopWaitPollInterval = std::chrono::milliseconds(50);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+	const auto poll_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(kStopWaitPollInterval);
+
 	std::mutex mutex;
 	std::condition_variable cv;
 	std::atomic<bool> stop_requested{false};
@@ -64,9 +75,22 @@ bool wait_for_stop_or_timeout(std::stop_token stop_token, std::chrono::duration<
 		cv.notify_all();
 	});
 	std::unique_lock lock(mutex);
-	return cv.wait_for(lock, timeout, [&] {
-		return stop_requested.load(std::memory_order_acquire);
-	});
+	for (;;) {
+		if (stop_requested.load(std::memory_order_acquire) || (cancel_event != nullptr && cancel_event->is_cancelled())) {
+			return true;
+		}
+
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return false;
+		}
+
+		const auto remaining = deadline - now;
+		const auto wait_slice = remaining < poll_interval ? remaining : poll_interval;
+		cv.wait_for(lock, wait_slice, [&] {
+			return stop_requested.load(std::memory_order_acquire);
+		});
+	}
 }
 
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
@@ -160,12 +184,15 @@ void finalize_progress_line() {
 	std::cerr << '\n' << std::flush;
 }
 
-std::jthread start_progress_thread(std::function<std::string(std::uint64_t)> build_line, std::atomic<std::uint64_t>& processed_bytes) {
-	return std::jthread([build_line = std::move(build_line), &processed_bytes](std::stop_token stop_token) {
+std::jthread start_progress_thread(
+	std::function<std::string(std::uint64_t)> build_line,
+	std::atomic<std::uint64_t>& processed_bytes,
+	const CancelEvent* cancel_event = nullptr) {
+	return std::jthread([build_line = std::move(build_line), &processed_bytes, cancel_event](std::stop_token stop_token) {
 		using namespace std::chrono_literals;
 		std::uint64_t previous = processed_bytes.load(std::memory_order_relaxed);
 		while (!stop_token.stop_requested()) {
-			if (wait_for_stop_or_timeout(stop_token, 1s)) {
+			if (wait_for_stop_or_timeout(stop_token, cancel_event, 1s)) {
 				break;
 			}
 			const auto current = processed_bytes.load(std::memory_order_relaxed);
@@ -209,13 +236,14 @@ void complete_progress(const std::shared_ptr<TransferProgress>& progress, bool f
 std::jthread start_progress_sync_thread(
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint64_t>& processed_bytes,
-	std::atomic<std::uint64_t>& processed_files) {
-	return std::jthread([progress, &processed_bytes, &processed_files](std::stop_token stop_token) {
+	std::atomic<std::uint64_t>& processed_files,
+	const CancelEvent* cancel_event = nullptr) {
+	return std::jthread([progress, &processed_bytes, &processed_files, cancel_event](std::stop_token stop_token) {
 		using namespace std::chrono_literals;
 		std::uint64_t previous_bytes = 0;
 		std::uint64_t previous_files = 0;
 		while (!stop_token.stop_requested()) {
-			if (wait_for_stop_or_timeout(stop_token, 250ms)) {
+			if (wait_for_stop_or_timeout(stop_token, cancel_event, 250ms)) {
 				break;
 			}
 			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
@@ -405,7 +433,7 @@ void receive_transport_from_source(
 		config.max_in_flight_write_ops,
 		config.max_parallel_extract_files);
 	print_receive_progress_legend();
-	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed, &cancel_event);
 
 	auto progress_thread = start_progress_thread(
 		[&](std::uint64_t bytes_per_second) {
@@ -416,7 +444,8 @@ void receive_transport_from_source(
 				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&cancel_event);
 
 	std::jthread input_thread([&] {
 		try {
@@ -510,7 +539,7 @@ asio::awaitable<void> listen_directory_task(
 		PipelineState state;
 		std::atomic<int> active_compression_level{compression_level};
 		print_listen_progress_legend();
-		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed, &cancel_event);
 
 		auto progress_thread = start_progress_thread(
 			[&](std::uint64_t bytes_per_second) {
@@ -527,7 +556,8 @@ asio::awaitable<void> listen_directory_task(
 					<< '/' << format_scaled_bytes(prefetcher.total_budget_bytes(), "");
 				return out.str();
 			},
-			uncompressed_bytes_processed);
+			uncompressed_bytes_processed,
+			&cancel_event);
 
 		auto traverse_future = asio::co_spawn(executors.executor(), traverser.traverse(source_dir, traversal_queue), asio::use_future);
 		auto open_future = asio::co_spawn(executors.executor(), opener.open(traversal_queue, opened_queue), asio::use_future);
@@ -721,7 +751,8 @@ void pack_directory_to_file(
 				<< '/' << format_scaled_bytes(prefetcher.total_budget_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&effective_cancel_event);
 
 	FileByteSink sink(output_file, tuning.max_in_flight_write_ops);
 	sink.listenCancelSignal(effective_cancel_event);
@@ -841,7 +872,8 @@ void unpack_file_to_directory(
 				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&effective_cancel_event);
 
 	std::jthread input_thread([&] {
 		try {

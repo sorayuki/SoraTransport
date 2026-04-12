@@ -942,7 +942,7 @@ public:
 	void wait_for_all_noexcept() noexcept {
 		while (!active_tasks_.empty()) {
 			try {
-				wait_for_any_task();
+				wait_for_any_task(false);
 			} catch (...) {
 			}
 		}
@@ -986,16 +986,19 @@ private:
 		wait_for_task(found->second);
 	}
 
-	void wait_for_any_task() {
+	void wait_for_any_task(bool allow_cancel = true) {
 		for (;;) {
 			std::uint64_t completed_task_id = 0;
 			{
 				std::unique_lock lock(completed_mutex_);
 				completed_cv_.wait_for(lock, std::chrono::milliseconds(50), [&] {
-					return !completed_task_ids_.empty() || (cancel_event_ != nullptr && cancel_event_->is_cancelled());
+					return !completed_task_ids_.empty()
+						|| (allow_cancel && cancel_event_ != nullptr && cancel_event_->is_cancelled());
 				});
-				throw_if_cancelled(cancel_event_);
 				if (completed_task_ids_.empty()) {
+					if (allow_cancel) {
+						throw_if_cancelled(cancel_event_);
+					}
 					continue;
 				}
 				completed_task_id = completed_task_ids_.front();
@@ -1011,10 +1014,20 @@ private:
 	}
 
 	void wait_for_task(std::list<ActiveFileTask>::iterator task_it) {
-		task_it->future.get();
-		active_tasks_by_id_.erase(task_it->task_id);
-		active_tasks_by_path_.erase(task_it->path_key);
+		const auto task_id = task_it->task_id;
+		const auto path_key = task_it->path_key;
+		std::exception_ptr error;
+		try {
+			task_it->future.get();
+		} catch (...) {
+			error = std::current_exception();
+		}
+		active_tasks_by_id_.erase(task_id);
+		active_tasks_by_path_.erase(path_key);
 		active_tasks_.erase(task_it);
+		if (error) {
+			std::rethrow_exception(error);
+		}
 	}
 
 	std::filesystem::path destination_root_;
