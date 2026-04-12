@@ -85,6 +85,11 @@
 - [src/detail2/infra.hpp](src/detail2/infra.hpp)
   - `SemaphoreCor`
   - `TaskExecutor`
+- [src/detail2/filesystem.hpp](src/detail2/filesystem.hpp)
+  - `FileTraverser`
+  - `FileOpener`
+  - `FilePrefetcher`
+  - `OpenedFile`
 
 当前 `detail2` 目录已接入构建，但还处于“分阶段替换”的第一步：基础设施模块可编译、可独立验证，顶层 pack/unpack/listen/receive 路径暂时仍由 `src/detail/` 提供。
 
@@ -224,6 +229,16 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `detail2::SemaphoreCor`：提供支持 move-only guard 的协程信号量，并带有批量取消等待者的语义
 
 这两个类当前主要用于后续重写节点时降低控制流复杂度；由于主路径尚未切换，所以运行结果仍然由旧实现决定。
+
+### 5.2.2 detail2 文件链路状态
+
+当前已经新增但尚未切主路径的文件链路节点包括：
+
+- `detail2::FileTraverser`：负责多根输入、BFS 遍历、目录元数据输出以及 symlink 跳过
+- `detail2::FileOpener`：负责按遍历顺序重排输出，同时把打开并发度限制交给 `SemaphoreCor`
+- `detail2::FilePrefetcher`：负责在字节预算信号量控制下触发初始预读，并把预算 guard 绑定到 `OpenedFile`
+
+这些节点当前已经进入 `soratransport_core` 构建并通过编译，但还没有接入 pack/listen 的实际执行路径。
 
 ### 5.3 队列
 

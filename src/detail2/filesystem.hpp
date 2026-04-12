@@ -1,0 +1,112 @@
+#pragma once
+
+#include "config.hpp"
+#include "infra.hpp"
+
+#include "../detail/io.hpp"
+#include "../detail/runtime.hpp"
+
+#include <boost/asio/awaitable.hpp>
+
+#include <filesystem>
+#include <future>
+#include <optional>
+
+namespace soratransport::detail2 {
+
+struct TraversalEntry : IQueueDisposable {
+	void Dispose() noexcept override {
+		meta = {};
+		sequence = 0;
+		regular_file = false;
+	}
+
+	FileMeta meta;
+	std::size_t sequence = 0;
+	bool regular_file = false;
+};
+
+class SequentialFileReader {
+public:
+	SequentialFileReader(
+		BufferPool& pool,
+		const std::filesystem::path& path,
+		std::uint64_t size,
+		std::size_t buffer_size,
+		HANDLE handle);
+	~SequentialFileReader();
+	SequentialFileReader(const SequentialFileReader&) = delete;
+	SequentialFileReader& operator=(const SequentialFileReader&) = delete;
+	SequentialFileReader(SequentialFileReader&& other);
+	SequentialFileReader& operator=(SequentialFileReader&& other);
+	void listenCancelSignal(CancelEvent& event);
+	void start_prefetch(std::size_t max_bytes);
+	DataChunk read_next_chunk();
+	std::uint64_t offset() const;
+	bool eof() const;
+	bool is_open() const;
+	bool is_cancelled() const;
+	void cancel_pending_work();
+
+private:
+	std::unique_ptr<OverlappedFileReader> reader_;
+};
+
+struct OpenedFile : IQueueDisposable {
+	void Dispose() noexcept override {
+		reader.reset();
+		prefetch_guard.reset();
+		open_guard.reset();
+		prefetched_bytes = 0;
+		meta = {};
+	}
+
+	FileMeta meta;
+	std::optional<SequentialFileReader> reader;
+	SemaphoreCor::Guard open_guard;
+	SemaphoreCor::Guard prefetch_guard;
+	std::size_t prefetched_bytes = 0;
+};
+
+class FileTraverser {
+public:
+	FileTraverser(boost::asio::any_io_executor executor, PipelineTuning tuning, CancelEvent* cancel_event = nullptr);
+	boost::asio::awaitable<void> traverse(const std::filesystem::path& root, BoundedQueue<TraversalEntry>& out_queue) const;
+	boost::asio::awaitable<void> traverse(const std::vector<std::filesystem::path>& roots, BoundedQueue<TraversalEntry>& out_queue) const;
+
+private:
+	PipelineTuning tuning_;
+	CancelEvent* cancel_event_ = nullptr;
+	mutable SemaphoreCor directory_slots_;
+	boost::signals2::scoped_connection cancel_connection_;
+};
+
+class FileOpener {
+public:
+	FileOpener(BufferPool& pool, TaskExecutor& executor, PipelineTuning tuning, CancelEvent* cancel_event = nullptr);
+	boost::asio::awaitable<void> open(BoundedQueue<TraversalEntry>& in_entries, BoundedQueue<OpenedFile>& out_opened) const;
+
+private:
+	BufferPool& pool_;
+	TaskExecutor& executor_;
+	PipelineTuning tuning_;
+	CancelEvent* cancel_event_ = nullptr;
+	mutable SemaphoreCor open_slots_;
+	boost::signals2::scoped_connection cancel_connection_;
+};
+
+class FilePrefetcher {
+public:
+	FilePrefetcher(boost::asio::any_io_executor executor, PipelineTuning tuning, CancelEvent* cancel_event = nullptr);
+	boost::asio::awaitable<void> prefetch(BoundedQueue<OpenedFile>& in_opened, BoundedQueue<OpenedFile>& out_prefetched) const;
+
+private:
+	PipelineTuning tuning_;
+	CancelEvent* cancel_event_ = nullptr;
+	mutable SemaphoreCor byte_budget_;
+	boost::signals2::scoped_connection cancel_connection_;
+};
+
+std::size_t compute_prefetch_bytes(const OpenedFile& opened_file, const PipelineTuning& tuning);
+
+} // namespace soratransport::detail2

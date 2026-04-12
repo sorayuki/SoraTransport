@@ -8,6 +8,7 @@
 
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,9 @@ public:
 	std::size_t thread_count() const;
 	boost::asio::any_io_executor executor();
 
+	template <typename Fn>
+	auto submit(Fn&& fn) -> std::future<std::invoke_result_t<std::decay_t<Fn>>>;
+
 	template <typename Fn, typename CompletionToken>
 	auto async_post(Fn&& fn, CompletionToken&& token);
 
@@ -65,7 +69,6 @@ public:
 	std::size_t available() const;
 	bool is_cancelled() const;
 
-private:
 	class Guard {
 	public:
 		Guard() = default;
@@ -113,6 +116,8 @@ private:
 		std::size_t permits_ = 0;
 	};
 
+	private:
+
 	struct AcquireResult {
 		std::exception_ptr error;
 		std::optional<Guard> guard;
@@ -141,9 +146,17 @@ private:
 	std::shared_ptr<State> state_;
 };
 
+template <typename Fn>
+auto TaskExecutor::submit(Fn&& fn) -> std::future<std::invoke_result_t<std::decay_t<Fn>>> {
+	using Result = std::invoke_result_t<std::decay_t<Fn>>;
+	auto task = std::make_shared<std::packaged_task<Result()>>(std::forward<Fn>(fn));
+	auto future = task->get_future();
+	boost::asio::post(pool_, [task]() { (*task)(); });
+	return future;
+}
+
 template <typename Fn, typename CompletionToken>
 auto TaskExecutor::async_post(Fn&& fn, CompletionToken&& token) {
-	using Handler = std::decay_t<CompletionToken>;
 	using Result = std::invoke_result_t<std::decay_t<Fn>>;
 	return boost::asio::async_initiate<CompletionToken, void(TaskResult<Result>)>(
 		[this, fn = std::forward<Fn>(fn)](auto handler) mutable {
