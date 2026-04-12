@@ -101,6 +101,8 @@
   - GUI 发送页对外状态接口
 - [src/detail2/gui_runtime.cpp](src/detail2/gui_runtime.cpp)
   - GUI 发送页状态机复用旧交互逻辑，但内部发送流水线切到 `detail2`
+- [src/detail2/writer.hpp](src/detail2/writer.hpp)
+  - `detail2::BufferedFileWriter`
 
 当前 `detail2` 目录已经进入第二阶段：`pack`、`listen` 和 GUI 发送页的实际发送流水线都已切到 `detail2`，而 `unpack` / `receive` 与落盘路径暂时仍由 `src/detail/` 提供。
 
@@ -276,6 +278,18 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `unpack_file_to_directory()`
 - `receive_directory()`
 - 解包阶段内部的落盘写入实现
+
+### 5.2.5 detail2 文件写入对象状态
+
+当前已经新增一个尚未接入解包主路径的新写入对象：
+
+- `detail2::BufferedFileWriter`
+  - 对外暴露 `write()` / `close()`
+  - 使用槽位缓冲聚合写入请求
+  - 通过 `TaskExecutor` 后台排空待写槽位
+  - 关闭时等待后台排空完成并保持取消语义
+
+这个对象用于承接后续 `unpack` / `receive` 的落盘重构，目前已经进入构建但尚未替换旧的解包写入实现。
 
 ### 5.3 队列
 

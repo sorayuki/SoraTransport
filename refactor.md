@@ -94,6 +94,21 @@
   - `pack`、`listen`、GUI 发送页已经改走 `detail2`
   - `unpack`、`receive` 以及解包落盘仍保留旧实现
 
+  ### 7. 文件写入对象已落地
+
+  已新增：
+
+  - `src/detail2/writer.hpp`
+  - `src/detail2/writer.cpp`
+
+  本轮完成内容：
+
+  - 实现 `detail2::BufferedFileWriter`
+    - 槽位缓冲聚合写入
+    - 后台 drain 任务通过 `TaskExecutor` 执行
+    - 关闭时等待所有已排队槽位刷入底层 `FileByteSink`
+    - 保留取消时终止写入与关闭等待的语义
+
 ## 验证
 
 - 已构建通过：`soratransport_core`
@@ -105,6 +120,6 @@
 
 ## 下一步
 
-1. 在 `detail2` 中补齐文件写入对象与解包落盘链路
+1. 把 `BufferedFileWriter` 接进 `unpack` / `receive` 的落盘链路
 2. 把 `unpack` / `receive` 也切到 `detail2`
 3. 继续补强符号链接、取消与大文件场景的专项验证
