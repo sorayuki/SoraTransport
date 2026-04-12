@@ -404,16 +404,8 @@ private:
 							sink.check_connection();
 						} catch (...) {
 							receiver_connected = false;
-							if (progress_) {
-								try {
-									throw;
-								} catch (const CancelledError&) {
-									progress_->set_cancelled("cancelled");
-								} catch (const std::exception& error) {
-									progress_->set_failed(error.what());
-								} catch (...) {
-									progress_->set_failed("receiver disconnected");
-								}
+							if (progress_ && cancel_event_.is_cancelled()) {
+								progress_->set_cancelled("cancelled");
 							}
 						}
 						continue;

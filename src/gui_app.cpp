@@ -5,15 +5,16 @@
 #include <FL/Fl.H>
 #include <FL/Fl_Box.H>
 #include <FL/Fl_Button.H>
+#include <FL/Fl_Choice.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Group.H>
 #include <FL/Fl_Input.H>
 #include <FL/Fl_Return_Button.H>
-#include <FL/Fl_Scroll.H>
 #include <FL/Fl_Tabs.H>
 #include <FL/fl_ask.H>
 #include <FL/platform.H>
 
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -78,6 +79,9 @@ std::string translate_status_text(std::string_view status_text) {
 	if (status_text == "receiver connected") {
 		return "接收端已连接，等待拖放";
 	}
+	if (status_text == "receiver connected, waiting for drop") {
+		return "接收端已连接，等待拖放";
+	}
 	if (status_text == "sending") {
 		return "正在发送";
 	}
@@ -86,6 +90,9 @@ std::string translate_status_text(std::string_view status_text) {
 	}
 	if (status_text == "receiving") {
 		return "正在接收";
+	}
+	if (status_text == "waiting for next transfer") {
+		return "等待下一次传输";
 	}
 	if (status_text == "send completed") {
 		return "发送完成";
@@ -131,6 +138,80 @@ std::string trim_ascii(std::string value) {
 	return value;
 }
 
+int hex_value(char ch) {
+	if (ch >= '0' && ch <= '9') {
+		return ch - '0';
+	}
+	if (ch >= 'a' && ch <= 'f') {
+		return 10 + (ch - 'a');
+	}
+	if (ch >= 'A' && ch <= 'F') {
+		return 10 + (ch - 'A');
+	}
+	return -1;
+}
+
+std::string decode_uri_component(std::string_view text) {
+	std::string decoded;
+	decoded.reserve(text.size());
+	for (std::size_t index = 0; index < text.size(); ++index) {
+		if (text[index] == '%' && index + 2 < text.size()) {
+			const auto hi = hex_value(text[index + 1]);
+			const auto lo = hex_value(text[index + 2]);
+			if (hi >= 0 && lo >= 0) {
+				decoded.push_back(static_cast<char>((hi << 4) | lo));
+				index += 2;
+				continue;
+			}
+		}
+		decoded.push_back(text[index]);
+	}
+	return decoded;
+}
+
+std::filesystem::path normalize_dropped_path(std::string text) {
+	text = trim_ascii(std::move(text));
+	text.erase(std::remove(text.begin(), text.end(), '\0'), text.end());
+	text = trim_ascii(std::move(text));
+	if (text.empty()) {
+		return {};
+	}
+	if (text.front() == '#' && text.find("://") == std::string::npos) {
+		return {};
+	}
+	if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
+		text = text.substr(1, text.size() - 2);
+	}
+	if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+		text = text.substr(1, text.size() - 2);
+	}
+
+	const auto scheme_sep = text.find("://");
+	if (scheme_sep == std::string::npos) {
+		return std::filesystem::path(text);
+	}
+
+	auto scheme = text.substr(0, scheme_sep);
+	for (char& ch : scheme) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	if (scheme != "file" && scheme != "computer") {
+		return std::filesystem::path(text);
+	}
+
+	auto location = decode_uri_component(text.substr(scheme_sep + 3));
+	if (location.rfind("localhost/", 0) == 0 || location.rfind("localhost\\", 0) == 0) {
+		location.erase(0, 10);
+	}
+	if (!location.empty() && location.front() == '/' && location.size() >= 3
+		&& std::isalpha(static_cast<unsigned char>(location[1])) && location[2] == ':') {
+		location.erase(0, 1);
+	} else if (!location.empty() && location.front() != '/' && !(location.size() >= 2 && location[1] == ':')) {
+		location = std::string("\\\\") + location;
+	}
+	return std::filesystem::path(location);
+}
+
 std::vector<std::filesystem::path> parse_dropped_paths(std::string_view raw_text) {
 	std::vector<std::filesystem::path> paths;
 	std::size_t offset = 0;
@@ -140,9 +221,9 @@ std::vector<std::filesystem::path> parse_dropped_paths(std::string_view raw_text
 		if (!piece.empty() && piece.back() == '\r') {
 			piece.remove_suffix(1);
 		}
-		auto text = trim_ascii(std::string(piece));
-		if (!text.empty()) {
-			paths.emplace_back(std::move(text));
+		auto path = normalize_dropped_path(std::string(piece));
+		if (!path.empty()) {
+			paths.push_back(std::move(path));
 		}
 		if (next == std::string_view::npos) {
 			break;
@@ -181,6 +262,14 @@ public:
 	void set_message(std::string message) {
 		copy_label(message.c_str());
 		redraw();
+	}
+
+	bool accepting() const {
+		return accepting_;
+	}
+
+	bool contains_point(int px, int py) const {
+		return visible() && px >= x() && px < x() + w() && py >= y() && py < y() + h();
 	}
 
 	int handle(int event) override {
@@ -280,6 +369,7 @@ public:
 		drop_target_->set_drop_handler([this](std::vector<std::filesystem::path> paths) {
 			handle_drop(std::move(paths));
 		});
+		copy_address_button_->callback(copy_address_callback, this);
 		connect_button_->callback(connect_callback, this);
 		receive_input_->when(FL_WHEN_ENTER_KEY_ALWAYS);
 		receive_input_->callback(connect_callback, this);
@@ -311,18 +401,58 @@ public:
 		send_server_.stop();
 	}
 
+	int handle(int event) override {
+		switch (event) {
+		case FL_DND_ENTER:
+		case FL_DND_DRAG:
+			if (route_drop_target_event(event)) {
+				return 1;
+			}
+			break;
+		case FL_DND_RELEASE:
+			if (route_drop_target_event(event)) {
+				awaiting_drop_paste_ = true;
+				return 1;
+			}
+			awaiting_drop_paste_ = false;
+			break;
+		case FL_DND_LEAVE:
+			awaiting_drop_paste_ = false;
+			if (dnd_over_drop_target_) {
+				dnd_over_drop_target_ = false;
+				return drop_target_->handle(FL_DND_LEAVE);
+			}
+			break;
+		case FL_PASTE:
+			if (awaiting_drop_paste_ || dnd_over_drop_target_) {
+				awaiting_drop_paste_ = false;
+				dnd_over_drop_target_ = false;
+				return drop_target_->handle(FL_PASTE);
+			}
+			break;
+		default:
+			break;
+		}
+		return Fl_Double_Window::handle(event);
+	}
+
 private:
 	void build_send_tab() {
 		send_group_ = new Fl_Group(22, 96, 936, 224, "发送");
-		send_intro_box_ = new Fl_Box(38, 124, 900, 24, "先复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
+		send_intro_box_ = new Fl_Box(38, 124, 900, 24, "先选择并复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
 		send_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 		send_intro_box_->labelsize(15);
-		send_address_title_box_ = new Fl_Box(38, 160, 900, 24, "复制发送链接");
+		send_address_title_box_ = new Fl_Box(38, 160, 900, 24, "选择发送链接");
 		send_address_title_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 		send_address_title_box_->labelfont(FL_HELVETICA_BOLD);
 		send_address_title_box_->labelsize(16);
-		send_address_scroll_ = new Fl_Scroll(38, 194, 900, 106);
-		send_empty_box_ = new Fl_Box(50, 204, 876, 88, "正在准备发送地址...");
+		send_address_choice_ = new Fl_Choice(38, 194, 742, 36);
+		send_address_choice_->textsize(15);
+		send_address_choice_->down_box(FL_BORDER_BOX);
+		copy_address_button_ = new Fl_Button(796, 194, 142, 36, "复制链接");
+		copy_address_button_->color(fl_rgb_color(233, 226, 214));
+		copy_address_button_->selection_color(fl_rgb_color(212, 169, 92));
+		send_empty_box_ = new Fl_Box(38, 244, 900, 56, "正在准备发送地址...");
 		send_empty_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
 		send_empty_box_->labelsize(14);
 		drop_target_ = new DropTargetBox(38, 194, 900, 106);
@@ -363,9 +493,14 @@ private:
 		static_cast<AppWindow*>(context)->update_ui();
 	}
 
-	static void copy_address_callback(Fl_Widget* widget, void* context) {
+	static void copy_address_callback(Fl_Widget*, void* context) {
 		auto* self = static_cast<AppWindow*>(context);
-		write_clipboard_text(widget->label());
+		const auto selected_url = self->selected_send_address_url();
+		if (!selected_url) {
+			self->set_transient_status("当前没有可复制的发送链接");
+			return;
+		}
+		write_clipboard_text(*selected_url);
 		self->set_transient_status("链接已复制到剪贴板");
 	}
 
@@ -448,7 +583,8 @@ private:
 		}
 
 		const auto send_snapshot = send_server_.snapshot();
-		const bool active_transfer = send_snapshot.receiver_connected || send_snapshot.transfer_in_progress || is_receive_session_active();
+		const auto receive_snapshot = receive_progress_->snapshot();
+		const bool active_transfer = send_snapshot.transfer_in_progress || (is_receive_session_active() && receive_snapshot.status_text == "receiving");
 		if (active_transfer) {
 			const auto choice = fl_choice("传输或连接仍在进行，要停止吗？", "否", "是", nullptr);
 			if (choice != kStopTransferChoice) {
@@ -462,24 +598,34 @@ private:
 		hide();
 	}
 
-	void rebuild_address_buttons() {
-		for (auto* button : address_buttons_) {
-			send_address_scroll_->remove(button);
-			delete button;
+	std::optional<std::string> selected_send_address_url() const {
+		if (send_address_choice_ == nullptr) {
+			return std::nullopt;
 		}
-		address_buttons_.clear();
+		const auto selected_index = send_address_choice_->value();
+		if (selected_index < 0 || static_cast<std::size_t>(selected_index) >= addresses_.size()) {
+			return std::nullopt;
+		}
+		return addresses_[static_cast<std::size_t>(selected_index)].url;
+	}
 
-		int y = 8;
-		for (const auto& address : addresses_) {
-			auto* button = new Fl_Button(send_address_scroll_->x() + 8, send_address_scroll_->y() + y, send_address_scroll_->w() - 24, 34, address.url.c_str());
-			button->callback(copy_address_callback, this);
-			button->color(fl_rgb_color(233, 226, 214));
-			button->selection_color(fl_rgb_color(212, 169, 92));
-			send_address_scroll_->add(button);
-			address_buttons_.push_back(button);
-			y += 42;
+	void rebuild_address_choice(std::string_view preferred_url = {}) {
+		send_address_choice_->clear();
+
+		int selected_index = -1;
+		for (std::size_t index = 0; index < addresses_.size(); ++index) {
+			send_address_choice_->add(addresses_[index].url.c_str());
+			if (!preferred_url.empty() && addresses_[index].url == preferred_url) {
+				selected_index = static_cast<int>(index);
+			}
 		}
-		send_address_scroll_->redraw();
+		if (selected_index < 0 && !addresses_.empty()) {
+			selected_index = 0;
+		}
+		if (selected_index >= 0) {
+			send_address_choice_->value(selected_index);
+		}
+		send_address_choice_->redraw();
 	}
 
 	void update_send_addresses(std::uint16_t port) {
@@ -488,17 +634,34 @@ private:
 		}
 		address_port_ = port;
 		try {
+			const auto selected_url = selected_send_address_url();
 			addresses_ = enumerate_shareable_addresses(port);
-			rebuild_address_buttons();
+			rebuild_address_choice(selected_url.value_or(""));
 		} catch (const std::exception& error) {
 			send_progress_->set_failed(error.what());
 		}
 	}
 
+	bool route_drop_target_event(int event) {
+		if (drop_target_ == nullptr || !drop_target_->visible() || !drop_target_->accepting()) {
+			return false;
+		}
+		if (!drop_target_->contains_point(Fl::event_x(), Fl::event_y())) {
+			if (dnd_over_drop_target_) {
+				dnd_over_drop_target_ = false;
+				drop_target_->handle(FL_DND_LEAVE);
+			}
+			return false;
+		}
+		dnd_over_drop_target_ = true;
+		return drop_target_->handle(event) != 0;
+	}
+
 	void update_send_controls(const GuiSendServerSnapshot& snapshot) {
 		if (snapshot.receiver_connected) {
 			send_address_title_box_->hide();
-			send_address_scroll_->hide();
+			send_address_choice_->hide();
+			copy_address_button_->hide();
 			send_empty_box_->hide();
 			drop_target_->show();
 			if (snapshot.transfer_in_progress) {
@@ -514,19 +677,22 @@ private:
 		drop_target_->hide();
 		send_address_title_box_->show();
 		if (snapshot.bound_port == 0) {
-			send_address_scroll_->hide();
+			send_address_choice_->hide();
+			copy_address_button_->hide();
 			send_empty_box_->show();
 			send_empty_box_->copy_label("正在准备发送地址...");
 			return;
 		}
 		if (addresses_.empty()) {
-			send_address_scroll_->hide();
+			send_address_choice_->hide();
+			copy_address_button_->hide();
 			send_empty_box_->show();
 			send_empty_box_->copy_label("暂未找到可分享的非虚拟网卡地址。\n\n如果你刚切换网络，请稍后再试。\n接收端连入后，这里会自动切换为拖放框。");
 			return;
 		}
 		send_empty_box_->hide();
-		send_address_scroll_->show();
+		send_address_choice_->show();
+		copy_address_button_->show();
 	}
 
 	void update_receive_controls() {
@@ -594,7 +760,7 @@ private:
 			detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    接收端已连入，可等待拖放开始发送").c_str());
 			return;
 		}
-		detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    复制任一链接给接收端").c_str());
+		detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    复制当前所选链接给接收端").c_str());
 	}
 
 	void update_summary_boxes(const TransferProgressSnapshot& snapshot, const ProgressViewState& state, bool receive_selected, std::chrono::steady_clock::time_point now) {
@@ -650,10 +816,11 @@ private:
 	std::atomic<bool> receive_session_finished_{true};
 	std::uint16_t address_port_ = 0;
 	std::vector<InterfaceAddress> addresses_;
-	std::vector<Fl_Button*> address_buttons_;
 	ProgressViewState send_view_state_;
 	ProgressViewState receive_view_state_;
 	bool close_requested_ = false;
+	bool dnd_over_drop_target_ = false;
+	bool awaiting_drop_paste_ = false;
 	std::string transient_status_;
 	std::chrono::steady_clock::time_point transient_status_until_{};
 
@@ -663,7 +830,8 @@ private:
 	Fl_Group* receive_group_ = nullptr;
 	Fl_Box* send_intro_box_ = nullptr;
 	Fl_Box* send_address_title_box_ = nullptr;
-	Fl_Scroll* send_address_scroll_ = nullptr;
+	Fl_Choice* send_address_choice_ = nullptr;
+	Fl_Button* copy_address_button_ = nullptr;
 	Fl_Box* send_empty_box_ = nullptr;
 	DropTargetBox* drop_target_ = nullptr;
 	Fl_Box* receive_intro_box_ = nullptr;

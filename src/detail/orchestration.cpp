@@ -575,6 +575,10 @@ asio::awaitable<void> receive_directory_task(
 				set_progress_status(progress, "waiting for next transfer");
 			}
 			if (!source.await_transport_begin()) {
+				if (keep_connection_open) {
+					set_progress_status(progress, "waiting");
+					break;
+				}
 				if (!received_any_transport) {
 					throw std::runtime_error("sender closed websocket before starting transport");
 				}
