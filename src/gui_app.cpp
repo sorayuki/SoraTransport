@@ -169,6 +169,18 @@ std::string decode_uri_component(std::string_view text) {
 	return decoded;
 }
 
+std::string escape_choice_label(std::string_view label) {
+	std::string escaped;
+	escaped.reserve(label.size() * 2);
+	for (const char ch : label) {
+		if (ch == '\\' || ch == '/') {
+			escaped.push_back('\\');
+		}
+		escaped.push_back(ch);
+	}
+	return escaped;
+}
+
 std::filesystem::path normalize_dropped_path(std::string text) {
 	text = trim_ascii(std::move(text));
 	text.erase(std::remove(text.begin(), text.end(), '\0'), text.end());
@@ -520,6 +532,16 @@ private:
 		}
 	}
 
+	void maybe_finish_close_request() {
+		if (!close_requested_) {
+			return;
+		}
+		cleanup_finished_receive_session();
+		if (!receive_thread_.joinable()) {
+			hide();
+		}
+	}
+
 	bool is_receive_session_active() const {
 		return receive_thread_.joinable() && !receive_session_finished_.load(std::memory_order_acquire);
 	}
@@ -593,8 +615,12 @@ private:
 		}
 
 		close_requested_ = true;
-		stop_receive_session(true);
+		stop_receive_session(false);
 		send_server_.stop();
+		if (receive_thread_.joinable()) {
+			set_transient_status("正在停止接收，请稍候");
+			return;
+		}
 		hide();
 	}
 
@@ -614,7 +640,8 @@ private:
 
 		int selected_index = -1;
 		for (std::size_t index = 0; index < addresses_.size(); ++index) {
-			send_address_choice_->add(addresses_[index].url.c_str());
+			auto escaped_label = escape_choice_label(addresses_[index].url);
+			send_address_choice_->add(escaped_label.c_str());
 			if (!preferred_url.empty() && addresses_[index].url == preferred_url) {
 				selected_index = static_cast<int>(index);
 			}
@@ -786,6 +813,7 @@ private:
 
 	void update_ui() {
 		cleanup_finished_receive_session();
+		maybe_finish_close_request();
 
 		const auto now = std::chrono::steady_clock::now();
 		const auto send_snapshot = send_server_.snapshot();
