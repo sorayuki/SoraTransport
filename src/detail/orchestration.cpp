@@ -21,6 +21,7 @@
 #include <stop_token>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace asio = boost::asio;
@@ -33,6 +34,7 @@ constexpr std::size_t kPipelineChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kOpenedQueueDepth = 32;
 constexpr std::size_t kPrefetchQueueDepth = 64;
 constexpr int kDefaultCompressionLevel = 3;
+constexpr auto kStopWaitPollInterval = std::chrono::milliseconds(50);
 
 std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
 	if (error.category() == boost::system::system_category()) {
@@ -53,18 +55,26 @@ void close_transport_socket(TransportWebSocket& websocket) {
 }
 
 template <typename Rep, typename Period>
-bool wait_for_stop_or_timeout(std::stop_token stop_token, std::chrono::duration<Rep, Period> timeout) {
-	std::mutex mutex;
-	std::condition_variable cv;
-	std::atomic<bool> stop_requested{false};
-	std::stop_callback on_stop(stop_token, [&] {
-		stop_requested.store(true, std::memory_order_release);
-		cv.notify_all();
-	});
-	std::unique_lock lock(mutex);
-	return cv.wait_for(lock, timeout, [&] {
-		return stop_requested.load(std::memory_order_acquire);
-	});
+bool wait_for_stop_or_timeout(
+	std::stop_token stop_token,
+	const CancelEvent* cancel_event,
+	std::chrono::duration<Rep, Period> timeout) {
+	if (stop_token.stop_requested() || (cancel_event != nullptr && cancel_event->is_cancelled())) {
+		return true;
+	}
+
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	const auto poll_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(kStopWaitPollInterval);
+	for (;;) {
+		if (stop_token.stop_requested() || (cancel_event != nullptr && cancel_event->is_cancelled())) {
+			return true;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return false;
+		}
+		std::this_thread::sleep_for(std::min(deadline - now, poll_interval));
+	}
 }
 
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
@@ -155,12 +165,15 @@ void finalize_progress_line() {
 	std::cerr << '\n' << std::flush;
 }
 
-std::jthread start_progress_thread(std::function<std::string(std::uint64_t)> build_line, std::atomic<std::uint64_t>& processed_bytes) {
-	return std::jthread([build_line = std::move(build_line), &processed_bytes](std::stop_token stop_token) {
+std::jthread start_progress_thread(
+	std::function<std::string(std::uint64_t)> build_line,
+	std::atomic<std::uint64_t>& processed_bytes,
+	const CancelEvent* cancel_event = nullptr) {
+	return std::jthread([build_line = std::move(build_line), &processed_bytes, cancel_event](std::stop_token stop_token) {
 		using namespace std::chrono_literals;
 		std::uint64_t previous = processed_bytes.load(std::memory_order_relaxed);
 		while (!stop_token.stop_requested()) {
-			if (wait_for_stop_or_timeout(stop_token, 1s)) {
+			if (wait_for_stop_or_timeout(stop_token, cancel_event, 1s)) {
 				break;
 			}
 			const auto current = processed_bytes.load(std::memory_order_relaxed);
@@ -171,7 +184,7 @@ std::jthread start_progress_thread(std::function<std::string(std::uint64_t)> bui
 	});
 }
 
-void join_and_capture(std::jthread& thread, PipelineState& state) {
+void join_and_capture(std::jthread& thread, PipelineState& state, std::string_view = {}) {
 	try {
 		if (thread.joinable()) {
 			thread.join();
@@ -208,13 +221,14 @@ void complete_progress(
 std::jthread start_progress_sync_thread(
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint64_t>& processed_bytes,
-	std::atomic<std::uint64_t>& processed_files) {
-	return std::jthread([progress, &processed_bytes, &processed_files](std::stop_token stop_token) {
+	std::atomic<std::uint64_t>& processed_files,
+	const CancelEvent* cancel_event = nullptr) {
+	return std::jthread([progress, &processed_bytes, &processed_files, cancel_event](std::stop_token stop_token) {
 		using namespace std::chrono_literals;
 		std::uint64_t previous_bytes = 0;
 		std::uint64_t previous_files = 0;
 		while (!stop_token.stop_requested()) {
-			if (wait_for_stop_or_timeout(stop_token, 250ms)) {
+			if (wait_for_stop_or_timeout(stop_token, cancel_event, 250ms)) {
 				break;
 			}
 			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
@@ -404,7 +418,7 @@ void receive_transport_from_source(
 		config.max_in_flight_write_ops,
 		config.max_parallel_extract_files);
 	print_receive_progress_legend();
-	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed, &cancel_event);
 
 	auto progress_thread = start_progress_thread(
 		[&](std::uint64_t bytes_per_second) {
@@ -415,7 +429,8 @@ void receive_transport_from_source(
 				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&cancel_event);
 
 	std::jthread input_thread([&] {
 		try {
@@ -436,8 +451,8 @@ void receive_transport_from_source(
 		}
 	});
 
-	join_and_capture(input_thread, state);
-	join_and_capture(unpacker_thread, state);
+	join_and_capture(input_thread, state, "receive input thread");
+	join_and_capture(unpacker_thread, state, "receive unpacker thread");
 	progress_thread.request_stop();
 	if (progress_thread.joinable()) {
 		progress_thread.join();
@@ -492,7 +507,7 @@ asio::awaitable<void> listen_directory_task(
 		PipelineState state;
 		std::atomic<int> active_compression_level{compression_level};
 		print_listen_progress_legend();
-		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed, &cancel_event);
 
 		auto progress_thread = start_progress_thread(
 			[&](std::uint64_t bytes_per_second) {
@@ -508,7 +523,8 @@ asio::awaitable<void> listen_directory_task(
 					<< '/' << format_scaled_bytes(read_budget->max_bytes(), "");
 				return out.str();
 			},
-			uncompressed_bytes_processed);
+			uncompressed_bytes_processed,
+			&cancel_event);
 
 		auto scanner_future = asio::co_spawn(executors.executor(), scanner.scan(source_dir, opened_queue), asio::use_future);
 		auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
@@ -694,7 +710,8 @@ void pack_directory_to_file(const std::filesystem::path& source_dir, const std::
 				<< '/' << format_scaled_bytes(read_budget->max_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&effective_cancel_event);
 
 	FileByteSink sink(output_file, config.max_in_flight_write_ops);
 	sink.listenCancelSignal(effective_cancel_event);
@@ -812,7 +829,8 @@ void unpack_file_to_directory(const std::filesystem::path& input_file, const std
 				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
 			return out.str();
 		},
-		uncompressed_bytes_processed);
+		uncompressed_bytes_processed,
+		&effective_cancel_event);
 
 	std::jthread input_thread([&] {
 		try {

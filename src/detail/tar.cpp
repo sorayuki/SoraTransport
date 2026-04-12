@@ -507,7 +507,7 @@ void write_small_extracted_file(
 class ExtractFileWriter {
 public:
 	ExtractFileWriter(const std::filesystem::path& output_path, std::size_t max_in_flight_write_ops)
-		: state_(std::make_unique<State>()) {
+		: state_(std::make_shared<State>()) {
 		state_->display_path = path_to_utf8_string(output_path);
 		state_->max_in_flight_write_ops = std::max<std::size_t>(1, max_in_flight_write_ops);
 		state_->handle = ::CreateFileW(
@@ -523,15 +523,13 @@ public:
 		}
 
 		state_->write_buffer_capacity = kBufferedExtractWriteBatchSize;
-		state_->write_slots.reserve(state_->max_in_flight_write_ops + 1);
 		for (std::size_t index = 0; index < state_->max_in_flight_write_ops + 1; ++index) {
-			state_->write_slots.emplace_back();
-			state_->write_slots.back().buffer = make_heap_buffer(state_->write_buffer_capacity);
+			auto request = std::make_shared<WriteRequest>();
+			request->reusable = true;
+			request->buffer = make_heap_buffer(state_->write_buffer_capacity);
+			state_->available_writes.push_back(std::move(request));
 		}
-		state_->active_slot_index = 0;
-		for (std::size_t index = 1; index < state_->write_slots.size(); ++index) {
-			state_->available_slots.push_back(index);
-		}
+		state_->active_write = take_available_write(state_);
 	}
 
 	~ExtractFileWriter() {
@@ -542,266 +540,345 @@ public:
 	ExtractFileWriter& operator=(const ExtractFileWriter&) = delete;
 
 	void listenCancelSignal(CancelEvent& event) {
-		if (!state_) {
+		auto state = state_;
+		if (!state) {
 			return;
 		}
-		state_->cancel_connection = event.connect([this] {
-			cancel_pending_work();
+		std::weak_ptr<State> weak_state(state);
+		state->cancel_connection = event.connect([weak_state] {
+			if (auto locked_state = weak_state.lock()) {
+				request_cancel(locked_state);
+			}
 		});
 	}
 
 	void write(ExtractWriteChunk chunk) {
-		if (!state_ || state_->closed || state_->handle == INVALID_HANDLE_VALUE) {
+		auto state = state_;
+		if (!state || state->closed || state->handle == INVALID_HANDLE_VALUE) {
 			throw std::runtime_error("extracted output file is closed");
 		}
-		if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		if (state->cancel_requested.load(std::memory_order_acquire)) {
 			throw CancelledError("extracted output file write cancelled");
 		}
 		if (chunk.chunk.length == 0) {
 			return;
 		}
 
-		if (chunk.chunk.length > state_->write_buffer_capacity) {
+		if (chunk.chunk.length > state->write_buffer_capacity) {
 			submit_active_write();
-			write_large_chunk_directly(std::move(chunk));
+			submit_direct_write(std::move(chunk));
 			return;
 		}
 
 		const auto now = std::chrono::steady_clock::now();
-		auto& active_slot = state_->write_slots[state_->active_slot_index];
-		if (active_slot.size != 0) {
-			const bool non_contiguous = chunk.chunk.offset != active_slot.offset + active_slot.size;
-			const bool capacity_reached = active_slot.size + chunk.chunk.length > state_->write_buffer_capacity;
-			const bool delay_reached = state_->fill_started_at.has_value()
-				&& now - *state_->fill_started_at >= kBufferedExtractWriteMaxDelay;
+		auto request = ensure_active_write(state);
+		if (request->size != 0) {
+			const bool non_contiguous = chunk.chunk.offset != request->offset + request->size;
+			const bool capacity_reached = request->size + chunk.chunk.length > state->write_buffer_capacity;
+			const bool delay_reached = state->fill_started_at.has_value()
+				&& now - *state->fill_started_at >= kBufferedExtractWriteMaxDelay;
 			if (non_contiguous || capacity_reached || delay_reached) {
 				submit_active_write();
+				request = ensure_active_write(state);
 			}
 		}
 
-		auto& current_slot = state_->write_slots[state_->active_slot_index];
-		if (current_slot.size == 0) {
-			current_slot.offset = chunk.chunk.offset;
-			state_->fill_started_at = now;
+		if (request->size == 0) {
+			request->offset = chunk.chunk.offset;
+			state->fill_started_at = now;
 		}
-		std::memcpy(current_slot.buffer.get() + current_slot.size, chunk.chunk.data.get(), chunk.chunk.length);
-		current_slot.size += chunk.chunk.length;
-		current_slot.write_budget_leases.push_back(std::move(chunk.write_budget_lease));
-		if (current_slot.size == state_->write_buffer_capacity) {
+		std::memcpy(request->buffer.get() + request->size, chunk.chunk.data.get(), chunk.chunk.length);
+		request->size += chunk.chunk.length;
+		request->write_budget_leases.push_back(std::move(chunk.write_budget_lease));
+		if (request->size == state->write_buffer_capacity) {
 			submit_active_write();
 		}
 	}
 
 	void close(const RestorableMetadata& metadata) {
-		if (!state_ || state_->closed) {
+		auto state = state_;
+		if (!state || state->closed) {
+			state_.reset();
 			return;
 		}
-		submit_active_write();
-		wait_for_all_writes();
-		state_->closed = true;
-		apply_timestamps_to_handle_if_present(state_->handle, metadata, state_->display_path);
-		if (!::CloseHandle(state_->handle)) {
-			state_->handle = INVALID_HANDLE_VALUE;
-			throw make_win32_error("failed to close extracted output file: " + state_->display_path);
+		try {
+			submit_active_write();
+			wait_for_all_writes(state, true);
+			if (state->cancel_requested.load(std::memory_order_acquire)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			state->closed = true;
+			apply_timestamps_to_handle_if_present(state->handle, metadata, state->display_path);
+			if (!::CloseHandle(state->handle)) {
+				state->handle = INVALID_HANDLE_VALUE;
+				throw make_win32_error("failed to close extracted output file: " + state->display_path);
+			}
+			state->handle = INVALID_HANDLE_VALUE;
+			state->cancel_connection.disconnect();
+			state_.reset();
+		} catch (...) {
+			state_.reset();
+			abandon_state(std::move(state));
+			throw;
 		}
-		state_->handle = INVALID_HANDLE_VALUE;
 	}
 
 	void cancel_pending_work() {
-		if (!state_) {
+		auto state = state_;
+		if (!state) {
 			return;
 		}
-		state_->cancel_requested.store(true, std::memory_order_release);
-		if (state_->handle != INVALID_HANDLE_VALUE) {
-			::CancelIoEx(state_->handle, nullptr);
-		}
+		request_cancel(state);
 	}
 
 private:
-	struct State {
-		struct WriteSlot : OverlappedSlotBase {
-			std::size_t size = 0;
-			std::uint64_t offset = 0;
-			std::vector<WriteBudgetLease> write_budget_leases;
-		};
+	struct WriteRequest : OverlappedSlotBase {
+		std::size_t size = 0;
+		std::uint64_t offset = 0;
+		std::vector<WriteBudgetLease> write_budget_leases;
+		bool reusable = false;
+	};
+
+	struct State : std::enable_shared_from_this<State> {
 
 		HANDLE handle = INVALID_HANDLE_VALUE;
 		std::string display_path;
 		bool closed = false;
 		std::size_t write_buffer_capacity = 0;
 		std::size_t max_in_flight_write_ops = 1;
-		std::vector<WriteSlot> write_slots;
-		std::deque<std::size_t> available_slots;
-		std::deque<std::size_t> in_flight_slots;
-		std::size_t active_slot_index = 0;
+		std::deque<std::shared_ptr<WriteRequest>> available_writes;
+		std::deque<std::shared_ptr<WriteRequest>> in_flight_writes;
+		std::shared_ptr<WriteRequest> active_write;
 		std::optional<std::chrono::steady_clock::time_point> fill_started_at;
 		std::atomic<bool> cancel_requested{false};
+		std::atomic<bool> detached_cleanup_started{false};
 		boost::signals2::scoped_connection cancel_connection;
 	};
 
-	void stop() noexcept {
-		if (!state_) {
+	static void request_cancel(const std::shared_ptr<State>& state) {
+		if (state->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
 			return;
 		}
-		cancel_pending_work();
-		try {
-			wait_for_all_writes();
-		} catch (...) {
+		if (state->handle != INVALID_HANDLE_VALUE) {
+			::CancelIoEx(state->handle, nullptr);
 		}
-		if (state_->handle != INVALID_HANDLE_VALUE) {
-			::CloseHandle(state_->handle);
-			state_->handle = INVALID_HANDLE_VALUE;
+	}
+
+	static void close_handle(const std::shared_ptr<State>& state) noexcept {
+		state->cancel_connection.disconnect();
+		if (state->handle != INVALID_HANDLE_VALUE) {
+			::CloseHandle(state->handle);
+			state->handle = INVALID_HANDLE_VALUE;
 		}
+	}
+
+	static void reset_request(const std::shared_ptr<WriteRequest>& request) {
+		request->size = 0;
+		request->offset = 0;
+		request->write_budget_leases.clear();
+		request->in_flight = false;
+		request->overlapped = {};
+		request->overlapped.hEvent = request->event_handle;
+	}
+
+	static void recycle_request(const std::shared_ptr<State>& state, const std::shared_ptr<WriteRequest>& request) {
+		reset_request(request);
+		if (request->reusable && !state->cancel_requested.load(std::memory_order_acquire) && state->handle != INVALID_HANDLE_VALUE) {
+			state->available_writes.push_back(request);
+		} else if (!request->reusable) {
+			request->buffer.reset();
+		}
+	}
+
+	static void discard_pending_requests(const std::shared_ptr<State>& state) {
+		if (state->active_write) {
+			reset_request(state->active_write);
+			state->active_write.reset();
+		}
+		for (auto& request : state->available_writes) {
+			reset_request(request);
+		}
+		state->available_writes.clear();
+		state->fill_started_at.reset();
+	}
+
+	static std::shared_ptr<WriteRequest> take_available_write(const std::shared_ptr<State>& state) {
+		if (state->available_writes.empty()) {
+			return nullptr;
+		}
+		auto request = state->available_writes.front();
+		state->available_writes.pop_front();
+		reset_request(request);
+		return request;
+	}
+
+	std::shared_ptr<WriteRequest> ensure_active_write(const std::shared_ptr<State>& state) {
+		if (state->active_write) {
+			return state->active_write;
+		}
+		while (state->available_writes.empty()) {
+			if (state->cancel_requested.load(std::memory_order_acquire)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			if (state->in_flight_writes.empty()) {
+				throw std::runtime_error("no extracted file write request available");
+			}
+			wait_for_one_write(state, true);
+		}
+		state->active_write = take_available_write(state);
+		return state->active_write;
+	}
+
+	static void issue_write(const std::shared_ptr<State>& state, const std::shared_ptr<WriteRequest>& request) {
+		request->overlapped = {};
+		request->overlapped.Offset = static_cast<DWORD>(request->offset & 0xffffffffull);
+		request->overlapped.OffsetHigh = static_cast<DWORD>((request->offset >> 32) & 0xffffffffull);
+		request->overlapped.hEvent = request->event_handle;
+		::ResetEvent(request->event_handle);
+
+		const auto ok = ::WriteFile(
+			state->handle,
+			request->buffer.get(),
+			static_cast<DWORD>(request->size),
+			nullptr,
+			&request->overlapped);
+		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+			const auto error = ::GetLastError();
+			reset_request(request);
+			if (!request->reusable) {
+				request->buffer.reset();
+			}
+			if (state->cancel_requested.load(std::memory_order_acquire)
+				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			throw make_win32_error("failed to write extracted output file: " + state->display_path, error);
+		}
+		request->in_flight = true;
+	}
+
+	void stop() noexcept {
+		auto state = std::move(state_);
+		if (!state) {
+			return;
+		}
+		abandon_state(std::move(state));
+	}
+
+	void abandon_state(std::shared_ptr<State> state) noexcept {
+		request_cancel(state);
+		discard_pending_requests(state);
+		if (state->detached_cleanup_started.exchange(true, std::memory_order_acq_rel)) {
+			return;
+		}
+		if (state->in_flight_writes.empty()) {
+			close_handle(state);
+			return;
+		}
+		std::thread([state = std::move(state)]() mutable {
+			try {
+				wait_for_all_writes(state, false);
+			} catch (...) {
+			}
+			close_handle(state);
+		}).detach();
 	}
 
 	void submit_active_write() {
-		if (!state_) {
+		auto state = state_;
+		if (!state) {
 			return;
 		}
-		if (state_->cancel_requested.load(std::memory_order_acquire)) {
+		if (state->cancel_requested.load(std::memory_order_acquire)) {
 			throw CancelledError("extracted output file write cancelled");
 		}
 
-		auto& slot = state_->write_slots[state_->active_slot_index];
-		if (slot.size == 0) {
-			return;
-		}
-		if (slot.in_flight) {
-			throw std::runtime_error("extracted file write slot is unexpectedly still in flight");
-		}
-
-		if (state_->in_flight_slots.size() >= state_->max_in_flight_write_ops) {
-			wait_for_one_write();
-		}
-
-		slot.overlapped = {};
-		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
-		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
-		slot.overlapped.hEvent = slot.event_handle;
-		::ResetEvent(slot.event_handle);
-
-		const auto ok = ::WriteFile(
-			state_->handle,
-			slot.buffer.get(),
-			static_cast<DWORD>(slot.size),
-			nullptr,
-			&slot.overlapped);
-		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
-			const auto error = ::GetLastError();
-			slot.size = 0;
-			slot.offset = 0;
-			slot.write_budget_leases.clear();
-			if (state_->cancel_requested.load(std::memory_order_acquire)
-				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
-				throw CancelledError("extracted output file write cancelled");
-			}
-			throw make_win32_error("failed to write extracted output file: " + state_->display_path, error);
-		}
-
-		slot.in_flight = true;
-		state_->in_flight_slots.push_back(state_->active_slot_index);
-
-		if (state_->available_slots.empty()) {
-			wait_for_one_write();
-		}
-		if (state_->available_slots.empty()) {
-			throw std::runtime_error("no extracted file write slot available after waiting for completion");
-		}
-
-		state_->active_slot_index = state_->available_slots.front();
-		state_->available_slots.pop_front();
-		state_->write_slots[state_->active_slot_index].size = 0;
-		state_->write_slots[state_->active_slot_index].offset = 0;
-		state_->write_slots[state_->active_slot_index].write_budget_leases.clear();
-		state_->fill_started_at.reset();
-	}
-
-	void write_large_chunk_directly(ExtractWriteChunk chunk) {
-		wait_for_all_writes();
-
-		OVERLAPPED overlapped{};
-		UniqueWin32Handle event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
-		if (!event.valid()) {
-			throw make_win32_error("failed to create extracted output write event");
-		}
-		overlapped.Offset = static_cast<DWORD>(chunk.chunk.offset & 0xffffffffull);
-		overlapped.OffsetHigh = static_cast<DWORD>((chunk.chunk.offset >> 32) & 0xffffffffull);
-		overlapped.hEvent = event.get();
-
-		const auto ok = ::WriteFile(
-			state_->handle,
-			chunk.chunk.data.get(),
-			static_cast<DWORD>(chunk.chunk.length),
-			nullptr,
-			&overlapped);
-		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
-			const auto error = ::GetLastError();
-			if (state_->cancel_requested.load(std::memory_order_acquire)
-				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
-				throw CancelledError("extracted output file write cancelled");
-			}
-			throw make_win32_error("failed to write extracted output file: " + state_->display_path, error);
-		}
-
-		DWORD bytes_written = 0;
-		if (!::GetOverlappedResult(state_->handle, &overlapped, &bytes_written, TRUE)) {
-			const auto error = ::GetLastError();
-			if (state_->cancel_requested.load(std::memory_order_acquire)
-				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
-				throw CancelledError("extracted output file write cancelled");
-			}
-			throw make_win32_error("failed to complete extracted output write: " + state_->display_path, error);
-		}
-		if (bytes_written != chunk.chunk.length) {
-			throw std::runtime_error("unexpected short write to extracted output file: " + state_->display_path);
-		}
-	}
-
-	void wait_for_one_write() {
-		if (!state_ || state_->in_flight_slots.empty()) {
+		auto request = state->active_write;
+		if (!request || request->size == 0) {
 			return;
 		}
 
-		const auto slot_index = state_->in_flight_slots.front();
-		state_->in_flight_slots.pop_front();
-		auto& slot = state_->write_slots[slot_index];
-		DWORD bytes_written = 0;
-		if (!::GetOverlappedResult(state_->handle, &slot.overlapped, &bytes_written, TRUE)) {
+		if (state->in_flight_writes.size() >= state->max_in_flight_write_ops) {
+			wait_for_one_write(state, true);
+		}
+		if (state->cancel_requested.load(std::memory_order_acquire)) {
+			throw CancelledError("extracted output file write cancelled");
+		}
+
+		issue_write(state, request);
+		state->in_flight_writes.push_back(request);
+		state->active_write.reset();
+		state->fill_started_at.reset();
+	}
+
+	void submit_direct_write(ExtractWriteChunk chunk) {
+		auto state = state_;
+		if (!state) {
+			return;
+		}
+		if (state->in_flight_writes.size() >= state->max_in_flight_write_ops) {
+			wait_for_one_write(state, true);
+		}
+		if (state->cancel_requested.load(std::memory_order_acquire)) {
+			throw CancelledError("extracted output file write cancelled");
+		}
+
+		auto request = std::make_shared<WriteRequest>();
+		request->buffer = std::move(chunk.chunk.data);
+		request->size = chunk.chunk.length;
+		request->offset = chunk.chunk.offset;
+		request->write_budget_leases.push_back(std::move(chunk.write_budget_lease));
+		issue_write(state, request);
+		state->in_flight_writes.push_back(std::move(request));
+	}
+
+		static void wait_for_one_write(const std::shared_ptr<State>& state, bool allow_cancel_detach) {
+		if (!state || state->in_flight_writes.empty()) {
+			return;
+		}
+
+		for (;;) {
+			auto request = state->in_flight_writes.front();
+			DWORD bytes_written = 0;
+			if (::GetOverlappedResult(state->handle, &request->overlapped, &bytes_written, FALSE)) {
+				const auto expected_bytes = request->size;
+				state->in_flight_writes.pop_front();
+				recycle_request(state, request);
+				if (bytes_written != expected_bytes) {
+					throw std::runtime_error("unexpected short write to extracted output file: " + state->display_path);
+				}
+				return;
+			}
+
 			const auto error = ::GetLastError();
-			slot.in_flight = false;
-			slot.size = 0;
-			slot.offset = 0;
-			slot.write_budget_leases.clear();
-			state_->available_slots.push_back(slot_index);
-			if (state_->cancel_requested.load(std::memory_order_acquire)
+			if (error == ERROR_IO_INCOMPLETE) {
+				if (allow_cancel_detach && state->cancel_requested.load(std::memory_order_acquire)) {
+					throw CancelledError("extracted output file write cancelled");
+				}
+				const auto wait_result = ::WaitForSingleObject(request->event_handle, 50);
+				if (wait_result == WAIT_FAILED) {
+					throw make_win32_error("failed to wait for extracted output write event: " + state->display_path);
+				}
+				continue;
+			}
+
+			state->in_flight_writes.pop_front();
+			recycle_request(state, request);
+			if (state->cancel_requested.load(std::memory_order_acquire)
 				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
 				throw CancelledError("extracted output file write cancelled");
 			}
-			throw make_win32_error("failed to complete extracted output write: " + state_->display_path, error);
-		}
-		if (bytes_written != slot.size) {
-			slot.in_flight = false;
-			slot.size = 0;
-			slot.offset = 0;
-			slot.write_budget_leases.clear();
-			state_->available_slots.push_back(slot_index);
-			throw std::runtime_error("unexpected short write to extracted output file: " + state_->display_path);
-		}
-
-		slot.in_flight = false;
-		slot.size = 0;
-		slot.offset = 0;
-		slot.write_budget_leases.clear();
-		state_->available_slots.push_back(slot_index);
+			throw make_win32_error("failed to complete extracted output write: " + state->display_path, error);
+			}
 	}
 
-	void wait_for_all_writes() {
-		while (state_ && !state_->in_flight_slots.empty()) {
-			wait_for_one_write();
+	static void wait_for_all_writes(const std::shared_ptr<State>& state, bool allow_cancel_detach) {
+		while (state && !state->in_flight_writes.empty()) {
+			wait_for_one_write(state, allow_cancel_detach);
 		}
 	}
 
-	std::unique_ptr<State> state_;
+	std::shared_ptr<State> state_;
 };
 
 class ExtractWriteScheduler {
@@ -942,7 +1019,7 @@ public:
 	void wait_for_all_noexcept() noexcept {
 		while (!active_tasks_.empty()) {
 			try {
-				wait_for_any_task();
+				wait_for_any_task(false);
 			} catch (...) {
 			}
 		}
@@ -986,16 +1063,19 @@ private:
 		wait_for_task(found->second);
 	}
 
-	void wait_for_any_task() {
+	void wait_for_any_task(bool allow_cancel = true) {
 		for (;;) {
 			std::uint64_t completed_task_id = 0;
 			{
 				std::unique_lock lock(completed_mutex_);
 				completed_cv_.wait_for(lock, std::chrono::milliseconds(50), [&] {
-					return !completed_task_ids_.empty() || (cancel_event_ != nullptr && cancel_event_->is_cancelled());
+					return !completed_task_ids_.empty()
+						|| (allow_cancel && cancel_event_ != nullptr && cancel_event_->is_cancelled());
 				});
-				throw_if_cancelled(cancel_event_);
 				if (completed_task_ids_.empty()) {
+					if (allow_cancel) {
+						throw_if_cancelled(cancel_event_);
+					}
 					continue;
 				}
 				completed_task_id = completed_task_ids_.front();
@@ -1011,10 +1091,20 @@ private:
 	}
 
 	void wait_for_task(std::list<ActiveFileTask>::iterator task_it) {
-		task_it->future.get();
-		active_tasks_by_id_.erase(task_it->task_id);
-		active_tasks_by_path_.erase(task_it->path_key);
+		const auto task_id = task_it->task_id;
+		const auto path_key = task_it->path_key;
+		std::exception_ptr error;
+		try {
+			task_it->future.get();
+		} catch (...) {
+			error = std::current_exception();
+		}
+		active_tasks_by_id_.erase(task_id);
+		active_tasks_by_path_.erase(path_key);
 		active_tasks_.erase(task_it);
+		if (error) {
+			std::rethrow_exception(error);
+		}
 	}
 
 	std::filesystem::path destination_root_;

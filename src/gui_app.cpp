@@ -615,11 +615,11 @@ private:
 		}
 
 		close_requested_ = true;
-		stop_receive_session(false);
-		send_server_.stop();
+		if (receive_cancel_event_) {
+			receive_cancel_event_->emit();
+		}
 		if (receive_thread_.joinable()) {
-			set_transient_status("正在停止接收，请稍候");
-			return;
+			receive_thread_.request_stop();
 		}
 		hide();
 	}
