@@ -1191,6 +1191,7 @@ struct SocketByteSource::State {
 
 	bool read_next_message(bool& got_text, std::vector<uint8_t>& payload) {
 		boost::beast::flat_buffer input_buffer;
+		input_buffer.reserve(kSocketIoBufferSize);
 		boost::system::error_code error;
 		websocket.read(input_buffer, error);
 		if (error == boost::beast::websocket::error::closed) {
