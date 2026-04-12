@@ -121,7 +121,8 @@ FileByteSource / SocketByteSource
 
 - 通过 libarchive 读取 tar 数据流
 - 负责目录创建、条目恢复和磁盘写入
-- 当前直接使用 `archive_write_disk`
+- 当前使用自定义的 `ExtractWriteScheduler` / `ExtractFileWriter` 负责普通文件落盘，而不是把文件内容直接交给 `archive_write_disk`
+- 解包写盘与输出文件写盘保持同样的思路：优先聚合到批量缓冲，达到容量阈值或时间阈值后再提交写入，避免大量零碎小写请求
 - 解包时会校验条目路径必须是相对路径，防止越界写入目标目录
 
 ## 3. 并发模型
@@ -176,7 +177,9 @@ FileByteSource / SocketByteSource
 ### 5.2 输出路径
 
 - `FileByteSink` 当前固定为 buffered + overlapped 写出
+- 写盘缓冲采用“容量阈值 + 时间阈值”策略：默认聚合到 4 MiB，或在首字节进入缓冲后等待约 100ms 仍未写满时主动提交
 - 通过多写槽和 `max_in_flight_write_ops` 控制在途写请求数
+- 解包落盘也采用同样的批量写思路：小文件同步写和常规 overlapped 写路径都会先做聚合，再按容量或时间阈值落盘
 - 输出侧当前不再暴露 direct write 接口
 
 ### 5.3 网络路径

@@ -99,7 +99,8 @@ std::filesystem::path normalize_relative_path(const std::filesystem::path& input
 }
 
 constexpr std::int64_t kWindowsToUnixEpochOffset100ns = 116444736000000000ll;
-constexpr std::uint64_t kSmallExtractFileThreshold = 256 * 1024;
+constexpr std::size_t kBufferedExtractWriteBatchSize = 4 * 1024 * 1024;
+constexpr auto kBufferedExtractWriteMaxDelay = std::chrono::milliseconds(100);
 
 struct UniqueWin32Handle {
 	explicit UniqueWin32Handle(HANDLE input_handle = INVALID_HANDLE_VALUE) noexcept : handle(input_handle) {}
@@ -452,26 +453,88 @@ void write_small_extracted_file(
 		throw make_win32_error("failed to open extracted output file: " + display_path);
 	}
 
+	auto buffered_output = make_heap_buffer(kBufferedExtractWriteBatchSize);
+	std::vector<WriteBudgetLease> buffered_leases;
+	std::size_t buffered_size = 0;
+	std::uint64_t buffered_offset = 0;
+	std::uint64_t committed_offset = 0;
 	std::uint64_t expected_offset = 0;
+	std::optional<std::chrono::steady_clock::time_point> fill_started_at;
+
+	auto flush_buffer = [&] {
+		if (buffered_size == 0) {
+			return;
+		}
+		if (buffered_offset != committed_offset) {
+			throw std::runtime_error("small extracted file buffered write became non-sequential: " + display_path);
+		}
+		DWORD bytes_written = 0;
+		if (!::WriteFile(
+				handle.get(),
+				buffered_output.get(),
+				static_cast<DWORD>(buffered_size),
+				&bytes_written,
+				nullptr)) {
+			throw make_win32_error("failed to write extracted output file: " + display_path);
+		}
+		if (bytes_written != buffered_size) {
+			throw std::runtime_error("unexpected short write to extracted output file: " + display_path);
+		}
+		committed_offset += buffered_size;
+		buffered_size = 0;
+		buffered_offset = committed_offset;
+		buffered_leases.clear();
+		fill_started_at.reset();
+	};
+
 	while (auto chunk = queue.pop()) {
 		throw_if_cancelled(cancel_event);
 		if (chunk->chunk.offset != expected_offset) {
 			throw std::runtime_error("small extracted file received non-sequential chunks: " + display_path);
 		}
-		DWORD bytes_written = 0;
-		if (!::WriteFile(
-				handle.get(),
-				chunk->chunk.data.get(),
-				static_cast<DWORD>(chunk->chunk.length),
-				&bytes_written,
-				nullptr)) {
-			throw make_win32_error("failed to write extracted output file: " + display_path);
+
+		const auto now = std::chrono::steady_clock::now();
+		if (chunk->chunk.length > kBufferedExtractWriteBatchSize) {
+			flush_buffer();
+			if (chunk->chunk.offset != committed_offset) {
+				throw std::runtime_error("small extracted file oversized chunk became non-sequential: " + display_path);
+			}
+			DWORD bytes_written = 0;
+			if (!::WriteFile(
+					handle.get(),
+					chunk->chunk.data.get(),
+					static_cast<DWORD>(chunk->chunk.length),
+					&bytes_written,
+					nullptr)) {
+				throw make_win32_error("failed to write extracted output file: " + display_path);
+			}
+			if (bytes_written != chunk->chunk.length) {
+				throw std::runtime_error("unexpected short write to extracted output file: " + display_path);
+			}
+			committed_offset += chunk->chunk.length;
+			chunk->write_budget_lease.reset();
+			expected_offset += chunk->chunk.length;
+			continue;
 		}
-		if (bytes_written != chunk->chunk.length) {
-			throw std::runtime_error("unexpected short write to extracted output file: " + display_path);
+
+		if (buffered_size != 0
+			&& (buffered_size + chunk->chunk.length > kBufferedExtractWriteBatchSize
+				|| (fill_started_at.has_value() && now - *fill_started_at >= kBufferedExtractWriteMaxDelay))) {
+			flush_buffer();
 		}
+		if (buffered_size == 0) {
+			buffered_offset = chunk->chunk.offset;
+			fill_started_at = now;
+		}
+		std::memcpy(buffered_output.get() + buffered_size, chunk->chunk.data.get(), chunk->chunk.length);
+		buffered_size += chunk->chunk.length;
+		buffered_leases.push_back(std::move(chunk->write_budget_lease));
 		expected_offset += chunk->chunk.length;
+		if (buffered_size == kBufferedExtractWriteBatchSize) {
+			flush_buffer();
+		}
 	}
+	flush_buffer();
 
 	apply_timestamps_to_handle_if_present(handle.get(), metadata, display_path);
 	if (!::CloseHandle(handle.release())) {
@@ -501,9 +564,14 @@ public:
 			throw make_win32_error("failed to open extracted output file: " + state_->display_path);
 		}
 
-		state_->write_slots.reserve(state_->max_in_flight_write_ops);
-		for (std::size_t index = 0; index < state_->max_in_flight_write_ops; ++index) {
+		state_->write_buffer_capacity = kBufferedExtractWriteBatchSize;
+		state_->write_slots.reserve(state_->max_in_flight_write_ops + 1);
+		for (std::size_t index = 0; index < state_->max_in_flight_write_ops + 1; ++index) {
 			state_->write_slots.emplace_back();
+			state_->write_slots.back().buffer = make_heap_buffer(state_->write_buffer_capacity);
+		}
+		state_->active_slot_index = 0;
+		for (std::size_t index = 1; index < state_->write_slots.size(); ++index) {
 			state_->available_slots.push_back(index);
 		}
 	}
@@ -535,51 +603,42 @@ public:
 			return;
 		}
 
-		while (state_->available_slots.empty()) {
-			wait_for_one_write();
+		if (chunk.chunk.length > state_->write_buffer_capacity) {
+			submit_active_write();
+			write_large_chunk_directly(std::move(chunk));
+			return;
 		}
 
-		const auto slot_index = state_->available_slots.front();
-		state_->available_slots.pop_front();
-		auto& slot = state_->write_slots[slot_index];
-		slot.buffer = std::move(chunk.chunk.data);
-		slot.size = chunk.chunk.length;
-		slot.offset = chunk.chunk.offset;
-		slot.write_budget_lease = std::move(chunk.write_budget_lease);
-		slot.overlapped = {};
-		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
-		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
-		slot.overlapped.hEvent = slot.event_handle;
-		::ResetEvent(slot.event_handle);
-
-		const auto ok = ::WriteFile(
-			state_->handle,
-			slot.buffer.get(),
-			static_cast<DWORD>(slot.size),
-			nullptr,
-			&slot.overlapped);
-		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
-			const auto error = ::GetLastError();
-			slot.buffer.reset();
-			slot.size = 0;
-			slot.offset = 0;
-			slot.write_budget_lease.reset();
-			state_->available_slots.push_front(slot_index);
-			if (state_->cancel_requested.load(std::memory_order_acquire)
-				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
-				throw CancelledError("extracted output file write cancelled");
+		const auto now = std::chrono::steady_clock::now();
+		auto& active_slot = state_->write_slots[state_->active_slot_index];
+		if (active_slot.size != 0) {
+			const bool non_contiguous = chunk.chunk.offset != active_slot.offset + active_slot.size;
+			const bool capacity_reached = active_slot.size + chunk.chunk.length > state_->write_buffer_capacity;
+			const bool delay_reached = state_->fill_started_at.has_value()
+				&& now - *state_->fill_started_at >= kBufferedExtractWriteMaxDelay;
+			if (non_contiguous || capacity_reached || delay_reached) {
+				submit_active_write();
 			}
-			throw make_win32_error("failed to write extracted output file: " + state_->display_path, error);
 		}
 
-		slot.in_flight = true;
-		state_->in_flight_slots.push_back(slot_index);
+		auto& current_slot = state_->write_slots[state_->active_slot_index];
+		if (current_slot.size == 0) {
+			current_slot.offset = chunk.chunk.offset;
+			state_->fill_started_at = now;
+		}
+		std::memcpy(current_slot.buffer.get() + current_slot.size, chunk.chunk.data.get(), chunk.chunk.length);
+		current_slot.size += chunk.chunk.length;
+		current_slot.write_budget_leases.push_back(std::move(chunk.write_budget_lease));
+		if (current_slot.size == state_->write_buffer_capacity) {
+			submit_active_write();
+		}
 	}
 
 	void close(const RestorableMetadata& metadata) {
 		if (!state_ || state_->closed) {
 			return;
 		}
+		submit_active_write();
 		wait_for_all_writes();
 		state_->closed = true;
 		apply_timestamps_to_handle_if_present(state_->handle, metadata, state_->display_path);
@@ -605,16 +664,19 @@ private:
 		struct WriteSlot : OverlappedSlotBase {
 			std::size_t size = 0;
 			std::uint64_t offset = 0;
-			WriteBudgetLease write_budget_lease;
+			std::vector<WriteBudgetLease> write_budget_leases;
 		};
 
 		HANDLE handle = INVALID_HANDLE_VALUE;
 		std::string display_path;
 		bool closed = false;
+		std::size_t write_buffer_capacity = 0;
 		std::size_t max_in_flight_write_ops = 1;
 		std::vector<WriteSlot> write_slots;
 		std::deque<std::size_t> available_slots;
 		std::deque<std::size_t> in_flight_slots;
+		std::size_t active_slot_index = 0;
+		std::optional<std::chrono::steady_clock::time_point> fill_started_at;
 		std::atomic<bool> cancel_requested{false};
 		boost::signals2::scoped_connection cancel_connection;
 	};
@@ -634,6 +696,109 @@ private:
 		}
 	}
 
+	void submit_active_write() {
+		if (!state_) {
+			return;
+		}
+		if (state_->cancel_requested.load(std::memory_order_acquire)) {
+			throw CancelledError("extracted output file write cancelled");
+		}
+
+		auto& slot = state_->write_slots[state_->active_slot_index];
+		if (slot.size == 0) {
+			return;
+		}
+		if (slot.in_flight) {
+			throw std::runtime_error("extracted file write slot is unexpectedly still in flight");
+		}
+
+		if (state_->in_flight_slots.size() >= state_->max_in_flight_write_ops) {
+			wait_for_one_write();
+		}
+
+		slot.overlapped = {};
+		slot.overlapped.Offset = static_cast<DWORD>(slot.offset & 0xffffffffull);
+		slot.overlapped.OffsetHigh = static_cast<DWORD>((slot.offset >> 32) & 0xffffffffull);
+		slot.overlapped.hEvent = slot.event_handle;
+		::ResetEvent(slot.event_handle);
+
+		const auto ok = ::WriteFile(
+			state_->handle,
+			slot.buffer.get(),
+			static_cast<DWORD>(slot.size),
+			nullptr,
+			&slot.overlapped);
+		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+			const auto error = ::GetLastError();
+			slot.size = 0;
+			slot.offset = 0;
+			slot.write_budget_leases.clear();
+			if (state_->cancel_requested.load(std::memory_order_acquire)
+				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			throw make_win32_error("failed to write extracted output file: " + state_->display_path, error);
+		}
+
+		slot.in_flight = true;
+		state_->in_flight_slots.push_back(state_->active_slot_index);
+
+		if (state_->available_slots.empty()) {
+			wait_for_one_write();
+		}
+		if (state_->available_slots.empty()) {
+			throw std::runtime_error("no extracted file write slot available after waiting for completion");
+		}
+
+		state_->active_slot_index = state_->available_slots.front();
+		state_->available_slots.pop_front();
+		state_->write_slots[state_->active_slot_index].size = 0;
+		state_->write_slots[state_->active_slot_index].offset = 0;
+		state_->write_slots[state_->active_slot_index].write_budget_leases.clear();
+		state_->fill_started_at.reset();
+	}
+
+	void write_large_chunk_directly(ExtractWriteChunk chunk) {
+		wait_for_all_writes();
+
+		OVERLAPPED overlapped{};
+		UniqueWin32Handle event(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
+		if (!event.valid()) {
+			throw make_win32_error("failed to create extracted output write event");
+		}
+		overlapped.Offset = static_cast<DWORD>(chunk.chunk.offset & 0xffffffffull);
+		overlapped.OffsetHigh = static_cast<DWORD>((chunk.chunk.offset >> 32) & 0xffffffffull);
+		overlapped.hEvent = event.get();
+
+		const auto ok = ::WriteFile(
+			state_->handle,
+			chunk.chunk.data.get(),
+			static_cast<DWORD>(chunk.chunk.length),
+			nullptr,
+			&overlapped);
+		if (!ok && ::GetLastError() != ERROR_IO_PENDING) {
+			const auto error = ::GetLastError();
+			if (state_->cancel_requested.load(std::memory_order_acquire)
+				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			throw make_win32_error("failed to write extracted output file: " + state_->display_path, error);
+		}
+
+		DWORD bytes_written = 0;
+		if (!::GetOverlappedResult(state_->handle, &overlapped, &bytes_written, TRUE)) {
+			const auto error = ::GetLastError();
+			if (state_->cancel_requested.load(std::memory_order_acquire)
+				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
+				throw CancelledError("extracted output file write cancelled");
+			}
+			throw make_win32_error("failed to complete extracted output write: " + state_->display_path, error);
+		}
+		if (bytes_written != chunk.chunk.length) {
+			throw std::runtime_error("unexpected short write to extracted output file: " + state_->display_path);
+		}
+	}
+
 	void wait_for_one_write() {
 		if (!state_ || state_->in_flight_slots.empty()) {
 			return;
@@ -646,10 +811,9 @@ private:
 		if (!::GetOverlappedResult(state_->handle, &slot.overlapped, &bytes_written, TRUE)) {
 			const auto error = ::GetLastError();
 			slot.in_flight = false;
-			slot.buffer.reset();
 			slot.size = 0;
 			slot.offset = 0;
-			slot.write_budget_lease.reset();
+			slot.write_budget_leases.clear();
 			state_->available_slots.push_back(slot_index);
 			if (state_->cancel_requested.load(std::memory_order_acquire)
 				&& (error == ERROR_OPERATION_ABORTED || error == ERROR_REQUEST_ABORTED)) {
@@ -659,19 +823,17 @@ private:
 		}
 		if (bytes_written != slot.size) {
 			slot.in_flight = false;
-			slot.buffer.reset();
 			slot.size = 0;
 			slot.offset = 0;
-			slot.write_budget_lease.reset();
+			slot.write_budget_leases.clear();
 			state_->available_slots.push_back(slot_index);
 			throw std::runtime_error("unexpected short write to extracted output file: " + state_->display_path);
 		}
 
 		slot.in_flight = false;
-		slot.buffer.reset();
 		slot.size = 0;
 		slot.offset = 0;
-		slot.write_budget_lease.reset();
+		slot.write_budget_leases.clear();
 		state_->available_slots.push_back(slot_index);
 	}
 
@@ -738,22 +900,18 @@ public:
 		const auto task_id = next_task_id_++;
 		auto future = executors_.post([this, task_id, queue, metadata = std::move(metadata), max_in_flight_write_ops = max_in_flight_write_ops_, file_counter = file_counter_, cancel_event = cancel_event_] {
 			try {
-				if (metadata.file_size <= kSmallExtractFileThreshold) {
-					write_small_extracted_file(metadata, *queue, file_counter, cancel_event);
-				} else {
-					ExtractFileWriter writer(metadata.output_path, max_in_flight_write_ops);
-					if (cancel_event != nullptr) {
-						writer.listenCancelSignal(*const_cast<CancelEvent*>(cancel_event));
-					}
-					while (auto chunk = queue->pop()) {
-						throw_if_cancelled(cancel_event);
-						writer.write(std::move(*chunk));
-					}
-					writer.close(metadata);
-					apply_permissions_if_possible(metadata);
-					if (file_counter != nullptr) {
-						file_counter->fetch_add(1, std::memory_order_relaxed);
-					}
+				ExtractFileWriter writer(metadata.output_path, max_in_flight_write_ops);
+				if (cancel_event != nullptr) {
+					writer.listenCancelSignal(*const_cast<CancelEvent*>(cancel_event));
+				}
+				while (auto chunk = queue->pop()) {
+					throw_if_cancelled(cancel_event);
+					writer.write(std::move(*chunk));
+				}
+				writer.close(metadata);
+				apply_permissions_if_possible(metadata);
+				if (file_counter != nullptr) {
+					file_counter->fetch_add(1, std::memory_order_relaxed);
 				}
 			} catch (...) {
 				queue->abandon();

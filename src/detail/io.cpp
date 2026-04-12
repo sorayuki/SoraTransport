@@ -146,6 +146,7 @@ struct FileByteSink::State {
 	std::deque<std::size_t> available_slots;
 	std::deque<std::size_t> in_flight_slots;
 	std::size_t active_slot_index = 0;
+	std::optional<std::chrono::steady_clock::time_point> fill_started_at;
 	std::atomic<bool> cancel_requested{false};
 	boost::signals2::scoped_connection cancel_connection;
 };
@@ -517,15 +518,26 @@ void FileByteSink::write(std::span<const uint8_t> bytes) {
 	}
 	while (!bytes.empty()) {
 		auto& active_slot = state_->write_slots[state_->active_slot_index];
+		const auto now = std::chrono::steady_clock::now();
+		if (active_slot.size != 0
+			&& state_->fill_started_at.has_value()
+			&& now - *state_->fill_started_at >= kSocketIoMaxBufferedSendDelay) {
+			submit_active_write();
+			continue;
+		}
 		if (active_slot.size == state_->write_buffer_capacity) {
 			submit_active_write();
 		}
 
 		const auto available = state_->write_buffer_capacity - active_slot.size;
 		const auto chunk = std::min<std::size_t>(available, bytes.size());
+		const auto was_empty = active_slot.size == 0;
 		std::memcpy(active_slot.buffer.get() + active_slot.size, bytes.data(), chunk);
 		active_slot.size += chunk;
 		bytes = bytes.subspan(chunk);
+		if (was_empty) {
+			state_->fill_started_at = now;
+		}
 
 		if (active_slot.size == state_->write_buffer_capacity) {
 			submit_active_write();
@@ -587,6 +599,8 @@ void FileByteSink::submit_active_write() {
 	state_->active_slot_index = state_->available_slots.front();
 	state_->available_slots.pop_front();
 	state_->write_slots[state_->active_slot_index].size = 0;
+	state_->write_slots[state_->active_slot_index].offset = 0;
+	state_->fill_started_at.reset();
 }
 
 void FileByteSink::wait_for_one_write() {

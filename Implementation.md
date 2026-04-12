@@ -100,7 +100,7 @@
 
 1. 根据模式选择 `RawTarReader` 或 `ZstdDecompressor`
 2. 输出 tar 数据流到 `BoundedQueue<DataChunk>`
-3. `TarUnpacker` 通过 libarchive 写回磁盘
+3. `TarUnpacker` 解析条目后，目录与元数据仍由 libarchive 协助恢复，普通文件内容则交给 `ExtractWriteScheduler -> ExtractFileWriter` 批量写回磁盘
 
 ### 3.3 网络发送
 
@@ -238,11 +238,14 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 ### 6.2 TarUnpacker
 
-仍然使用 libarchive 的 `archive_write_disk` 写回磁盘，并额外：
+当前 `TarUnpacker` 会把目录、权限和时间戳恢复与普通文件内容写入拆开处理：
 
 - 只接受相对路径条目
 - 拒绝 `..` 越界路径
 - 当前跳过 symlink 条目
+- 目录创建和目录元数据恢复由 `CreatedDirectoryIndex` / `DirectoryMetadataFinalizer` 协调
+- 普通文件内容通过 `ExtractWriteScheduler` 分发到后台任务；每个文件内部由 `ExtractFileWriter` 执行 buffered + overlapped 写出
+- 小文件同步写路径 `write_small_extracted_file()` 也不再按 chunk 直写，而是先聚合到缓冲区后再落盘
 
 ### 6.3 Zstd
 
@@ -273,8 +276,10 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 - 当前接口不再接收 `FileIoMode`
 - 固定使用 buffered + overlapped 写出
+- 写盘策略与网络发送保持一致：优先聚合到活动缓冲，写满后提交；如果缓冲首字节进入后约 100ms 仍未写满，也会主动刷盘
 - 通过 `max_in_flight_write_ops` 控制在途异步写数量
 - 默认写并发是 3，而不是 1
+- 解包落盘路径也采用同样的“容量阈值 + 时间阈值”聚合思路，默认批量大小同样是 4 MiB
 
 ### 7.3 Socket I/O
 
@@ -325,6 +330,7 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `kOverlappedFileReadQueueDepth = 8`
 - `kTargetInFlightReadBytes = 96 MiB`
 - `kDefaultMaxInFlightWriteOps = 3`
+- `kBufferedExtractWriteBatchSize = 4 MiB`
 - `kMaxDefaultWorkerThreads = 12`
 - `kOpenConcurrencyMultiplier = 4`
 - `kMaxDefaultOpenConcurrency = 48`
