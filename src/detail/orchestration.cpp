@@ -255,6 +255,30 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	co_return socket;
 }
 
+std::string make_websocket_host_header(std::string_view host, std::uint16_t port) {
+	const auto host_text = std::string(host);
+	if (host_text.find(':') != std::string::npos && (host_text.empty() || host_text.front() != '[')) {
+		return std::string("[") + host_text + "]:" + std::to_string(port);
+	}
+	return host_text + ':' + std::to_string(port);
+}
+
+asio::awaitable<TransportWebSocket> connect_websocket_async(std::string host, std::uint16_t port, CancelEvent& cancel_event) {
+	auto socket = co_await connect_socket_async(host, port, cancel_event);
+	TransportWebSocket websocket(std::move(socket));
+	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
+	boost::system::error_code error;
+	auto host_header = make_websocket_host_header(host, port);
+	co_await websocket.async_handshake(host_header, "/", asio::redirect_error(asio::use_awaitable, error));
+	if (error) {
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
+		}
+		throw make_boost_error("failed to complete websocket handshake", error);
+	}
+	co_return websocket;
+}
+
 asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port, CancelEvent& cancel_event) {
 	auto executor = co_await asio::this_coro::executor;
 	asio::ip::tcp::acceptor acceptor(executor);
@@ -303,6 +327,91 @@ asio::awaitable<asio::ip::tcp::socket> accept_socket_async(std::uint16_t port, s
 	co_return socket;
 }
 
+asio::awaitable<TransportWebSocket> accept_websocket_async(std::uint16_t port, std::atomic<std::uint16_t>* bound_port, CancelEvent& cancel_event) {
+	auto socket = co_await accept_socket_async(port, bound_port, cancel_event);
+	TransportWebSocket websocket(std::move(socket));
+	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
+	boost::system::error_code error;
+	co_await websocket.async_accept(asio::redirect_error(asio::use_awaitable, error));
+	if (error) {
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
+		}
+		throw make_boost_error("failed to accept websocket handshake", error);
+	}
+	co_return websocket;
+}
+
+void receive_transport_from_source(
+	SocketByteSource& source,
+	const std::filesystem::path& destination_dir,
+	const std::shared_ptr<TransferProgress>& progress,
+	CancelEvent& cancel_event) {
+	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
+	std::atomic<std::uint64_t> files_processed{0};
+	auto config = make_runtime_config();
+
+	RuntimeExecutors executors(config.worker_threads);
+	BufferPool pool;
+	auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
+	write_budget->listenCancelSignal(cancel_event);
+	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
+	tar_queue.listenCancelSignal(cancel_event);
+	PipelineState state;
+	TarUnpacker unpacker(
+		destination_dir,
+		pool,
+		executors,
+		write_budget,
+		config.max_in_flight_write_ops,
+		config.max_parallel_extract_files);
+	print_receive_progress_legend();
+	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
+
+	auto progress_thread = start_progress_thread(
+		[&](std::uint64_t bytes_per_second) {
+			std::ostringstream out;
+			out << "[receive] " << format_rate(bytes_per_second)
+				<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}'
+				<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
+				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
+			return out.str();
+		},
+		uncompressed_bytes_processed);
+
+	std::jthread input_thread([&] {
+		try {
+			ZstdDecompressor decompressor(pool);
+			decompressor.decompress(source, tar_queue, &cancel_event);
+		} catch (...) {
+			state.fail(std::current_exception());
+			tar_queue.close();
+		}
+	});
+
+	std::jthread unpacker_thread([&] {
+		try {
+			unpacker.unpack(tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
+		} catch (...) {
+			state.fail(std::current_exception());
+			tar_queue.close();
+		}
+	});
+
+	join_and_capture(input_thread, state);
+	join_and_capture(unpacker_thread, state);
+	progress_thread.request_stop();
+	if (progress_thread.joinable()) {
+		progress_thread.join();
+	}
+	progress_sync_thread.request_stop();
+	if (progress_sync_thread.joinable()) {
+		progress_sync_thread.join();
+	}
+	finalize_progress_line();
+	state.rethrow_if_failed();
+}
+
 asio::awaitable<void> listen_directory_task(
 	const std::filesystem::path source_dir,
 	std::uint16_t port,
@@ -315,12 +424,13 @@ asio::awaitable<void> listen_directory_task(
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "binding listener");
-		auto socket = co_await accept_socket_async(port, bound_port, cancel_event);
+		auto websocket = co_await accept_websocket_async(port, bound_port, cancel_event);
 		set_progress_status(progress, "receiver connected");
-		std::cerr << "listening on port " << socket.local_endpoint().port() << ", waiting for receiver...\n";
+		std::cerr << "listening on port " << websocket.next_layer().local_endpoint().port() << ", waiting for receiver...\n";
 		std::cerr << "receiver connected, starting transfer...\n";
-		SocketByteSink sink(std::move(socket));
+		SocketByteSink sink(std::move(websocket), true);
 		sink.listenCancelSignal(cancel_event);
+		sink.send_transport_begin();
 		auto config = make_runtime_config(options);
 		const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
 		const auto enable_adaptive_compression = !options.compression_level.has_value();
@@ -428,6 +538,9 @@ asio::awaitable<void> listen_directory_task(
 		}
 		finalize_progress_line();
 		state.rethrow_if_failed();
+		sink.send_transport_end();
+		sink.check_connection();
+		sink.close_socket();
 		complete_progress(progress, false, false, "send completed");
 	} catch (...) {
 		*task_error = std::current_exception();
@@ -446,80 +559,39 @@ asio::awaitable<void> receive_directory_task(
 	std::uint16_t port,
 	const std::filesystem::path destination_dir,
 	const std::shared_ptr<TransferProgress>& progress,
+	bool keep_connection_open,
 	CancelEvent& cancel_event,
 	std::exception_ptr* task_error) {
-	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
-	std::atomic<std::uint64_t> files_processed{0};
 	try {
 		set_progress_status(progress, "connecting");
 		std::cerr << "connecting to " << host << ':' << port << "...\n";
-		auto socket = co_await connect_socket_async(std::move(host), port, cancel_event);
-		set_progress_status(progress, "receiving");
-		std::cerr << "connected, receiving transfer...\n";
-		SocketByteSource source(std::move(socket));
+		auto websocket = co_await connect_websocket_async(std::move(host), port, cancel_event);
+		std::cerr << "connected, waiting for transfer...\n";
+		SocketByteSource source(std::move(websocket));
 		source.listenCancelSignal(cancel_event);
-		auto config = make_runtime_config();
-
-		RuntimeExecutors executors(config.worker_threads);
-		BufferPool pool;
-		auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
-		write_budget->listenCancelSignal(cancel_event);
-		BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
-		tar_queue.listenCancelSignal(cancel_event);
-		PipelineState state;
-		TarUnpacker unpacker(
-			destination_dir,
-			pool,
-			executors,
-			write_budget,
-			config.max_in_flight_write_ops,
-			config.max_parallel_extract_files);
-		print_receive_progress_legend();
-		auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
-
-		auto progress_thread = start_progress_thread(
-			[&](std::uint64_t bytes_per_second) {
-				std::ostringstream out;
-				out << "[receive] " << format_rate(bytes_per_second)
-					<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}'
-					<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
-					<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
-				return out.str();
-			},
-			uncompressed_bytes_processed);
-
-		std::jthread input_thread([&] {
-			try {
-				ZstdDecompressor decompressor(pool);
-				decompressor.decompress(source, tar_queue, &cancel_event);
-			} catch (...) {
-				state.fail(std::current_exception());
-				tar_queue.close();
+		bool received_any_transport = false;
+		for (;;) {
+			if (received_any_transport) {
+				set_progress_status(progress, "waiting for next transfer");
 			}
-		});
-
-		std::jthread unpacker_thread([&] {
-			try {
-				unpacker.unpack(tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
-			} catch (...) {
-				state.fail(std::current_exception());
-				tar_queue.close();
+			if (!source.await_transport_begin()) {
+				if (!received_any_transport) {
+					throw std::runtime_error("sender closed websocket before starting transport");
+				}
+				break;
 			}
-		});
-
-		join_and_capture(input_thread, state);
-		join_and_capture(unpacker_thread, state);
-		progress_thread.request_stop();
-		if (progress_thread.joinable()) {
-			progress_thread.join();
+			if (progress) {
+				progress->reset("receiving");
+			}
+			std::cerr << "transport started, receiving...\n";
+			receive_transport_from_source(source, destination_dir, progress, cancel_event);
+			received_any_transport = true;
+			complete_progress(progress, false, false, "receive completed");
+			if (!keep_connection_open) {
+				break;
+			}
 		}
-		progress_sync_thread.request_stop();
-		if (progress_sync_thread.joinable()) {
-			progress_sync_thread.join();
-		}
-		finalize_progress_line();
-		state.rethrow_if_failed();
-		complete_progress(progress, false, false, "receive completed");
+		source.close_socket();
 	} catch (...) {
 		*task_error = std::current_exception();
 		if (should_report_transfer_error(cancel_event, *task_error)) {
@@ -768,7 +840,7 @@ void listen_directory(
 }
 
 void receive_directory(std::string_view host, std::uint16_t port, const std::filesystem::path& destination_dir) {
-	receive_directory(host, port, destination_dir, {}, {}, nullptr);
+	receive_directory(host, port, destination_dir, {}, {}, nullptr, false);
 }
 
 void receive_directory(
@@ -777,7 +849,8 @@ void receive_directory(
 	const std::filesystem::path& destination_dir,
 	const std::shared_ptr<TransferProgress>& progress,
 	std::stop_token stop_token,
-	CancelEvent* cancel_event) {
+	CancelEvent* cancel_event,
+	bool keep_connection_open) {
 	CancelEvent local_cancel_event;
 	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	std::stop_callback on_stop(stop_token, [&effective_cancel_event] {
@@ -785,7 +858,7 @@ void receive_directory(
 	});
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, effective_cancel_event, &task_error), asio::detached);
+	asio::co_spawn(io_context, receive_directory_task(std::string(host), port, destination_dir, progress, keep_connection_open, effective_cancel_event, &task_error), asio::detached);
 	io_context.run();
 	if (task_error && should_report_transfer_error(effective_cancel_event, task_error)) {
 		std::rethrow_exception(task_error);

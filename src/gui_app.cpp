@@ -424,7 +424,7 @@ private:
 			url = *receive_url_,
 			cancel_event = receive_cancel_event_.get()](std::stop_token stop_token) {
 			try {
-				receive_directory(url.host, url.port, current_dir_, receive_progress_, stop_token, cancel_event);
+				receive_directory(url.host, url.port, current_dir_, receive_progress_, stop_token, cancel_event, true);
 			} catch (...) {
 			}
 			receive_session_finished_.store(true, std::memory_order_release);

@@ -151,17 +151,31 @@ asio::ip::tcp::socket accept_socket(asio::io_context& io_context, asio::ip::tcp:
 	return std::move(*accepted_socket);
 }
 
+TransportWebSocket accept_websocket(asio::io_context& io_context, asio::ip::tcp::acceptor& acceptor, CancelEvent& cancel_event) {
+	auto socket = accept_socket(io_context, acceptor, cancel_event);
+	TransportWebSocket websocket(std::move(socket));
+	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
+	boost::system::error_code error;
+	websocket.accept(error);
+	if (error) {
+		if (should_throw_cancelled_error(cancel_event, error)) {
+			throw CancelledError("transfer cancelled");
+		}
+		throw make_boost_error("failed to accept websocket handshake", error);
+	}
+	return websocket;
+}
+
 void send_paths_to_socket(
 	const std::vector<std::filesystem::path>& source_paths,
-	asio::ip::tcp::socket socket,
+	SocketByteSink& sink,
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
 	CancelEvent& cancel_event) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 
-	SocketByteSink sink(std::move(socket));
-	sink.listenCancelSignal(cancel_event);
+	sink.send_transport_begin();
 
 	auto config = make_runtime_config(options);
 	const auto compression_level = options.compression_level.value_or(kDefaultCompressionLevel);
@@ -249,6 +263,8 @@ void send_paths_to_socket(
 		progress_sync_thread.join();
 	}
 	state.rethrow_if_failed();
+	sink.send_transport_end();
+	sink.check_connection();
 	if (cancel_event.is_cancelled()) {
 		throw CancelledError("transfer cancelled");
 	}
@@ -349,59 +365,99 @@ private:
 			}
 
 			while (!stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
-				auto socket = accept_socket(io_context, acceptor, cancel_event_);
+				auto websocket = accept_websocket(io_context, acceptor, cancel_event_);
+				SocketByteSink sink(std::move(websocket), true);
+				sink.listenCancelSignal(cancel_event_);
 				{
 					std::lock_guard lock(mutex_);
 					receiver_connected_ = true;
 					transfer_in_progress_ = false;
 				}
 				if (progress_) {
-					progress_->reset("receiver connected");
+					progress_->set_status("receiver connected, waiting for drop");
 				}
 
-				std::vector<std::filesystem::path> source_paths;
-				{
-					std::unique_lock lock(mutex_);
-					cv_.wait(lock, [&] {
-						return stop_token.stop_requested() || cancel_event_.is_cancelled() || pending_paths_.has_value();
-					});
-					if (stop_token.stop_requested() || cancel_event_.is_cancelled()) {
-						break;
-					}
-					source_paths = std::move(*pending_paths_);
-					pending_paths_.reset();
-					transfer_in_progress_ = true;
-				}
-
-				try {
-					if (progress_) {
-						progress_->reset("sending");
-					}
-					send_paths_to_socket(source_paths, std::move(socket), options_, progress_, cancel_event_);
-					if (progress_) {
-						progress_->set_completed("send completed");
-					}
-				} catch (...) {
-					if (progress_) {
-						try {
-							throw;
-						} catch (const CancelledError&) {
-							progress_->set_cancelled("cancelled");
-						} catch (const std::exception& error) {
-							progress_->set_failed(error.what());
-						} catch (...) {
-							progress_->set_failed("send failed");
+				bool receiver_connected = true;
+				while (receiver_connected && !stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
+					std::vector<std::filesystem::path> source_paths;
+					{
+						std::unique_lock lock(mutex_);
+						const bool has_pending_paths = cv_.wait_for(lock, std::chrono::milliseconds(500), [&] {
+							return stop_token.stop_requested() || cancel_event_.is_cancelled() || pending_paths_.has_value();
+						});
+						if (stop_token.stop_requested() || cancel_event_.is_cancelled()) {
+							receiver_connected = false;
+							break;
+						}
+						if (has_pending_paths) {
+							source_paths = std::move(*pending_paths_);
+							pending_paths_.reset();
+							transfer_in_progress_ = true;
 						}
 					}
-					if (cancel_event_.is_cancelled()) {
+
+					if (!receiver_connected) {
 						break;
+					}
+					if (source_paths.empty()) {
+						try {
+							sink.check_connection();
+						} catch (...) {
+							receiver_connected = false;
+							if (progress_) {
+								try {
+									throw;
+								} catch (const CancelledError&) {
+									progress_->set_cancelled("cancelled");
+								} catch (const std::exception& error) {
+									progress_->set_failed(error.what());
+								} catch (...) {
+									progress_->set_failed("receiver disconnected");
+								}
+							}
+						}
+						continue;
+					}
+
+					try {
+						if (progress_) {
+							progress_->reset("sending");
+						}
+						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_);
+						if (progress_) {
+							progress_->set_completed("send completed");
+							progress_->set_status("receiver connected, waiting for drop");
+						}
+					} catch (...) {
+						receiver_connected = false;
+						if (progress_) {
+							try {
+								throw;
+							} catch (const CancelledError&) {
+								progress_->set_cancelled("cancelled");
+							} catch (const std::exception& error) {
+								progress_->set_failed(error.what());
+							} catch (...) {
+								progress_->set_failed("send failed");
+							}
+						}
+						if (cancel_event_.is_cancelled()) {
+							break;
+						}
+					}
+
+					{
+						std::lock_guard lock(mutex_);
+						transfer_in_progress_ = false;
 					}
 				}
 
+				sink.close_socket();
 				{
 					std::lock_guard lock(mutex_);
 					receiver_connected_ = false;
 					transfer_in_progress_ = false;
+					pending_paths_.reset();
 				}
 
 				if (!stop_token.stop_requested() && !cancel_event_.is_cancelled() && progress_) {

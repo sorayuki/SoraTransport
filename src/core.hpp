@@ -62,7 +62,8 @@ void receive_directory(
 	const std::filesystem::path& destination_dir,
 	const std::shared_ptr<TransferProgress>& progress = {},
 	std::stop_token stop_token = {},
-	CancelEvent* cancel_event = nullptr);
+	CancelEvent* cancel_event = nullptr,
+	bool keep_connection_open = false);
 int run_soratransport_cli(int argc, char** argv);
 int run_fasttar_cli(int argc, char** argv);
 

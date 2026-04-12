@@ -104,35 +104,42 @@
 
 ### 3.3 网络发送
 
-`listen_directory()` 的控制流由 Boost.Asio 协程监听并 `accept()` 连接，但数据面和本地打包一致：
+`listen_directory()` 的控制流由 Boost.Asio 协程监听并 `accept()` WebSocket 连接，但数据面和本地打包一致：
 
-1. 扫描目录
-2. 并发打开普通文件
-3. 预读
-4. 打 tar
-5. zstd 压缩
-6. 通过 `SocketByteSink` 发送
-7. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
+1. 监听端先完成 TCP accept 和 WebSocket server handshake
+2. 发送一条文本 JSON 控制帧 `transport_begin`
+3. 扫描目录
+4. 并发打开普通文件
+5. 预读
+6. 打 tar
+7. zstd 压缩
+8. 通过 `SocketByteSink` 以 WebSocket 二进制消息发送连续字节流
+9. 发送一条文本 JSON 控制帧 `transport_end`
+10. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
 
 ### 3.3.1 GUI 发送
 
 GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServer` 做一个更贴合交互的会话层：
 
 1. 启动窗口时立即绑定一个固定监听端口，并生成可复制的 `soratrans://` 链接
-2. 接收端先连入该端口，发送页界面切换为拖放框
+2. 接收端先连入该端口并完成 WebSocket handshake，发送页界面切换为拖放框
 3. 用户一次拖放可提交多个文件或目录
-4. `GuiSendServer` 复用现有 `DirScanner -> FileReaderPrefetcher -> TarPacker -> ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
-5. 单次拖放完成后关闭当前连接，再回到等待下一接收端的状态
+4. 每次 drop 都会发送一组 `transport_begin -> 二进制数据 -> transport_end`
+5. `GuiSendServer` 复用现有 `DirScanner -> FileReaderPrefetcher -> TarPacker -> ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
+6. 单次拖放完成后连接保持不变，继续等待下一次拖放；空闲期间由服务端定时发出 WebSocket ping 保活
 
 ### 3.4 网络接收
 
 `receive_directory()` 当前流程：
 
-1. 通过 Boost.Asio 协程主动 `connect()` 到远端
-2. `SocketByteSource` 读取字节流
-3. `ZstdDecompressor` 解压为 tar 数据流
-4. `TarUnpacker` 落盘
-5. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
+1. 通过 Boost.Asio 协程主动 `connect()` 到远端，并完成 WebSocket client handshake
+2. 等待文本 JSON 控制帧 `transport_begin`
+3. `SocketByteSource` 把后续 WebSocket 二进制消息拼成连续字节流
+4. 收到文本 JSON 控制帧 `transport_end` 时，把本次读取视为一次压缩流结束
+5. `ZstdDecompressor` 解压为 tar 数据流
+6. `TarUnpacker` 落盘
+7. CLI 模式下一次传输完成后退出；GUI 模式会继续等待后续 `transport_begin`
+8. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
 
 ## 4. 文件读取实现现状
 
@@ -283,8 +290,10 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 ### 7.3 Socket I/O
 
-- `SocketByteSink` 采用缓冲聚合发送，并带有取消与停止逻辑
-- `SocketByteSource` 采用同步读取接口向解压阶段供数
+- `SocketByteSink` 现在封装 Boost.Beast WebSocket server/client 流，并继续采用缓冲聚合发送
+- `SocketByteSink` 在 GUI 发送端支持文本 JSON 控制帧、二进制数据帧，以及空闲 ping 保活
+- `SocketByteSource` 采用同步读取接口向解压阶段供数，并把多条二进制 message 重新拼成一个连续压缩字节流
+- `SocketByteSource` 通过读取文本 JSON 控制帧来判定单次传输的开始与结束
 - 网络错误文本会通过 Windows 辅助函数转换成更稳定的 UTF-8 文本
 
 ## 8. CLI 行为
@@ -345,6 +354,7 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `fs_benchmark`
 - `soratransport_app`
 - 工程要求 `cmake_minimum_required(VERSION 4.0.0)`，并通过 vcpkg manifest 管理依赖
+- `fltk` 与 `nlohmann_json` 都通过 `FetchContent` 拉取，其中 `nlohmann_json` 用于解析 WebSocket 文本控制帧
 
 ## 11. 维护建议
 

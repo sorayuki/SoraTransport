@@ -1,6 +1,6 @@
 这是一份针对 SoraTransport 与 fasttar 的当前架构设计文档。
 
-当前实现采用“协程控制平面 + 线程化流水线数据面 + 可取消运行时”的方案。网络连接仍然由 Boost.Asio 协程处理；真正的数据搬运则由阶段线程、单共享线程池、有界队列和阻塞式字节源/汇协作完成。相比更早期的设想，当前设计重点已经转向清晰的阶段边界、稳定的资源控制、统一的 Windows overlapped I/O 路径，以及 GUI/CLI 共用的一套取消与进度接口。
+当前实现采用“协程控制平面 + 线程化流水线数据面 + 可取消运行时”的方案。网络连接仍然由 Boost.Asio 协程处理，但协议层已经切到 Boost.Beast WebSocket：二进制消息承载 zstd 压缩 tar 字节流，文本消息承载 JSON 控制事件。真正的数据搬运则由阶段线程、单共享线程池、有界队列和阻塞式字节源/汇协作完成。相比更早期的设想，当前设计重点已经转向清晰的阶段边界、稳定的资源控制、统一的 Windows overlapped I/O 路径，以及 GUI/CLI 共用的一套取消与进度接口。
 
 ## 1. 总体架构
 
@@ -185,6 +185,10 @@ FileByteSource / SocketByteSource
 ### 5.3 网络路径
 
 - `SocketByteSink` / `SocketByteSource` 也接入统一取消语义
+- 网络协议在 TCP 连接之上使用 Boost.Beast WebSocket
+- 二进制消息只承载压缩 tar 字节流；message 边界不再定义一次传输的开始和结束
+- 文本消息使用 JSON 控制事件；当前约定 `{"type":"event","event_id":"transport_begin"}` 与 `{"type":"event","event_id":"transport_end"}`
+- 监听发送端在连接空闲时会主动发出 WebSocket ping，避免 NAT 映射因长时间空闲被回收
 - 网络发送端固定走 zstd 压缩路径；raw tar 只在本地 `fasttar -n` 路径使用
 
 ## 6. 实现取舍
@@ -225,8 +229,9 @@ FileByteSource / SocketByteSource
   - 基于 FLTK 的 Windows GUI
     - 主界面固定为“发送 / 接收”两个 tab
     - 发送页启动后立即绑定监听端口并展示可复制的 `soratrans://` 链接
-    - 当接收端先连入发送页后，界面切换为拖放框；一次拖放可提交多个文件或目录，并触发一次发送
-    - 接收页提供发送者链接输入框，按回车或点“连接”后才发起接收
+        - 当接收端先连入发送页后，界面切换为拖放框；一次拖放可提交多个文件或目录，并触发一个 `transport_begin -> 二进制数据 -> transport_end` 传输片段
+        - 同一个 GUI 发送连接会在一次 drop 完成后继续保持，等待下一次拖放；只有断开或取消时才重新回到“等待接收端”
+        - 接收页提供发送者链接输入框，按回车或点“连接”后才发起接收；GUI 接收连接建立后会持续等待后续传输片段
     - 启动时如果剪贴板里有可识别的 `soratrans://` 链接，则默认切到接收页并预填输入框；否则默认切到发送页
     - GUI 不再接受命令行参数来决定模式
 

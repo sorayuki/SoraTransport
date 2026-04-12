@@ -35,7 +35,15 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+	nlohmann_json
+	GIT_REPOSITORY https://github.com/nlohmann/json.git
+	GIT_TAG v3.11.3
+	GIT_SHALLOW TRUE
+)
+
 FetchContent_MakeAvailable(fltk)
+FetchContent_MakeAvailable(nlohmann_json)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,6 +84,7 @@ target_link_libraries(soratransport_dependencies
 		ZLIB::ZLIB
 		zstd::libzstd
 		LibArchive::LibArchive
+		nlohmann_json::nlohmann_json
 )
 
 if(WIN32)

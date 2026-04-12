@@ -2,12 +2,17 @@
 
 #include "runtime.hpp"
 
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/websocket/stream.hpp>
+
 #include <span>
 #include <windows.h>
 
 namespace soratransport {
 
 inline constexpr std::size_t kOverlappedFileReadQueueDepth = 8;
+
+using TransportWebSocket = boost::beast::websocket::stream<boost::asio::ip::tcp::socket>;
 
 class IByteSink {
 public:
@@ -91,15 +96,18 @@ private:
 
 class SocketByteSink final : public IByteSink {
 public:
-	explicit SocketByteSink(boost::asio::ip::tcp::socket socket);
+	explicit SocketByteSink(TransportWebSocket websocket, bool enable_keepalive_ping = false);
 	~SocketByteSink() override;
 	SocketByteSink(const SocketByteSink&) = delete;
 	SocketByteSink& operator=(const SocketByteSink&) = delete;
 	SocketByteSink(SocketByteSink&&) noexcept;
 	SocketByteSink& operator=(SocketByteSink&&) noexcept;
 	void listenCancelSignal(CancelEvent& event);
+	void send_transport_begin();
+	void send_transport_end();
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
+	void check_connection();
 	void close_socket();
 	void stop();
 	bool is_cancelled() const;
@@ -112,13 +120,14 @@ private:
 
 class SocketByteSource final : public IByteSource {
 public:
-	explicit SocketByteSource(boost::asio::ip::tcp::socket socket);
+	explicit SocketByteSource(TransportWebSocket websocket);
 	~SocketByteSource() override;
 	SocketByteSource(const SocketByteSource&) = delete;
 	SocketByteSource& operator=(const SocketByteSource&) = delete;
 	SocketByteSource(SocketByteSource&&) noexcept;
 	SocketByteSource& operator=(SocketByteSource&&) noexcept;
 	void listenCancelSignal(CancelEvent& event);
+	bool await_transport_begin();
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
 	void close_socket();
 	void stop();

@@ -6,6 +6,7 @@
     {
       "name": "libarchive",
       "default-features": false
-    }
+    },
+    "nlohmann-json"
   ]
 }
