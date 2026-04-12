@@ -99,6 +99,8 @@ endif()
 add_library(soratransport_core
 	src/core.cpp
 	src/core.hpp
+	src/detail2/config.cpp
+	src/detail2/infra.cpp
 	src/detail/runtime.cpp
 	src/detail/io.cpp
 	src/detail/filesystem.cpp

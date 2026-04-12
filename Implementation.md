@@ -79,6 +79,14 @@
   - GUI 发送页复用现有流水线，将多根路径打包并推送到网络套接字
 - [src/detail/windows_helpers.hpp](src/detail/windows_helpers.hpp)
   - Windows 错误文本和 GUI 辅助函数
+- [src/detail2/config.hpp](src/detail2/config.hpp)
+  - `PipelineTuning`
+  - `make_pipeline_tuning()`
+- [src/detail2/infra.hpp](src/detail2/infra.hpp)
+  - `SemaphoreCor`
+  - `TaskExecutor`
+
+当前 `detail2` 目录已接入构建，但还处于“分阶段替换”的第一步：基础设施模块可编译、可独立验证，顶层 pack/unpack/listen/receive 路径暂时仍由 `src/detail/` 提供。
 
 ## 3. 当前数据流
 
@@ -207,6 +215,15 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - 默认线程数是 `min(hardware_concurrency, 12)`
 
 目录扫描、文件 open 和 zstd 压缩共享这一执行器；默认文件打开并发度是 `worker_threads * 4`，上限 48。
+
+### 5.2.1 detail2 基础设施状态
+
+为了把新的节点逻辑从旧实现中拆开，当前已经新增一组尚未切主路径的基础设施：
+
+- `detail2::TaskExecutor`：继续基于 Boost.Asio `post()`，但对外暴露可 `co_await` 的等待接口
+- `detail2::SemaphoreCor`：提供支持 move-only guard 的协程信号量，并带有批量取消等待者的语义
+
+这两个类当前主要用于后续重写节点时降低控制流复杂度；由于主路径尚未切换，所以运行结果仍然由旧实现决定。
 
 ### 5.3 队列
 
