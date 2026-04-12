@@ -90,6 +90,10 @@
   - `FileOpener`
   - `FilePrefetcher`
   - `OpenedFile`
+- [src/detail2/tar.hpp](src/detail2/tar.hpp)
+  - `detail2::TarPacker`
+- [src/detail2/zstd.hpp](src/detail2/zstd.hpp)
+  - `detail2::ZstdCompressor`
 
 当前 `detail2` 目录已接入构建，但还处于“分阶段替换”的第一步：基础设施模块可编译、可独立验证，顶层 pack/unpack/listen/receive 路径暂时仍由 `src/detail/` 提供。
 
@@ -239,6 +243,16 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `detail2::FilePrefetcher`：负责在字节预算信号量控制下触发初始预读，并把预算 guard 绑定到 `OpenedFile`
 
 这些节点当前已经进入 `soratransport_core` 构建并通过编译，但还没有接入 pack/listen 的实际执行路径。
+
+### 5.2.3 detail2 打包侧状态
+
+当前已经新增但尚未切主路径的打包侧节点包括：
+
+- `detail2::TarPacker`：消费 `OpenedFile`，在真正读文件前释放预读预算 guard，并生成 tar 数据块
+- `detail2::ZstdCompressor`：延续原有自适应压缩判定，同时把输出字节预算绑定到数据块生命周期
+- `detail2::chunk.hpp`：用 aliasing `shared_ptr` 把预算 guard 与 `DataChunk` 生命周期绑定，供 tar/zstd 输出队列复用
+
+这些模块的目标是为接下来的 pack/listen 切流准备一个完整但仍可逐步接线的 pack 侧实现。
 
 ### 5.3 队列
 

@@ -3,8 +3,10 @@
 #include "../detail/types.hpp"
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/thread_pool.hpp>
+#include <boost/asio/use_future.hpp>
 
 #include <deque>
 #include <functional>
@@ -65,6 +67,7 @@ public:
 	auto async_acquire(std::size_t permits, CompletionToken&& token);
 
 	boost::asio::awaitable<Guard> acquire(std::size_t permits = 1);
+	Guard acquire_blocking(std::size_t permits = 1);
 	void cancel(std::string message = "semaphore cancelled");
 	std::size_t available() const;
 	bool is_cancelled() const;

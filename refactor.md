@@ -55,6 +55,28 @@
   - 预读 guard 绑定到 `OpenedFile` 生命周期
   - 仍复用旧的 `OverlappedFileReader` 以保持底层取消和顺序读取行为
 
+  ### 4. pack 侧节点已落地
+
+  已新增：
+
+  - `src/detail2/chunk.hpp`
+  - `src/detail2/tar.hpp`
+  - `src/detail2/tar.cpp`
+  - `src/detail2/zstd.hpp`
+  - `src/detail2/zstd.cpp`
+
+  本轮完成内容：
+
+  - 实现 `detail2::TarPacker`
+    - 兼容 `OpenedFile` 输入
+    - 消费条目时先释放预读预算 guard，再顺序读取文件
+    - 输出 tar 数据块时可绑定输出预算 guard
+  - 实现 `detail2::ZstdCompressor`
+    - 保留原有自适应压缩级别调节逻辑
+    - 压缩输出同样可绑定输出预算 guard
+  - 实现 `detail2::chunk.hpp`
+    - 通过 aliasing `shared_ptr` 让 `DataChunk` 的释放自动回收预算 guard
+
 ## 验证
 
 - 已构建通过：`soratransport_core`

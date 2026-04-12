@@ -31,6 +31,11 @@ boost::asio::awaitable<SemaphoreCor::Guard> SemaphoreCor::acquire(std::size_t pe
 	co_return std::move(*result.guard);
 }
 
+SemaphoreCor::Guard SemaphoreCor::acquire_blocking(std::size_t permits) {
+	auto future = boost::asio::co_spawn(state_->executor, acquire(permits), boost::asio::use_future);
+	return future.get();
+}
+
 void SemaphoreCor::cancel(std::string message) {
 	std::deque<PendingRequest> pending;
 	{
