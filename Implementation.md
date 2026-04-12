@@ -19,9 +19,10 @@
   - 使用 `--read-files` 时走 open + prefetch + 顺序消费链路
 - `soratransport_app`
   - 基于 FLTK 的 Windows GUI
-  - 发送模式调用 `listen_directory()`
-  - 接收模式调用 `receive_directory()`
-  - 通过 `TransferProgress` 和 `CancelEvent` 驱动界面状态
+  - 主窗口固定包含“发送 / 接收”两个 tab，不再根据命令行参数选择模式
+  - 发送页通过 `GuiSendServer` 先绑定监听端口，接收端连入后等待一次拖放来触发发送
+  - 接收页通过输入框 + “连接”按钮显式启动 `receive_directory()`
+  - 两个 tab 分别维护自己的 `TransferProgress` 状态，并共享底部统计区域展示当前选中 tab 的进度
 
 ## 2. 代码组织
 
@@ -72,6 +73,10 @@
   - 顶层本地/网络编排
 - [src/detail/cli.cpp](src/detail/cli.cpp)
   - CLI 解析与 usage
+- [src/detail/gui_runtime.hpp](src/detail/gui_runtime.hpp)
+  - GUI 发送页的监听、接收端接入、拖放发送状态机
+- [src/detail/gui_runtime.cpp](src/detail/gui_runtime.cpp)
+  - GUI 发送页复用现有流水线，将多根路径打包并推送到网络套接字
 - [src/detail/windows_helpers.hpp](src/detail/windows_helpers.hpp)
   - Windows 错误文本和 GUI 辅助函数
 
@@ -109,6 +114,16 @@
 6. 通过 `SocketByteSink` 发送
 7. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
 
+### 3.3.1 GUI 发送
+
+GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServer` 做一个更贴合交互的会话层：
+
+1. 启动窗口时立即绑定一个固定监听端口，并生成可复制的 `soratrans://` 链接
+2. 接收端先连入该端口，发送页界面切换为拖放框
+3. 用户一次拖放可提交多个文件或目录
+4. `GuiSendServer` 复用现有 `DirScanner -> FileReaderPrefetcher -> TarPacker -> ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
+5. 单次拖放完成后关闭当前连接，再回到等待下一接收端的状态
+
 ### 3.4 网络接收
 
 `receive_directory()` 当前流程：
@@ -126,6 +141,7 @@
 当前 `DirScanner` 已经承担“扫描 + 填充元数据 + 并发打开普通文件”的职责：
 
 - 递归遍历目录，并保留根目录条目
+- 也支持一次接收多个根路径，供 GUI 发送页直接打包多个文件或目录
 - 生成 `FileMeta`，其中包含 UTF-8 tar 相对路径
 - 通过 `std::filesystem` 和 `GetFileInformationByHandleEx()` 填充大小、时间戳、Windows 文件属性
 - 普通文件会在线程池中并发打开，再按扫描顺序输出 `OpenedFileReader`

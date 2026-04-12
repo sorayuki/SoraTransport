@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 #include <windows.h>
@@ -206,8 +208,8 @@ OpenedFileReader open_regular_file(
 	return opened_file;
 }
 
-std::filesystem::path archive_root_name_for_directory(const std::filesystem::path& root_dir) {
-	auto normalized = root_dir.lexically_normal();
+std::filesystem::path archive_root_name_for_source(const std::filesystem::path& source_path) {
+	auto normalized = source_path.lexically_normal();
 	auto name = normalized.filename();
 	if (!name.empty()) {
 		return name;
@@ -219,7 +221,7 @@ std::filesystem::path archive_root_name_for_directory(const std::filesystem::pat
 		return std::filesystem::path(root_name);
 	}
 
-	throw std::runtime_error("source directory must have a name in the archive");
+	throw std::runtime_error("source path must have a name in the archive");
 }
 
 std::string archive_path_for_entry(
@@ -388,21 +390,24 @@ DirScanner::DirScanner(
 	  cancel_event_(cancel_event) {}
 
 boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const {
-	throw_if_cancelled(cancel_event_);
-	if (!std::filesystem::exists(root_dir)) {
-		throw std::runtime_error("source directory does not exist: " + path_to_utf8_string(root_dir));
-	}
-	if (!std::filesystem::is_directory(root_dir)) {
-		throw std::runtime_error("source path is not a directory: " + path_to_utf8_string(root_dir));
-	}
+	std::vector<std::filesystem::path> roots;
+	roots.push_back(root_dir);
+	co_await scan(roots, out_queue);
+	co_return;
+}
 
-	const auto archive_root_name = archive_root_name_for_directory(root_dir);
+boost::asio::awaitable<void> DirScanner::scan(const std::vector<std::filesystem::path>& input_roots, BoundedQueue<OpenedFileReader>& out_queue) const {
+	throw_if_cancelled(cancel_event_);
+	if (input_roots.empty()) {
+		throw std::runtime_error("at least one source path is required");
+	}
 
 	try {
 		std::map<std::size_t, std::future<OpenedFileReader>> pending_results;
 		std::map<std::size_t, OpenedFileReader> ready_results;
 		std::size_t next_sequence = 0;
 		std::size_t next_emit_sequence = 0;
+		std::set<std::string> archive_root_names;
 
 		auto emit_ready = [&](bool wait_for_next) -> boost::asio::awaitable<void> {
 			while (true) {
@@ -438,58 +443,103 @@ boost::asio::awaitable<void> DirScanner::scan(const std::filesystem::path& root_
 			}
 		};
 
-		OpenedFileReader root_entry;
-		root_entry.meta.full_path = root_dir;
-		populate_file_meta(root_entry.meta);
-		root_entry.meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
-		enqueue_ready(std::move(root_entry));
-		co_await emit_ready(false);
+		auto enqueue_directory_root = [&](const std::filesystem::path& root_dir, const std::filesystem::path& archive_root_name) -> boost::asio::awaitable<void> {
+			OpenedFileReader root_entry;
+			root_entry.meta.full_path = root_dir;
+			populate_file_meta(root_entry.meta);
+			root_entry.meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, ".");
+			enqueue_ready(std::move(root_entry));
+			co_await emit_ready(false);
 
-		std::deque<std::filesystem::path> directories;
-		directories.push_back(root_dir);
+			std::deque<std::filesystem::path> directories;
+			directories.push_back(root_dir);
 
-		while (!directories.empty()) {
-			throw_if_cancelled(cancel_event_);
-			auto current_dir = std::move(directories.front());
-			directories.pop_front();
-
-			for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
+			while (!directories.empty()) {
 				throw_if_cancelled(cancel_event_);
-				FileMeta meta;
-				meta.full_path = entry.path();
-				populate_file_status(meta);
-				meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
-				if (meta.relative_path_in_tar.empty()) {
-					continue;
-				}
-				if (meta.status.type() == std::filesystem::file_type::symlink) {
-					continue;
-				}
-				if (entry.is_directory()) {
-					directories.push_back(entry.path());
-				}
+				auto current_dir = std::move(directories.front());
+				directories.pop_front();
 
-				if (meta.status.type() == std::filesystem::file_type::regular) {
-					const auto sequence = next_sequence++;
-					pending_results.emplace(
-						sequence,
-						executors_.post([this, meta = std::move(meta)]() mutable {
-							return open_regular_file(
-								pool_,
-								std::move(meta),
-								buffer_size_,
-								cancel_event_);
-						}));
-				} else {
-					OpenedFileReader opened_file;
-					opened_file.meta = std::move(meta);
-					populate_file_meta(opened_file.meta);
-					ready_results.emplace(next_sequence++, std::move(opened_file));
-				}
+				for (const auto& entry : std::filesystem::directory_iterator(current_dir)) {
+					throw_if_cancelled(cancel_event_);
+					FileMeta meta;
+					meta.full_path = entry.path();
+					populate_file_status(meta);
+					meta.relative_path_in_tar = archive_path_for_entry(archive_root_name, entry.path().lexically_relative(root_dir));
+					if (meta.relative_path_in_tar.empty()) {
+						continue;
+					}
+					if (meta.status.type() == std::filesystem::file_type::symlink) {
+						continue;
+					}
+					if (entry.is_directory()) {
+						directories.push_back(entry.path());
+					}
 
-				co_await emit_ready(false);
-				co_await throttle_reorder_window();
+					if (meta.status.type() == std::filesystem::file_type::regular) {
+						const auto sequence = next_sequence++;
+						pending_results.emplace(
+							sequence,
+							executors_.post([this, meta = std::move(meta)]() mutable {
+								return open_regular_file(
+									pool_,
+									std::move(meta),
+									buffer_size_,
+									cancel_event_);
+							}));
+					} else {
+						OpenedFileReader opened_file;
+						opened_file.meta = std::move(meta);
+						populate_file_meta(opened_file.meta);
+						ready_results.emplace(next_sequence++, std::move(opened_file));
+					}
+
+					co_await emit_ready(false);
+					co_await throttle_reorder_window();
+				}
 			}
+		};
+
+		auto enqueue_regular_root = [&](const std::filesystem::path& root_file, const std::filesystem::path& archive_root_name) -> boost::asio::awaitable<void> {
+			FileMeta meta;
+			meta.full_path = root_file;
+			populate_file_status(meta);
+			meta.relative_path_in_tar = path_to_generic_utf8_string(archive_root_name);
+			const auto sequence = next_sequence++;
+			pending_results.emplace(
+				sequence,
+				executors_.post([this, meta = std::move(meta)]() mutable {
+					return open_regular_file(
+						pool_,
+						std::move(meta),
+						buffer_size_,
+						cancel_event_);
+				}));
+			co_await emit_ready(false);
+			co_await throttle_reorder_window();
+		};
+
+		for (const auto& root_path : input_roots) {
+			throw_if_cancelled(cancel_event_);
+			if (!std::filesystem::exists(root_path)) {
+				throw std::runtime_error("source path does not exist: " + path_to_utf8_string(root_path));
+			}
+
+			const auto archive_root_name = archive_root_name_for_source(root_path);
+			const auto archive_root_key = path_to_generic_utf8_string(archive_root_name);
+			if (!archive_root_names.insert(archive_root_key).second) {
+				throw std::runtime_error("duplicate archive root name is not supported: " + archive_root_key);
+			}
+
+			if (std::filesystem::is_directory(root_path)) {
+				co_await enqueue_directory_root(root_path, archive_root_name);
+				continue;
+			}
+			if (std::filesystem::is_regular_file(root_path)) {
+				co_await enqueue_regular_root(root_path, archive_root_name);
+				continue;
+			}
+
+			throw std::runtime_error("unsupported source path type: " + path_to_utf8_string(root_path));
 		}
 
 		while (!pending_results.empty() || !ready_results.empty()) {

@@ -19,6 +19,7 @@ class TransferProgress {
 public:
 	void add_processed_bytes(std::uint64_t bytes);
 	void add_processed_files(std::uint64_t files = 1);
+	void reset(std::string status_text = "idle");
 	void set_status(std::string status_text);
 	void set_completed(std::string status_text = "completed");
 	void set_failed(std::string status_text);

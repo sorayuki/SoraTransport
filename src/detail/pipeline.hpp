@@ -203,6 +203,7 @@ public:
 		std::size_t submit_concurrency,
 		std::size_t buffer_size,
 		CancelEvent* cancel_event = nullptr);
+	boost::asio::awaitable<void> scan(const std::vector<std::filesystem::path>& roots, BoundedQueue<OpenedFileReader>& out_queue) const;
 	boost::asio::awaitable<void> scan(const std::filesystem::path& root_dir, BoundedQueue<OpenedFileReader>& out_queue) const;
 
 private:

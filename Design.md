@@ -67,6 +67,7 @@ FileByteSource / SocketByteSource
 ### 2.1 DirScanner
 
 - 递归遍历目录，并保留根目录条目
+- 也可以按给定顺序处理多个独立根路径，允许 GUI 一次拖放多个文件或目录
 - 为所有条目填充 `FileMeta`
 - 将相对路径统一转换为 UTF-8 generic path，供 tar 条目名使用
 - 普通文件会在线程池中并发打开，并以 `OpenedFileReader` 的形式顺序输出
@@ -219,7 +220,12 @@ FileByteSource / SocketByteSource
   - 可选 `--read-files`，通过真实的 open + prefetch + consume 流水线验证读取性能
 - `soratransport_app`
   - 基于 FLTK 的 Windows GUI
-  - 复用 `listen_directory` / `receive_directory`、`TransferProgress` 与 `CancelEvent`
+    - 主界面固定为“发送 / 接收”两个 tab
+    - 发送页启动后立即绑定监听端口并展示可复制的 `soratrans://` 链接
+    - 当接收端先连入发送页后，界面切换为拖放框；一次拖放可提交多个文件或目录，并触发一次发送
+    - 接收页提供发送者链接输入框，按回车或点“连接”后才发起接收
+    - 启动时如果剪贴板里有可识别的 `soratrans://` 链接，则默认切到接收页并预填输入框；否则默认切到发送页
+    - GUI 不再接受命令行参数来决定模式
 
 其中 `-l <level>` 的语义是“显式锁定压缩级别”，不是“提供一个自适应起始值”。
 

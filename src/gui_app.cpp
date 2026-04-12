@@ -1,24 +1,29 @@
 #include "core.hpp"
+#include "detail/gui_runtime.hpp"
 #include "detail/windows_helpers.hpp"
 
 #include <FL/Fl.H>
 #include <FL/Fl_Box.H>
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Double_Window.H>
+#include <FL/Fl_Group.H>
+#include <FL/Fl_Input.H>
+#include <FL/Fl_Return_Button.H>
 #include <FL/Fl_Scroll.H>
+#include <FL/Fl_Tabs.H>
 #include <FL/fl_ask.H>
 #include <FL/platform.H>
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <vector>
 
 namespace soratransport {
 
@@ -54,30 +59,12 @@ std::string path_to_ui_text(const std::filesystem::path& path) {
 	return path_to_utf8_string(path);
 }
 
-std::string make_label(std::string_view prefix, std::string_view value) {
-	std::string label(prefix);
-	label += value;
-	return label;
-}
-
-bool should_mark_transfer_started(std::string_view raw_status_text, const TransferProgressSnapshot& snapshot) {
-	return raw_status_text == "receiver connected"
-		|| raw_status_text == "send completed"
-		|| raw_status_text == "send failed"
-		|| raw_status_text == "cancelled"
-		|| snapshot.processed_bytes != 0
-		|| snapshot.processed_files != 0;
-}
-
 std::string translate_status_text(std::string_view status_text) {
 	if (status_text == "idle") {
 		return "空闲";
 	}
 	if (status_text == "waiting") {
 		return "等待操作";
-	}
-	if (status_text == "starting sender") {
-		return "正在启动发送端";
 	}
 	if (status_text == "starting receiver") {
 		return "正在启动接收端";
@@ -89,7 +76,10 @@ std::string translate_status_text(std::string_view status_text) {
 		return "等待接收端连接";
 	}
 	if (status_text == "receiver connected") {
-		return "接收端已连接，正在开始传输";
+		return "接收端已连接，等待拖放";
+	}
+	if (status_text == "sending") {
+		return "正在发送";
 	}
 	if (status_text == "connecting") {
 		return "正在连接";
@@ -131,117 +121,236 @@ std::wstring utf8_to_utf16(std::string_view text) {
 	return result;
 }
 
-enum class GuiMode {
-	Idle,
-	Send,
-	Receive,
+std::string trim_ascii(std::string value) {
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+		value.erase(value.begin());
+	}
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+		value.pop_back();
+	}
+	return value;
+}
+
+std::vector<std::filesystem::path> parse_dropped_paths(std::string_view raw_text) {
+	std::vector<std::filesystem::path> paths;
+	std::size_t offset = 0;
+	while (offset <= raw_text.size()) {
+		const auto next = raw_text.find('\n', offset);
+		auto piece = raw_text.substr(offset, next == std::string_view::npos ? raw_text.size() - offset : next - offset);
+		if (!piece.empty() && piece.back() == '\r') {
+			piece.remove_suffix(1);
+		}
+		auto text = trim_ascii(std::string(piece));
+		if (!text.empty()) {
+			paths.emplace_back(std::move(text));
+		}
+		if (next == std::string_view::npos) {
+			break;
+		}
+		offset = next + 1;
+	}
+	return paths;
+}
+
+class DropTargetBox final : public Fl_Box {
+public:
+	explicit DropTargetBox(int x, int y, int w, int h)
+		: Fl_Box(x, y, w, h, "接收端已连接。\n将文件或文件夹拖到这里开始发送。") {
+		box(FL_BORDER_BOX);
+		align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE | FL_ALIGN_WRAP);
+		labelsize(16);
+		labelfont(FL_HELVETICA_BOLD);
+		update_visual_state();
+	}
+
+	void set_drop_handler(std::function<void(std::vector<std::filesystem::path>)> handler) {
+		on_drop_ = std::move(handler);
+	}
+
+	void set_accepting(bool value) {
+		if (accepting_ == value) {
+			return;
+		}
+		accepting_ = value;
+		if (!accepting_) {
+			highlighted_ = false;
+		}
+		update_visual_state();
+	}
+
+	void set_message(std::string message) {
+		copy_label(message.c_str());
+		redraw();
+	}
+
+	int handle(int event) override {
+		if (!accepting_) {
+			return Fl_Box::handle(event);
+		}
+
+		switch (event) {
+		case FL_DND_ENTER:
+		case FL_DND_DRAG:
+			highlighted_ = true;
+			update_visual_state();
+			return 1;
+		case FL_DND_LEAVE:
+			highlighted_ = false;
+			update_visual_state();
+			return 1;
+		case FL_DND_RELEASE:
+			highlighted_ = true;
+			update_visual_state();
+			return 1;
+		case FL_PASTE:
+			highlighted_ = false;
+			update_visual_state();
+			if (on_drop_) {
+				auto paths = parse_dropped_paths(std::string_view(Fl::event_text(), static_cast<std::size_t>(Fl::event_length())));
+				if (!paths.empty()) {
+					on_drop_(std::move(paths));
+				}
+			}
+			return 1;
+		default:
+			return Fl_Box::handle(event);
+		}
+	}
+
+private:
+	void update_visual_state() {
+		if (!accepting_) {
+			color(fl_rgb_color(229, 224, 216));
+			labelcolor(fl_rgb_color(110, 105, 96));
+		} else if (highlighted_) {
+			color(fl_rgb_color(212, 232, 255));
+			labelcolor(fl_rgb_color(30, 62, 102));
+		} else {
+			color(fl_rgb_color(239, 235, 228));
+			labelcolor(fl_rgb_color(58, 54, 48));
+		}
+		redraw();
+	}
+
+	bool accepting_ = true;
+	bool highlighted_ = false;
+	std::function<void(std::vector<std::filesystem::path>)> on_drop_;
+};
+
+struct ProgressViewState {
+	std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+	std::optional<std::chrono::steady_clock::time_point> completed_at;
+	std::chrono::steady_clock::time_point last_sample_time{};
+	std::uint64_t last_bytes = 0;
+	std::uint64_t last_files = 0;
+	std::uint64_t recent_rate = 0;
+	std::uint64_t recent_files = 0;
+	std::string last_status_text;
 };
 
 class AppWindow final : public Fl_Double_Window {
 public:
-	AppWindow(GuiMode mode, std::filesystem::path path, std::optional<SoratransUrl> url)
-		: Fl_Double_Window(920, 560, "SoraTransport 文件传输"),
-		  mode_(mode),
-		  path_(std::move(path)),
-		  receive_url_(std::move(url)),
-		  progress_(std::make_shared<TransferProgress>()),
-		  started_at_(std::chrono::steady_clock::now()) {
+	AppWindow(std::filesystem::path current_dir, std::optional<SoratransUrl> clipboard_url)
+		: Fl_Double_Window(980, 620, "SoraTransport 文件传输"),
+		  current_dir_(std::move(current_dir)),
+		  send_progress_(std::make_shared<TransferProgress>()),
+		  receive_progress_(std::make_shared<TransferProgress>()),
+		  send_server_(send_progress_),
+		  receive_url_(std::move(clipboard_url)) {
 		begin();
-		title_box_ = new Fl_Box(24, 18, 872, 34, "SoraTransport 文件传输");
-		mode_box_ = new Fl_Box(24, 66, 872, 28);
-		detail_box_ = new Fl_Box(24, 100, 872, 28);
-		recent_box_ = new Fl_Box(24, 152, 872, 28);
-		total_box_ = new Fl_Box(24, 186, 872, 28);
-		status_box_ = new Fl_Box(24, 220, 872, 28);
-		address_title_box_ = new Fl_Box(24, 272, 872, 24, "可分享的地址");
-		address_scroll_ = new Fl_Scroll(24, 304, 872, 220);
-		empty_box_ = new Fl_Box(40, 328, 840, 48, "");
+		title_box_ = new Fl_Box(20, 18, 940, 34, "SoraTransport 文件传输");
+		tabs_ = new Fl_Tabs(20, 72, 940, 250);
+		build_send_tab();
+		build_receive_tab();
+		tabs_->end();
+		detail_box_ = new Fl_Box(20, 346, 940, 28);
+		recent_box_ = new Fl_Box(20, 388, 940, 28);
+		total_box_ = new Fl_Box(20, 430, 940, 28);
+		status_box_ = new Fl_Box(20, 472, 940, 28);
 		end();
 
 		color(fl_rgb_color(247, 244, 238));
 		title_box_->labelfont(FL_HELVETICA_BOLD);
 		title_box_->labelsize(28);
-		mode_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		detail_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		recent_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		total_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		status_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		address_title_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		address_title_box_->labelfont(FL_HELVETICA_BOLD);
-		address_title_box_->labelsize(16);
-		empty_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
-		empty_box_->hide();
-
-		for (Fl_Box* box : {mode_box_, detail_box_, recent_box_, total_box_, status_box_}) {
+		for (Fl_Box* box : {detail_box_, recent_box_, total_box_, status_box_}) {
+			box->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 			box->labelsize(15);
 		}
 
-		switch (mode_) {
-		case GuiMode::Send:
-			mode_box_->copy_label("模式：发送");
-			detail_box_->copy_label(make_label("源目录：", path_to_ui_text(path_)).c_str());
-			address_title_box_->show();
-			address_scroll_->show();
-			progress_->set_status("starting sender");
-			session_thread_ = std::jthread([this](std::stop_token stop_token) {
-				try {
-					listen_directory(path_, 0, {}, progress_, &bound_port_, stop_token, &cancel_event_);
-				} catch (const std::exception& error) {
-					progress_->set_failed(error.what());
-				}
-				session_finished_.store(true, std::memory_order_release);
-				Fl::awake();
-			});
-			break;
-		case GuiMode::Receive:
-			mode_box_->copy_label("模式：接收");
-			detail_box_->copy_label(make_label("目标目录：", path_to_ui_text(path_)).c_str());
-			address_title_box_->hide();
-			address_scroll_->hide();
-			empty_box_->show();
-			empty_box_->copy_label("接收模式会从剪贴板读取 soratrans:// 地址，并将收到的文件保存到当前文件夹。");
-			progress_->set_status("starting receiver");
-			session_thread_ = std::jthread([this](std::stop_token stop_token) {
-				try {
-					receive_directory(receive_url_->host, receive_url_->port, path_, progress_, stop_token, &cancel_event_);
-				} catch (const std::exception& error) {
-					progress_->set_failed(error.what());
-				}
-				session_finished_.store(true, std::memory_order_release);
-				Fl::awake();
-			});
-			break;
-		case GuiMode::Idle:
-			mode_box_->copy_label("模式：待机");
-			detail_box_->copy_label("未提供目录参数，且剪贴板中也没有 soratrans:// 地址。");
-			address_title_box_->hide();
-			address_scroll_->hide();
-			empty_box_->show();
-			empty_box_->copy_label("启动时传入一个文件夹即可进入发送模式；或者先把 soratrans:// 地址复制到剪贴板，再在无参数启动时于此处接收。\n\n提示：发送模式下可点击下方地址按钮复制分享地址。");
-			progress_->set_status("waiting");
-			break;
+		drop_target_->set_drop_handler([this](std::vector<std::filesystem::path> paths) {
+			handle_drop(std::move(paths));
+		});
+		connect_button_->callback(connect_callback, this);
+		receive_input_->when(FL_WHEN_ENTER_KEY_ALWAYS);
+		receive_input_->callback(connect_callback, this);
+		tabs_->callback(tabs_changed_callback, this);
+		callback(window_close_callback, this);
+
+		if (receive_url_) {
+			receive_input_->value(receive_url_->canonical_text.c_str());
+			tabs_->value(receive_group_);
+		} else {
+			tabs_->value(send_group_);
 		}
 
-		callback(window_close_callback, this);
+		send_progress_->reset("binding listener");
+		receive_progress_->reset("waiting");
+		try {
+			send_server_.start();
+		} catch (const std::exception& error) {
+			send_progress_->set_failed(error.what());
+		}
+
 		update_ui();
 		Fl::add_timeout(0.25, timer_callback, this);
 	}
 
 	~AppWindow() override {
 		Fl::remove_timeout(timer_callback, this);
+		stop_receive_session(true);
+		send_server_.stop();
 	}
 
 private:
-	static void window_close_callback(Fl_Widget*, void* context) {
-		static_cast<AppWindow*>(context)->handle_close_request();
+	void build_send_tab() {
+		send_group_ = new Fl_Group(22, 96, 936, 224, "发送");
+		send_intro_box_ = new Fl_Box(38, 124, 900, 24, "先复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
+		send_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+		send_intro_box_->labelsize(15);
+		send_address_title_box_ = new Fl_Box(38, 160, 900, 24, "复制发送链接");
+		send_address_title_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+		send_address_title_box_->labelfont(FL_HELVETICA_BOLD);
+		send_address_title_box_->labelsize(16);
+		send_address_scroll_ = new Fl_Scroll(38, 194, 900, 106);
+		send_empty_box_ = new Fl_Box(50, 204, 876, 88, "正在准备发送地址...");
+		send_empty_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
+		send_empty_box_->labelsize(14);
+		drop_target_ = new DropTargetBox(38, 194, 900, 106);
+		drop_target_->hide();
+		send_group_->end();
 	}
 
-	static void copy_address_callback(Fl_Widget* widget, void* context) {
-		auto* self = static_cast<AppWindow*>(context);
-		write_clipboard_text(widget->label());
-		self->transient_status_ = "地址已复制到剪贴板";
-		self->transient_status_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-		self->update_ui();
+	void build_receive_tab() {
+		receive_group_ = new Fl_Group(22, 96, 936, 224, "接收");
+		receive_intro_box_ = new Fl_Box(38, 124, 900, 24, "输入发送者链接后连接；接收到的数据会保存到当前工作目录。");
+		receive_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+		receive_intro_box_->labelsize(15);
+		receive_destination_box_ = new Fl_Box(38, 160, 900, 24, "保存目录：");
+		receive_destination_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+		receive_destination_box_->labelsize(15);
+		receive_input_ = new Fl_Input(38, 204, 736, 34);
+		receive_input_->textsize(15);
+		connect_button_ = new Fl_Return_Button(790, 204, 148, 34, "连接");
+		connect_button_->color(fl_rgb_color(233, 226, 214));
+		connect_button_->selection_color(fl_rgb_color(212, 169, 92));
+		receive_hint_box_ = new Fl_Box(38, 252, 900, 46, "支持在输入框按回车，或点击右侧按钮开始连接。");
+		receive_hint_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
+		receive_hint_box_->labelsize(14);
+		receive_group_->end();
+	}
+
+	static void window_close_callback(Fl_Widget*, void* context) {
+		static_cast<AppWindow*>(context)->handle_close_request();
 	}
 
 	static void timer_callback(void* context) {
@@ -250,198 +359,334 @@ private:
 		Fl::repeat_timeout(0.25, timer_callback, context);
 	}
 
+	static void tabs_changed_callback(Fl_Widget*, void* context) {
+		static_cast<AppWindow*>(context)->update_ui();
+	}
+
+	static void copy_address_callback(Fl_Widget* widget, void* context) {
+		auto* self = static_cast<AppWindow*>(context);
+		write_clipboard_text(widget->label());
+		self->set_transient_status("链接已复制到剪贴板");
+	}
+
+	static void connect_callback(Fl_Widget*, void* context) {
+		static_cast<AppWindow*>(context)->start_receive_session();
+	}
+
+	void set_transient_status(std::string status) {
+		transient_status_ = std::move(status);
+		transient_status_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		update_ui();
+	}
+
+	void cleanup_finished_receive_session() {
+		if (receive_session_finished_.load(std::memory_order_acquire) && receive_thread_.joinable()) {
+			receive_thread_.join();
+		}
+	}
+
+	bool is_receive_session_active() const {
+		return receive_thread_.joinable() && !receive_session_finished_.load(std::memory_order_acquire);
+	}
+
+	void stop_receive_session(bool join_now) {
+		if (receive_cancel_event_) {
+			receive_cancel_event_->emit();
+		}
+		if (receive_thread_.joinable()) {
+			receive_thread_.request_stop();
+			if (join_now) {
+				receive_thread_.join();
+				receive_session_finished_.store(true, std::memory_order_release);
+			}
+		}
+	}
+
+	void start_receive_session() {
+		cleanup_finished_receive_session();
+		if (is_receive_session_active()) {
+			set_transient_status("当前接收任务仍在进行");
+			return;
+		}
+
+		auto parsed_url = parse_soratrans_url(receive_input_->value());
+		if (!parsed_url) {
+			set_transient_status("请输入有效的 soratrans:// 链接");
+			return;
+		}
+
+		receive_url_ = *parsed_url;
+		receive_progress_->reset("connecting");
+		receive_cancel_event_ = std::make_unique<CancelEvent>();
+		receive_session_finished_.store(false, std::memory_order_release);
+		receive_thread_ = std::jthread([
+			this,
+			url = *receive_url_,
+			cancel_event = receive_cancel_event_.get()](std::stop_token stop_token) {
+			try {
+				receive_directory(url.host, url.port, current_dir_, receive_progress_, stop_token, cancel_event);
+			} catch (...) {
+			}
+			receive_session_finished_.store(true, std::memory_order_release);
+			Fl::awake();
+		});
+		update_ui();
+	}
+
+	void handle_drop(std::vector<std::filesystem::path> paths) {
+		auto submit_error = send_server_.submit_paths(std::move(paths));
+		if (submit_error) {
+			set_transient_status(*submit_error);
+			return;
+		}
+		set_transient_status("已开始发送拖放内容");
+	}
+
 	void handle_close_request() {
 		if (close_requested_) {
 			return;
 		}
 
-		const auto snapshot = progress_->snapshot();
-		if (mode_ == GuiMode::Idle || snapshot.completed) {
-			hide();
-			return;
-		}
-
-		const bool active_transfer = (mode_ == GuiMode::Receive) || transfer_started_;
+		const auto send_snapshot = send_server_.snapshot();
+		const bool active_transfer = send_snapshot.receiver_connected || send_snapshot.transfer_in_progress || is_receive_session_active();
 		if (active_transfer) {
-			const auto choice = fl_choice("传输仍在进行，要停止吗？", "否", "是", nullptr);
+			const auto choice = fl_choice("传输或连接仍在进行，要停止吗？", "否", "是", nullptr);
 			if (choice != kStopTransferChoice) {
 				return;
 			}
 		}
 
 		close_requested_ = true;
-		transient_status_ = "正在取消传输...";
-		transient_status_until_ = std::chrono::steady_clock::time_point::max();
-		cancel_event_.emit();
-		session_thread_.request_stop();
-		update_ui();
-		if (session_finished_.load(std::memory_order_acquire)) {
-			hide();
-		}
+		stop_receive_session(true);
+		send_server_.stop();
+		hide();
 	}
 
 	void rebuild_address_buttons() {
 		for (auto* button : address_buttons_) {
-			address_scroll_->remove(button);
+			send_address_scroll_->remove(button);
 			delete button;
 		}
 		address_buttons_.clear();
 
 		int y = 8;
 		for (const auto& address : addresses_) {
-			auto* button = new Fl_Button(address_scroll_->x() + 8, address_scroll_->y() + y, address_scroll_->w() - 24, 36, address.url.c_str());
+			auto* button = new Fl_Button(send_address_scroll_->x() + 8, send_address_scroll_->y() + y, send_address_scroll_->w() - 24, 34, address.url.c_str());
 			button->callback(copy_address_callback, this);
 			button->color(fl_rgb_color(233, 226, 214));
 			button->selection_color(fl_rgb_color(212, 169, 92));
-			address_scroll_->add(button);
+			send_address_scroll_->add(button);
 			address_buttons_.push_back(button);
-			y += 44;
+			y += 42;
 		}
-		if (addresses_.empty()) {
-			empty_box_->show();
-			empty_box_->copy_label("暂未找到带默认网关的可用非虚拟网卡地址。\n\n如果你刚接入网络或切换了网卡，请稍后重新打开程序。\n点击上方任一地址即可复制到剪贴板。");
-		} else {
-			empty_box_->hide();
-		}
-		address_scroll_->redraw();
+		send_address_scroll_->redraw();
 	}
 
-	void update_send_addresses() {
-		const auto port = bound_port_.load(std::memory_order_relaxed);
-		if (mode_ != GuiMode::Send || port == 0 || addresses_loaded_) {
+	void update_send_addresses(std::uint16_t port) {
+		if (port == 0 || address_port_ == port) {
 			return;
 		}
-
-		addresses_loaded_ = true;
+		address_port_ = port;
 		try {
 			addresses_ = enumerate_shareable_addresses(port);
 			rebuild_address_buttons();
 		} catch (const std::exception& error) {
-			progress_->set_failed(error.what());
+			send_progress_->set_failed(error.what());
 		}
 	}
 
-	void update_ui() {
-		if (close_requested_ && session_finished_.load(std::memory_order_acquire)) {
-			hide();
+	void update_send_controls(const GuiSendServerSnapshot& snapshot) {
+		if (snapshot.receiver_connected) {
+			send_address_title_box_->hide();
+			send_address_scroll_->hide();
+			send_empty_box_->hide();
+			drop_target_->show();
+			if (snapshot.transfer_in_progress) {
+				drop_target_->set_accepting(false);
+				drop_target_->set_message("正在发送当前拖放内容，请等待本次传输完成。");
+			} else {
+				drop_target_->set_accepting(true);
+				drop_target_->set_message("接收端已连接。\n将文件或文件夹拖到这里开始发送。");
+			}
 			return;
 		}
 
-		update_send_addresses();
-
-		const auto snapshot = progress_->snapshot();
-		const auto now = std::chrono::steady_clock::now();
-		const std::string raw_status_text = snapshot.status_text;
-		if (snapshot.completed && !completed_at_.has_value()) {
-			completed_at_ = now;
+		drop_target_->hide();
+		send_address_title_box_->show();
+		if (snapshot.bound_port == 0) {
+			send_address_scroll_->hide();
+			send_empty_box_->show();
+			send_empty_box_->copy_label("正在准备发送地址...");
+			return;
 		}
-		if (mode_ == GuiMode::Send && !transfer_started_ && should_mark_transfer_started(raw_status_text, snapshot)) {
-			transfer_started_ = true;
-			address_title_box_->hide();
-			address_scroll_->hide();
-			empty_box_->hide();
+		if (addresses_.empty()) {
+			send_address_scroll_->hide();
+			send_empty_box_->show();
+			send_empty_box_->copy_label("暂未找到可分享的非虚拟网卡地址。\n\n如果你刚切换网络，请稍后再试。\n接收端连入后，这里会自动切换为拖放框。");
+			return;
+		}
+		send_empty_box_->hide();
+		send_address_scroll_->show();
+	}
+
+	void update_receive_controls() {
+		receive_destination_box_->copy_label(("保存目录：" + path_to_ui_text(current_dir_)).c_str());
+		const bool active = is_receive_session_active();
+		if (active) {
+			receive_input_->deactivate();
+			connect_button_->deactivate();
+		} else {
+			receive_input_->activate();
+			connect_button_->activate();
+		}
+	}
+
+	void update_progress_view_state(const TransferProgressSnapshot& snapshot, ProgressViewState& state, std::chrono::steady_clock::time_point now) {
+		const bool counters_reset = snapshot.processed_bytes < state.last_bytes || snapshot.processed_files < state.last_files;
+		const bool phase_reset = snapshot.status_text != state.last_status_text && snapshot.processed_bytes == 0 && snapshot.processed_files == 0;
+		if (counters_reset || phase_reset) {
+			state.started_at = now;
+			state.completed_at.reset();
+			state.last_sample_time = now;
+			state.last_bytes = snapshot.processed_bytes;
+			state.last_files = snapshot.processed_files;
+			state.recent_rate = 0;
+			state.recent_files = 0;
+		}
+		if (snapshot.completed && !state.completed_at.has_value()) {
+			state.completed_at = now;
+		}
+		if (!snapshot.completed) {
+			state.completed_at.reset();
+		}
+		if (state.last_sample_time.time_since_epoch().count() == 0) {
+			state.last_sample_time = now;
+			state.last_bytes = snapshot.processed_bytes;
+			state.last_files = snapshot.processed_files;
+		}
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_sample_time);
+		if (elapsed >= std::chrono::seconds(1)) {
+			state.recent_rate = snapshot.processed_bytes - state.last_bytes;
+			state.recent_files = snapshot.processed_files - state.last_files;
+			state.last_bytes = snapshot.processed_bytes;
+			state.last_files = snapshot.processed_files;
+			state.last_sample_time = now;
+		}
+		state.last_status_text = snapshot.status_text;
+	}
+
+	void update_detail_box(const GuiSendServerSnapshot& send_snapshot, bool receive_selected) {
+		if (receive_selected) {
+			auto parsed_url = parse_soratrans_url(receive_input_->value());
+			if (parsed_url) {
+				detail_box_->copy_label(("来源地址：" + parsed_url->canonical_text + "    保存到：" + path_to_ui_text(current_dir_)).c_str());
+			} else {
+				detail_box_->copy_label(("保存到：" + path_to_ui_text(current_dir_)).c_str());
+			}
+			return;
 		}
 
-		if (!transient_status_.empty() && now >= transient_status_until_) {
+		if (send_snapshot.bound_port == 0) {
+			detail_box_->copy_label("发送页：正在绑定监听端口...");
+			return;
+		}
+		if (send_snapshot.receiver_connected) {
+			detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    接收端已连入，可等待拖放开始发送").c_str());
+			return;
+		}
+		detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    复制任一链接给接收端").c_str());
+	}
+
+	void update_summary_boxes(const TransferProgressSnapshot& snapshot, const ProgressViewState& state, bool receive_selected, std::chrono::steady_clock::time_point now) {
+		const auto average_rate_end_time = state.completed_at.value_or(now);
+		const std::string io_label = receive_selected ? "磁盘写入" : "磁盘读取";
+		recent_box_->copy_label((io_label + "（最近 1 秒）：" + format_rate(state.recent_rate) + "    最近 1 秒文件数：" + std::to_string(state.recent_files)).c_str());
+		total_box_->copy_label((io_label + "（累计）：" + format_size(snapshot.processed_bytes) + "    平均速率：" + format_average_rate(snapshot.processed_bytes, average_rate_end_time - state.started_at) + "    累计文件数：" + std::to_string(snapshot.processed_files)).c_str());
+	}
+
+	void update_status_box(const TransferProgressSnapshot& snapshot) {
+		std::string status_text = translate_status_text(snapshot.status_text);
+		if (!transient_status_.empty() && std::chrono::steady_clock::now() >= transient_status_until_) {
 			transient_status_.clear();
 		}
-		if (last_sample_time_.time_since_epoch().count() == 0) {
-			last_sample_time_ = now;
-			last_bytes_ = snapshot.processed_bytes;
-			last_files_ = snapshot.processed_files;
-		}
-
-		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sample_time_);
-		if (elapsed >= std::chrono::seconds(1)) {
-			recent_rate_ = snapshot.processed_bytes - last_bytes_;
-			recent_files_ = snapshot.processed_files - last_files_;
-			last_bytes_ = snapshot.processed_bytes;
-			last_files_ = snapshot.processed_files;
-			last_sample_time_ = now;
-		}
-
-		if (mode_ == GuiMode::Receive && receive_url_) {
-			detail_box_->copy_label(("传输地址：" + receive_url_->canonical_text + "    保存到：" + path_to_ui_text(path_)).c_str());
-		} else if (mode_ == GuiMode::Send) {
-			const auto bound_port = bound_port_.load(std::memory_order_relaxed);
-			if (bound_port != 0) {
-				detail_box_->copy_label(("源目录：" + path_to_ui_text(path_) + "    端口：" + std::to_string(bound_port)).c_str());
-			}
-		}
-
-		const auto average_rate_end_time = completed_at_.value_or(now);
-		const std::string io_label = mode_ == GuiMode::Receive ? "磁盘写入" : "磁盘读取";
-		recent_box_->copy_label((io_label + "（最近 1 秒）：" + format_rate(recent_rate_) + "    最近 1 秒文件数：" + std::to_string(recent_files_)).c_str());
-		total_box_->copy_label((io_label + "（累计）：" + format_size(snapshot.processed_bytes) + "    平均速率：" + format_average_rate(snapshot.processed_bytes, average_rate_end_time - started_at_) + "    累计文件数：" + std::to_string(snapshot.processed_files)).c_str());
-
-		std::string status_text = translate_status_text(raw_status_text);
-		if (mode_ == GuiMode::Send && bound_port_.load(std::memory_order_relaxed) != 0 && raw_status_text == "binding listener") {
-			status_text = "等待接收端连接";
-		}
 		if (!transient_status_.empty()) {
-			status_text += "    " + transient_status_;
+			if (!status_text.empty()) {
+				status_text += "    ";
+			}
+			status_text += transient_status_;
 		}
 		status_box_->copy_label(("状态：" + status_text).c_str());
 	}
 
-	GuiMode mode_;
-	std::filesystem::path path_;
+	void update_ui() {
+		cleanup_finished_receive_session();
+
+		const auto now = std::chrono::steady_clock::now();
+		const auto send_snapshot = send_server_.snapshot();
+		update_send_addresses(send_snapshot.bound_port);
+		update_send_controls(send_snapshot);
+		update_receive_controls();
+
+		const auto send_progress_snapshot = send_progress_->snapshot();
+		const auto receive_progress_snapshot = receive_progress_->snapshot();
+		update_progress_view_state(send_progress_snapshot, send_view_state_, now);
+		update_progress_view_state(receive_progress_snapshot, receive_view_state_, now);
+
+		const bool receive_selected = tabs_->value() == receive_group_;
+		const auto& selected_progress = receive_selected ? receive_progress_snapshot : send_progress_snapshot;
+		const auto& selected_view_state = receive_selected ? receive_view_state_ : send_view_state_;
+		update_detail_box(send_snapshot, receive_selected);
+		update_summary_boxes(selected_progress, selected_view_state, receive_selected, now);
+		update_status_box(selected_progress);
+	}
+
+	std::filesystem::path current_dir_;
+	std::shared_ptr<TransferProgress> send_progress_;
+	std::shared_ptr<TransferProgress> receive_progress_;
+	GuiSendServer send_server_;
 	std::optional<SoratransUrl> receive_url_;
-	std::shared_ptr<TransferProgress> progress_;
-	CancelEvent cancel_event_;
-	std::jthread session_thread_;
-	std::atomic<std::uint16_t> bound_port_{0};
-	std::chrono::steady_clock::time_point started_at_;
-	std::optional<std::chrono::steady_clock::time_point> completed_at_;
-	bool addresses_loaded_ = false;
-	bool transfer_started_ = false;
-	bool close_requested_ = false;
-	std::atomic<bool> session_finished_{false};
+	std::unique_ptr<CancelEvent> receive_cancel_event_;
+	std::jthread receive_thread_;
+	std::atomic<bool> receive_session_finished_{true};
+	std::uint16_t address_port_ = 0;
 	std::vector<InterfaceAddress> addresses_;
 	std::vector<Fl_Button*> address_buttons_;
-	std::chrono::steady_clock::time_point last_sample_time_{};
-	std::chrono::steady_clock::time_point transient_status_until_{};
-	std::uint64_t last_bytes_ = 0;
-	std::uint64_t last_files_ = 0;
-	std::uint64_t recent_rate_ = 0;
-	std::uint64_t recent_files_ = 0;
+	ProgressViewState send_view_state_;
+	ProgressViewState receive_view_state_;
+	bool close_requested_ = false;
 	std::string transient_status_;
+	std::chrono::steady_clock::time_point transient_status_until_{};
 
 	Fl_Box* title_box_ = nullptr;
-	Fl_Box* mode_box_ = nullptr;
+	Fl_Tabs* tabs_ = nullptr;
+	Fl_Group* send_group_ = nullptr;
+	Fl_Group* receive_group_ = nullptr;
+	Fl_Box* send_intro_box_ = nullptr;
+	Fl_Box* send_address_title_box_ = nullptr;
+	Fl_Scroll* send_address_scroll_ = nullptr;
+	Fl_Box* send_empty_box_ = nullptr;
+	DropTargetBox* drop_target_ = nullptr;
+	Fl_Box* receive_intro_box_ = nullptr;
+	Fl_Box* receive_destination_box_ = nullptr;
+	Fl_Input* receive_input_ = nullptr;
+	Fl_Return_Button* connect_button_ = nullptr;
+	Fl_Box* receive_hint_box_ = nullptr;
 	Fl_Box* detail_box_ = nullptr;
 	Fl_Box* recent_box_ = nullptr;
 	Fl_Box* total_box_ = nullptr;
 	Fl_Box* status_box_ = nullptr;
-	Fl_Box* address_title_box_ = nullptr;
-	Fl_Box* empty_box_ = nullptr;
-	Fl_Scroll* address_scroll_ = nullptr;
 };
 
 int run_gui_app(int argc, char** argv) {
 	const auto current_dir = std::filesystem::current_path();
-	if (argc >= 2) {
-		// prevent Fl::run() from processing command line arguments, since we've already processed them
-		argc = 1; 
-		
-		const std::filesystem::path candidate = argv[1];
-		if (std::filesystem::is_directory(candidate)) {
-			AppWindow window(GuiMode::Send, candidate, std::nullopt);
-			window.show(argc, argv);
-			return Fl::run();
-		}
-	}
-
+	std::optional<SoratransUrl> clipboard_url;
 	if (const auto clipboard = read_clipboard_text()) {
-		if (const auto url = parse_soratrans_url(*clipboard)) {
-			AppWindow window(GuiMode::Receive, current_dir, *url);
-			window.show(argc, argv);
-			return Fl::run();
-		}
+		clipboard_url = parse_soratrans_url(*clipboard);
 	}
 
-	AppWindow window(GuiMode::Idle, current_dir, std::nullopt);
-	window.show(argc, argv);
+	const int fltk_argc = argc > 0 ? 1 : 0;
+	AppWindow window(current_dir, clipboard_url);
+	window.show(fltk_argc, argv);
 	return Fl::run();
 }
 

@@ -146,6 +146,7 @@ target_link_libraries(fs_benchmark
 
 add_executable(soratransport_app WIN32
 	src/gui_app.cpp
+	src/detail/gui_runtime.cpp
 )
 
 target_link_libraries(soratransport_app
