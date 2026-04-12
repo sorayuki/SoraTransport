@@ -103,6 +103,7 @@ add_library(soratransport_core
 	src/detail2/filesystem.cpp
 	src/detail2/infra.cpp
 	src/detail2/orchestration.cpp
+	src/detail2/stream.cpp
 	src/detail2/tar.cpp
 	src/detail2/writer.cpp
 	src/detail2/zstd.cpp

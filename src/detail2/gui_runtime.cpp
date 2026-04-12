@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "stream.hpp"
 #include "tar.hpp"
 #include "zstd.hpp"
 
@@ -286,7 +287,7 @@ void send_paths_to_socket(
 
 	std::jthread sink_thread([&] {
 		try {
-			QueueWriter writer;
+			detail2::QueueWriter writer;
 			writer.write(zstd_queue, sink, &cancel_event);
 		} catch (...) {
 			state.fail(std::current_exception());

@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "stream.hpp"
 #include "tar.hpp"
 #include "zstd.hpp"
 
@@ -396,7 +397,7 @@ void receive_transport_from_source(
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 	tar_queue.listenCancelSignal(cancel_event);
 	PipelineState state;
-	TarUnpacker unpacker(
+	detail2::TarUnpacker unpacker(
 		destination_dir,
 		pool,
 		executors,
@@ -419,7 +420,7 @@ void receive_transport_from_source(
 
 	std::jthread input_thread([&] {
 		try {
-			ZstdDecompressor decompressor(pool);
+			detail2::ZstdDecompressor decompressor(pool);
 			decompressor.decompress(source, tar_queue, &cancel_event);
 		} catch (...) {
 			state.fail(std::current_exception());
@@ -563,7 +564,7 @@ asio::awaitable<void> listen_directory_task(
 
 		std::jthread sink_thread([&] {
 			try {
-				QueueWriter writer;
+				detail2::QueueWriter writer;
 				writer.write(zstd_queue, sink, &cancel_event);
 			} catch (...) {
 				state.fail(std::current_exception());
@@ -752,7 +753,7 @@ void pack_directory_to_file(
 					options.log_adaptive_compression);
 				compressor.compress(tar_queue, zstd_queue, &effective_cancel_event);
 			} else {
-				QueueWriter writer;
+				detail2::QueueWriter writer;
 				writer.write(tar_queue, sink, &effective_cancel_event);
 			}
 		} catch (...) {
@@ -769,7 +770,7 @@ void pack_directory_to_file(
 			return;
 		}
 		try {
-			QueueWriter writer;
+			detail2::QueueWriter writer;
 			writer.write(zstd_queue, sink, &effective_cancel_event);
 		} catch (...) {
 			if (!is_transfer_cancelled(std::current_exception())) {
@@ -820,7 +821,7 @@ void unpack_file_to_directory(
 	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	PipelineState state;
-	TarUnpacker unpacker(
+	detail2::TarUnpacker unpacker(
 		destination_dir,
 		pool,
 		executors,
@@ -845,10 +846,10 @@ void unpack_file_to_directory(
 	std::jthread input_thread([&] {
 		try {
 			if (mode == CompressionMode::Zstd) {
-				ZstdDecompressor decompressor(pool);
+				detail2::ZstdDecompressor decompressor(pool);
 				decompressor.decompress(source, tar_queue, &effective_cancel_event);
 			} else {
-				RawTarReader reader(pool);
+				detail2::RawTarReader reader(pool);
 				reader.read(source, tar_queue, &effective_cancel_event);
 			}
 		} catch (...) {

@@ -103,6 +103,11 @@
   - GUI 发送页状态机复用旧交互逻辑，但内部发送流水线切到 `detail2`
 - [src/detail2/writer.hpp](src/detail2/writer.hpp)
   - `detail2::BufferedFileWriter`
+- [src/detail2/stream.hpp](src/detail2/stream.hpp)
+  - `detail2::QueueWriter`
+  - `detail2::RawTarReader`
+  - `detail2::ZstdDecompressor`
+  - `detail2::TarUnpacker`
 
 当前 `detail2` 目录已经进入第二阶段：`pack`、`listen` 和 GUI 发送页的实际发送流水线都已切到 `detail2`，而 `unpack` / `receive` 与落盘路径暂时仍由 `src/detail/` 提供。
 
@@ -275,8 +280,6 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 当前仍保留旧实现的主路径包括：
 
-- `unpack_file_to_directory()`
-- `receive_directory()`
 - 解包阶段内部的落盘写入实现
 
 ### 5.2.5 detail2 文件写入对象状态
@@ -290,6 +293,20 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
   - 关闭时等待后台排空完成并保持取消语义
 
 这个对象用于承接后续 `unpack` / `receive` 的落盘重构，目前已经进入构建但尚未替换旧的解包写入实现。
+
+### 5.2.6 detail2 接收侧包装状态
+
+为了让顶层编排统一指向 `detail2`，当前已经新增：
+
+- `detail2::QueueWriter`
+- `detail2::RawTarReader`
+- `detail2::ZstdDecompressor`
+- `detail2::TarUnpacker`
+
+这组类当前通过包装方式委托现有稳定实现，因此：
+
+- `unpack_file_to_directory()` 与 `receive_directory()` 的顶层编排已经只引用 `detail2` 节点
+- 复杂的解包与落盘内部细节暂时仍委托给旧实现，以保持结果一致
 
 ### 5.3 队列
 
