@@ -459,6 +459,14 @@ boost::asio::awaitable<void> FilePrefetcher::prefetch(BoundedQueue<OpenedFile>& 
 	co_return;
 }
 
+std::size_t FilePrefetcher::used_budget_bytes() const {
+	return tuning_.file_prefetch_budget_bytes - byte_budget_.available();
+}
+
+std::size_t FilePrefetcher::total_budget_bytes() const {
+	return tuning_.file_prefetch_budget_bytes;
+}
+
 std::size_t compute_prefetch_bytes(const OpenedFile& opened_file, const PipelineTuning& tuning) {
 	if (!opened_file.reader.has_value() || !std::filesystem::is_regular_file(opened_file.meta.status) || opened_file.meta.size == 0) {
 		return 0;

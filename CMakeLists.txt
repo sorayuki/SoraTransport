@@ -102,6 +102,7 @@ add_library(soratransport_core
 	src/detail2/config.cpp
 	src/detail2/filesystem.cpp
 	src/detail2/infra.cpp
+	src/detail2/orchestration.cpp
 	src/detail2/tar.cpp
 	src/detail2/zstd.cpp
 	src/detail/runtime.cpp
@@ -109,7 +110,6 @@ add_library(soratransport_core
 	src/detail/filesystem.cpp
 	src/detail/tar.cpp
 	src/detail/zstd.cpp
-	src/detail/orchestration.cpp
 	src/detail/cli.cpp
 	src/detail/windows_helpers.cpp
 )
@@ -160,7 +160,7 @@ target_link_libraries(fs_benchmark
 
 add_executable(soratransport_app WIN32
 	src/gui_app.cpp
-	src/detail/gui_runtime.cpp
+	src/detail2/gui_runtime.cpp
 )
 
 target_link_libraries(soratransport_app

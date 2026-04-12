@@ -77,12 +77,34 @@
   - 实现 `detail2::chunk.hpp`
     - 通过 aliasing `shared_ptr` 让 `DataChunk` 的释放自动回收预算 guard
 
+  ### 5. 顶层编排已切换到 detail2 发送侧
+
+  本轮完成内容：
+
+  - 新增 `src/detail2/orchestration.cpp`
+    - `pack_directory_to_file()` 切到 `detail2` 发送侧节点
+    - `listen_directory()` 切到 `detail2` 发送侧节点
+    - `unpack` / `receive` 先继续复用旧实现，保证行为稳定
+  - 新增 `src/detail2/gui_runtime.*`
+    - GUI 发送页内部的发送流水线切到 `detail2`
+    - GUI 交互状态机与用户体验保持原样
+
+  ### 6. 当前接线状态
+
+  - `pack`、`listen`、GUI 发送页已经改走 `detail2`
+  - `unpack`、`receive` 以及解包落盘仍保留旧实现
+
 ## 验证
 
 - 已构建通过：`soratransport_core`
+- 已构建通过：`soratransport`
+- 已构建通过：`fasttar`
+- 已构建通过：`soratransport_app`
+- 已验证：`fasttar pack -z` / `unpack -z` roundtrip smoke test
+- 已验证：`fasttar pack -n` / `unpack -n` roundtrip smoke test
 
 ## 下一步
 
-1. 重写 detail2 打包器与压缩节点，并把输出预算迁移到信号量 guard
-2. 切换 pack/listen 的顶层编排到新节点
-3. 继续补齐 unpack/写入路径并保持旧行为不变
+1. 在 `detail2` 中补齐文件写入对象与解包落盘链路
+2. 把 `unpack` / `receive` 也切到 `detail2`
+3. 继续补强符号链接、取消与大文件场景的专项验证

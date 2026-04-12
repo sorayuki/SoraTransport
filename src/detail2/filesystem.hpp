@@ -99,6 +99,8 @@ class FilePrefetcher {
 public:
 	FilePrefetcher(boost::asio::any_io_executor executor, PipelineTuning tuning, CancelEvent* cancel_event = nullptr);
 	boost::asio::awaitable<void> prefetch(BoundedQueue<OpenedFile>& in_opened, BoundedQueue<OpenedFile>& out_prefetched) const;
+	std::size_t used_budget_bytes() const;
+	std::size_t total_budget_bytes() const;
 
 private:
 	PipelineTuning tuning_;

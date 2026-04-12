@@ -1,5 +1,5 @@
 #include "core.hpp"
-#include "detail/gui_runtime.hpp"
+#include "detail2/gui_runtime.hpp"
 #include "detail/windows_helpers.hpp"
 
 #include <FL/Fl.H>

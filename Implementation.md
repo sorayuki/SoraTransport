@@ -94,8 +94,15 @@
   - `detail2::TarPacker`
 - [src/detail2/zstd.hpp](src/detail2/zstd.hpp)
   - `detail2::ZstdCompressor`
+- [src/detail2/orchestration.cpp](src/detail2/orchestration.cpp)
+  - 顶层 `pack` / `listen` 编排
+  - 保留旧 `unpack` / `receive` 路径的搬运实现
+- [src/detail2/gui_runtime.hpp](src/detail2/gui_runtime.hpp)
+  - GUI 发送页对外状态接口
+- [src/detail2/gui_runtime.cpp](src/detail2/gui_runtime.cpp)
+  - GUI 发送页状态机复用旧交互逻辑，但内部发送流水线切到 `detail2`
 
-当前 `detail2` 目录已接入构建，但还处于“分阶段替换”的第一步：基础设施模块可编译、可独立验证，顶层 pack/unpack/listen/receive 路径暂时仍由 `src/detail/` 提供。
+当前 `detail2` 目录已经进入第二阶段：`pack`、`listen` 和 GUI 发送页的实际发送流水线都已切到 `detail2`，而 `unpack` / `receive` 与落盘路径暂时仍由 `src/detail/` 提供。
 
 ## 3. 当前数据流
 
@@ -103,12 +110,13 @@
 
 `pack_directory_to_file()` 当前流程：
 
-1. `DirScanner` 扫描目录、填充 `FileMeta`，并对普通文件并发打开句柄后顺序输出 `OpenedFileReader`
-2. `FileReaderPrefetcher` 在预算允许范围内对已打开文件执行初始预读
-3. `TarPacker` 顺序消费 reader，生成 tar 数据流
+1. `detail2::FileTraverser` 以 BFS 方式扫描目录并输出 `TraversalEntry`
+2. `detail2::FileOpener` 对普通文件并发 open，并把 open guard 绑定到 `OpenedFile`
+3. `detail2::FilePrefetcher` 在字节预算信号量允许范围内对已打开文件执行初始预读
+4. `detail2::TarPacker` 顺序消费 reader，生成 tar 数据流
 4. 根据模式选择：
-   - raw tar：`QueueWriter`
-   - zstd：`ZstdCompressor`
+  - raw tar：`QueueWriter`
+  - zstd：`detail2::ZstdCompressor`
 5. 最终写入 `FileByteSink`
 
 ### 3.2 本地解包
@@ -127,9 +135,9 @@
 2. 发送一条文本 JSON 控制帧 `transport_begin`
 3. 扫描目录
 4. 并发打开普通文件
-5. 预读
-6. 打 tar
-7. zstd 压缩
+5. `detail2::FilePrefetcher` 预读
+6. `detail2::TarPacker` 打 tar
+7. `detail2::ZstdCompressor` 压缩
 8. 通过 `SocketByteSink` 以 WebSocket 二进制消息发送连续字节流
 9. 发送一条文本 JSON 控制帧 `transport_end`
 10. 若调用方提供 `TransferProgress`，后台线程会同步已处理字节数与文件数
@@ -143,6 +151,7 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 3. 用户一次拖放可提交多个文件或目录
 4. 每次 drop 都会发送一组 `transport_begin -> 二进制数据 -> transport_end`
 5. `GuiSendServer` 复用现有 `DirScanner -> FileReaderPrefetcher -> TarPacker -> ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
+5. `GuiSendServer` 当前已经改为复用 `detail2::FileTraverser -> detail2::FileOpener -> detail2::FilePrefetcher -> detail2::TarPacker -> detail2::ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
 6. 单次拖放完成后连接保持不变，继续等待下一次拖放；空闲期间由服务端定时发出 WebSocket ping 保活
 
 ### 3.4 网络接收
@@ -253,6 +262,20 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `detail2::chunk.hpp`：用 aliasing `shared_ptr` 把预算 guard 与 `DataChunk` 生命周期绑定，供 tar/zstd 输出队列复用
 
 这些模块的目标是为接下来的 pack/listen 切流准备一个完整但仍可逐步接线的 pack 侧实现。
+
+### 5.2.4 detail2 顶层接线状态
+
+当前已经完成的主路径替换包括：
+
+- `pack_directory_to_file()` 改为调用 `detail2` 的发送侧节点
+- `listen_directory()` 改为调用 `detail2` 的发送侧节点
+- GUI 发送页内部的 `send_paths_to_socket()` 改为调用 `detail2` 的发送侧节点
+
+当前仍保留旧实现的主路径包括：
+
+- `unpack_file_to_directory()`
+- `receive_directory()`
+- 解包阶段内部的落盘写入实现
 
 ### 5.3 队列
 

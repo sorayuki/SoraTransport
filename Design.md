@@ -249,7 +249,13 @@ FileByteSource / SocketByteSource
 - `detail2/config.*` 统一承载本轮重构引入的并发度、槽位数、预算上限和默认压缩级别等常量配置
 - `detail2/infra.*` 提供 `SemaphoreCor` 与 `TaskExecutor`，用于承接后续协程化的资源控制和任务投递
 
-在 `detail2` 全量接管前，现网执行路径仍由 `src/detail/` 下的旧实现负责；因此 staged refactor 的目标是“先保证可验证替换，再切换行为路径”，而不是一次性改写全部节点。
+在此基础上，当前已经完成第二批接线：
+
+- 本地 `pack` 路径已经切到 `detail2` 的 traverser / opener / prefetcher / tar / zstd 编排
+- 网络 `listen` 发送路径已经切到 `detail2`
+- GUI 发送页内部的拖放发送流水线也已经切到 `detail2`
+
+当前仍保留在 `src/detail/` 下的主路径主要是 `unpack` / `receive` 与对应的落盘实现；因此 staged refactor 的目标是“先保证可验证替换，再切换行为路径”，而不是一次性改写全部节点。
 
 如果后续继续演进，优先级较高的方向包括：
 
