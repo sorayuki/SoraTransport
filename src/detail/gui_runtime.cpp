@@ -31,6 +31,32 @@ std::runtime_error make_boost_error(const std::string& message, const boost::sys
 	return std::runtime_error(message + ": " + error.message());
 }
 
+void close_transport_socket(asio::ip::tcp::socket& socket) {
+	boost::system::error_code ignored;
+	socket.cancel(ignored);
+	socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+	socket.close(ignored);
+}
+
+void close_transport_socket(TransportWebSocket& websocket) {
+	close_transport_socket(websocket.next_layer());
+}
+
+template <typename Rep, typename Period>
+bool wait_for_stop_or_timeout(std::stop_token stop_token, std::chrono::duration<Rep, Period> timeout) {
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::atomic<bool> stop_requested{false};
+	std::stop_callback on_stop(stop_token, [&] {
+		stop_requested.store(true, std::memory_order_release);
+		cv.notify_all();
+	});
+	std::unique_lock lock(mutex);
+	return cv.wait_for(lock, timeout, [&] {
+		return stop_requested.load(std::memory_order_acquire);
+	});
+}
+
 void join_and_capture(std::jthread& thread, PipelineState& state) {
 	try {
 		if (thread.joinable()) {
@@ -50,7 +76,9 @@ std::jthread start_progress_sync_thread(
 		std::uint64_t previous_bytes = 0;
 		std::uint64_t previous_files = 0;
 		while (!stop_token.stop_requested()) {
-			std::this_thread::sleep_for(250ms);
+			if (wait_for_stop_or_timeout(stop_token, 250ms)) {
+				break;
+			}
 			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
 			const auto current_files = processed_files.load(std::memory_order_relaxed);
 			if (progress) {
@@ -83,7 +111,12 @@ bool is_transfer_cancelled(const std::exception_ptr& error) {
 }
 
 bool should_throw_cancelled_error(const CancelEvent& cancel_event, const boost::system::error_code& error) {
-	return cancel_event.is_cancelled() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
+	return cancel_event.is_cancelled()
+		&& (error == asio::error::operation_aborted
+			|| error == asio::error::bad_descriptor
+			|| error == asio::error::connection_reset
+			|| error == asio::error::eof
+			|| error == boost::beast::websocket::error::closed);
 }
 
 asio::ip::tcp::acceptor make_listener_acceptor(asio::io_context& io_context, std::uint16_t port) {
@@ -155,6 +188,9 @@ TransportWebSocket accept_websocket(asio::io_context& io_context, asio::ip::tcp:
 	auto socket = accept_socket(io_context, acceptor, cancel_event);
 	TransportWebSocket websocket(std::move(socket));
 	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
+	auto on_cancel = cancel_event.connect([&websocket] {
+		close_transport_socket(websocket);
+	});
 	boost::system::error_code error;
 	websocket.accept(error);
 	if (error) {

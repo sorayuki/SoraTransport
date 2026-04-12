@@ -13,9 +13,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <stop_token>
 #include <sstream>
 #include <stdexcept>
@@ -37,6 +39,32 @@ std::runtime_error make_boost_error(const std::string& message, const boost::sys
 		return std::runtime_error(message + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
 	}
 	return std::runtime_error(message + ": " + error.message());
+}
+
+void close_transport_socket(asio::ip::tcp::socket& socket) {
+	boost::system::error_code ignored;
+	socket.cancel(ignored);
+	socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+	socket.close(ignored);
+}
+
+void close_transport_socket(TransportWebSocket& websocket) {
+	close_transport_socket(websocket.next_layer());
+}
+
+template <typename Rep, typename Period>
+bool wait_for_stop_or_timeout(std::stop_token stop_token, std::chrono::duration<Rep, Period> timeout) {
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::atomic<bool> stop_requested{false};
+	std::stop_callback on_stop(stop_token, [&] {
+		stop_requested.store(true, std::memory_order_release);
+		cv.notify_all();
+	});
+	std::unique_lock lock(mutex);
+	return cv.wait_for(lock, timeout, [&] {
+		return stop_requested.load(std::memory_order_acquire);
+	});
 }
 
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
@@ -132,8 +160,7 @@ std::jthread start_progress_thread(std::function<std::string(std::uint64_t)> bui
 		using namespace std::chrono_literals;
 		std::uint64_t previous = processed_bytes.load(std::memory_order_relaxed);
 		while (!stop_token.stop_requested()) {
-			std::this_thread::sleep_for(1s);
-			if (stop_token.stop_requested()) {
+			if (wait_for_stop_or_timeout(stop_token, 1s)) {
 				break;
 			}
 			const auto current = processed_bytes.load(std::memory_order_relaxed);
@@ -187,7 +214,9 @@ std::jthread start_progress_sync_thread(
 		std::uint64_t previous_bytes = 0;
 		std::uint64_t previous_files = 0;
 		while (!stop_token.stop_requested()) {
-			std::this_thread::sleep_for(250ms);
+			if (wait_for_stop_or_timeout(stop_token, 250ms)) {
+				break;
+			}
 			const auto current_bytes = processed_bytes.load(std::memory_order_relaxed);
 			const auto current_files = processed_files.load(std::memory_order_relaxed);
 			if (progress) {
@@ -220,7 +249,12 @@ bool is_transfer_cancelled(const std::exception_ptr& error) {
 }
 
 bool should_throw_cancelled_error(const CancelEvent& cancel_event, const boost::system::error_code& error) {
-	return cancel_event.is_cancelled() && (error == asio::error::operation_aborted || error == asio::error::bad_descriptor);
+	return cancel_event.is_cancelled()
+		&& (error == asio::error::operation_aborted
+			|| error == asio::error::bad_descriptor
+			|| error == asio::error::connection_reset
+			|| error == asio::error::eof
+			|| error == boost::beast::websocket::error::closed);
 }
 
 bool should_report_transfer_error(const CancelEvent& cancel_event, const std::exception_ptr& error) {
@@ -233,9 +267,7 @@ asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, st
 	asio::ip::tcp::socket socket(executor);
 	auto on_cancel = cancel_event.connect([&resolver, &socket] {
 		resolver.cancel();
-		boost::system::error_code ignored;
-		socket.cancel(ignored);
-		socket.close(ignored);
+		close_transport_socket(socket);
 	});
 	boost::system::error_code error;
 	auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::redirect_error(asio::use_awaitable, error));
@@ -267,6 +299,9 @@ asio::awaitable<TransportWebSocket> connect_websocket_async(std::string host, st
 	auto socket = co_await connect_socket_async(host, port, cancel_event);
 	TransportWebSocket websocket(std::move(socket));
 	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::client));
+	auto on_cancel = cancel_event.connect([&websocket] {
+		close_transport_socket(websocket);
+	});
 	boost::system::error_code error;
 	auto host_header = make_websocket_host_header(host, port);
 	co_await websocket.async_handshake(host_header, "/", asio::redirect_error(asio::use_awaitable, error));
@@ -331,6 +366,9 @@ asio::awaitable<TransportWebSocket> accept_websocket_async(std::uint16_t port, s
 	auto socket = co_await accept_socket_async(port, bound_port, cancel_event);
 	TransportWebSocket websocket(std::move(socket));
 	websocket.set_option(boost::beast::websocket::stream_base::timeout::suggested(boost::beast::role_type::server));
+	auto on_cancel = cancel_event.connect([&websocket] {
+		close_transport_socket(websocket);
+	});
 	boost::system::error_code error;
 	co_await websocket.async_accept(asio::redirect_error(asio::use_awaitable, error));
 	if (error) {
