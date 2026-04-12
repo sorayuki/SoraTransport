@@ -132,4 +132,48 @@ struct OverlappedSlotBase {
 	}
 };
 
+// ── Unique Win32 handle RAII wrapper ────────────────────────────────
+
+struct UniqueWin32Handle {
+	explicit UniqueWin32Handle(HANDLE input_handle = INVALID_HANDLE_VALUE) noexcept : handle(input_handle) {}
+	~UniqueWin32Handle() {
+		reset();
+	}
+
+	UniqueWin32Handle(const UniqueWin32Handle&) = delete;
+	UniqueWin32Handle& operator=(const UniqueWin32Handle&) = delete;
+
+	UniqueWin32Handle(UniqueWin32Handle&& other) noexcept : handle(other.release()) {}
+
+	UniqueWin32Handle& operator=(UniqueWin32Handle&& other) noexcept {
+		if (this != &other) {
+			reset(other.release());
+		}
+		return *this;
+	}
+
+	void reset(HANDLE new_handle = INVALID_HANDLE_VALUE) noexcept {
+		if (handle != INVALID_HANDLE_VALUE) {
+			::CloseHandle(handle);
+		}
+		handle = new_handle;
+	}
+
+	HANDLE get() const noexcept {
+		return handle;
+	}
+
+	HANDLE release() noexcept {
+		const auto released = handle;
+		handle = INVALID_HANDLE_VALUE;
+		return released;
+	}
+
+	bool valid() const noexcept {
+		return handle != INVALID_HANDLE_VALUE;
+	}
+
+	HANDLE handle = INVALID_HANDLE_VALUE;
+};
+
 } // namespace soratransport
