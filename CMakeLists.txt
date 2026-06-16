@@ -17,23 +17,8 @@ project(SoraTransport)
 # boost
 list(APPEND CMAKE_PREFIX_PATH "D:/dev/boost_1_90_0/dist/lib/cmake/Boost-1.90.0")
 
-# fltk
+# nlohmann_json
 include(FetchContent)
-
-set(FLTK_BUILD_TEST OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_FLUID OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_HTML_DOCS OFF CACHE BOOL "" FORCE)
-set(FLTK_BUILD_PDF_DOCS OFF CACHE BOOL "" FORCE)
-set(FLTK_OPTION_PRINT_SUPPORT OFF CACHE BOOL "" FORCE)
-set(FLTK_MSVC_RUNTIME_DLL OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    fltk
-    GIT_REPOSITORY https://github.com/fltk/fltk.git
-    GIT_TAG release-1.4.4
-    GIT_SHALLOW TRUE
-)
 
 FetchContent_Declare(
 	nlohmann_json
@@ -42,7 +27,6 @@ FetchContent_Declare(
 	GIT_SHALLOW TRUE
 )
 
-FetchContent_MakeAvailable(fltk)
 FetchContent_MakeAvailable(nlohmann_json)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -51,6 +35,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
 	set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime library" FORCE)
 endif()
+
+# wxWidgets (static, matching project CRT linkage)
+set(wxBUILD_SHARED OFF CACHE BOOL "Build wx libraries as shared libs" FORCE)
+set(wxBUILD_USE_STATIC_RUNTIME ON CACHE BOOL "Link using the static runtime library" FORCE)
+set(wxBUILD_SAMPLES OFF CACHE STRING "Build samples" FORCE)
+set(wxBUILD_TESTS OFF CACHE STRING "Build tests" FORCE)
+set(wxBUILD_DEMOS OFF CACHE BOOL "Build demos" FORCE)
+set(wxBUILD_BENCHMARKS OFF CACHE BOOL "Build benchmarks" FORCE)
+set(wxBUILD_PRECOMP OFF CACHE BOOL "Use precompiled headers" FORCE)
+set(wxBUILD_INSTALL OFF CACHE BOOL "Create install target" FORCE)
+add_subdirectory(deps/wxwidgets)
 
 if(MSVC)
 	add_compile_options(/utf-8)
@@ -62,13 +57,6 @@ find_package(Boost REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
-# find_package(FLTK CONFIG REQUIRED)
-
-if(TARGET fltk AND NOT TARGET fltk::fltk)
-	add_library(fltk::fltk INTERFACE IMPORTED)
-	target_link_libraries(fltk::fltk INTERFACE fltk)
-endif()
-
 if(TARGET Boost::headers)
 	set(SORATRANSPORT_BOOST_TARGET Boost::headers)
 elseif(TARGET Boost::boost)
@@ -161,6 +149,7 @@ add_executable(soratransport_app WIN32
 target_link_libraries(soratransport_app
 	PRIVATE
 		soratransport_core
-		fltk
+		wx::core
+		wx::base
 )
 

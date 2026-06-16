@@ -200,7 +200,7 @@ std::optional<SoratransUrl> parse_soratrans_url(std::string_view text) {
 		result.port = static_cast<std::uint16_t>(std::stoul(normalized.substr(end + 2)));
 	} else {
 		const auto colon = normalized.rfind(':');
-		if (colon == std::string::npos) {
+		if (colon == std::string::npos || colon + 1 >= normalized.size()) {
 			return std::nullopt;
 		}
 		result.host = normalized.substr(0, colon);

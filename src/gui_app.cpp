@@ -2,19 +2,20 @@
 #include "detail/gui_runtime.hpp"
 #include "detail/windows_helpers.hpp"
 
-#include <FL/Fl.H>
-#include <FL/Fl_Box.H>
-#include <FL/Fl_Button.H>
-#include <FL/Fl_Choice.H>
-#include <FL/Fl_Double_Window.H>
-#include <FL/Fl_Group.H>
-#include <FL/Fl_Input.H>
-#include <FL/Fl_Return_Button.H>
-#include <FL/Fl_Tabs.H>
-#include <FL/fl_ask.H>
-#include <FL/platform.H>
+#include <wx/wx.h>
+#include <wx/clipbrd.h>
+#include <wx/dnd.h>
+#include <wx/notebook.h>
+#include <wx/choice.h>
+#include <wx/stattext.h>
+#include <wx/textctrl.h>
+#include <wx/button.h>
+#include <wx/sizer.h>
+#include <wx/panel.h>
+#include <wx/msgdlg.h>
+#include <wx/timer.h>
+#include <wx/colour.h>
 
-#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -30,7 +31,8 @@ namespace soratransport {
 
 namespace {
 
-constexpr int kStopTransferChoice = 1;
+constexpr int kTimerId = 1;
+constexpr int kTimerIntervalMs = 250;
 
 std::string format_size(std::uint64_t bytes) {
 	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -56,65 +58,6 @@ std::string format_average_rate(std::uint64_t bytes, std::chrono::steady_clock::
 	return format_rate(bytes_per_second);
 }
 
-std::string path_to_ui_text(const std::filesystem::path& path) {
-	return path_to_utf8_string(path);
-}
-
-std::string translate_status_text(std::string_view status_text) {
-	if (status_text == "idle") {
-		return "空闲";
-	}
-	if (status_text == "waiting") {
-		return "等待操作";
-	}
-	if (status_text == "starting receiver") {
-		return "正在启动接收端";
-	}
-	if (status_text == "binding listener") {
-		return "正在绑定监听端口";
-	}
-	if (status_text == "waiting for receiver") {
-		return "等待接收端连接";
-	}
-	if (status_text == "receiver connected") {
-		return "接收端已连接，等待拖放";
-	}
-	if (status_text == "receiver connected, waiting for drop") {
-		return "接收端已连接，等待拖放";
-	}
-	if (status_text == "sending") {
-		return "正在发送";
-	}
-	if (status_text == "connecting") {
-		return "正在连接";
-	}
-	if (status_text == "receiving") {
-		return "正在接收";
-	}
-	if (status_text == "waiting for next transfer") {
-		return "等待下一次传输";
-	}
-	if (status_text == "send completed") {
-		return "发送完成";
-	}
-	if (status_text == "receive completed") {
-		return "接收完成";
-	}
-	if (status_text == "completed") {
-		return "已完成";
-	}
-	if (status_text == "send failed") {
-		return "发送失败";
-	}
-	if (status_text == "receive failed") {
-		return "接收失败";
-	}
-	if (status_text == "cancelled") {
-		return "已取消";
-	}
-	return std::string(status_text);
-}
-
 std::wstring utf8_to_utf16(std::string_view text) {
 	if (text.empty()) {
 		return {};
@@ -128,215 +71,9 @@ std::wstring utf8_to_utf16(std::string_view text) {
 	return result;
 }
 
-std::string trim_ascii(std::string value) {
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-		value.erase(value.begin());
-	}
-	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
-		value.pop_back();
-	}
-	return value;
+std::wstring path_to_ui_text(const std::filesystem::path& path) {
+	return path.wstring();
 }
-
-int hex_value(char ch) {
-	if (ch >= '0' && ch <= '9') {
-		return ch - '0';
-	}
-	if (ch >= 'a' && ch <= 'f') {
-		return 10 + (ch - 'a');
-	}
-	if (ch >= 'A' && ch <= 'F') {
-		return 10 + (ch - 'A');
-	}
-	return -1;
-}
-
-std::string decode_uri_component(std::string_view text) {
-	std::string decoded;
-	decoded.reserve(text.size());
-	for (std::size_t index = 0; index < text.size(); ++index) {
-		if (text[index] == '%' && index + 2 < text.size()) {
-			const auto hi = hex_value(text[index + 1]);
-			const auto lo = hex_value(text[index + 2]);
-			if (hi >= 0 && lo >= 0) {
-				decoded.push_back(static_cast<char>((hi << 4) | lo));
-				index += 2;
-				continue;
-			}
-		}
-		decoded.push_back(text[index]);
-	}
-	return decoded;
-}
-
-std::string escape_choice_label(std::string_view label) {
-	std::string escaped;
-	escaped.reserve(label.size() * 2);
-	for (const char ch : label) {
-		if (ch == '\\' || ch == '/') {
-			escaped.push_back('\\');
-		}
-		escaped.push_back(ch);
-	}
-	return escaped;
-}
-
-std::filesystem::path normalize_dropped_path(std::string text) {
-	text = trim_ascii(std::move(text));
-	text.erase(std::remove(text.begin(), text.end(), '\0'), text.end());
-	text = trim_ascii(std::move(text));
-	if (text.empty()) {
-		return {};
-	}
-	if (text.front() == '#' && text.find("://") == std::string::npos) {
-		return {};
-	}
-	if (text.size() >= 2 && text.front() == '{' && text.back() == '}') {
-		text = text.substr(1, text.size() - 2);
-	}
-	if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
-		text = text.substr(1, text.size() - 2);
-	}
-
-	const auto scheme_sep = text.find("://");
-	if (scheme_sep == std::string::npos) {
-		return std::filesystem::path(text);
-	}
-
-	auto scheme = text.substr(0, scheme_sep);
-	for (char& ch : scheme) {
-		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-	}
-	if (scheme != "file" && scheme != "computer") {
-		return std::filesystem::path(text);
-	}
-
-	auto location = decode_uri_component(text.substr(scheme_sep + 3));
-	if (location.rfind("localhost/", 0) == 0 || location.rfind("localhost\\", 0) == 0) {
-		location.erase(0, 10);
-	}
-	if (!location.empty() && location.front() == '/' && location.size() >= 3
-		&& std::isalpha(static_cast<unsigned char>(location[1])) && location[2] == ':') {
-		location.erase(0, 1);
-	} else if (!location.empty() && location.front() != '/' && !(location.size() >= 2 && location[1] == ':')) {
-		location = std::string("\\\\") + location;
-	}
-	return std::filesystem::path(location);
-}
-
-std::vector<std::filesystem::path> parse_dropped_paths(std::string_view raw_text) {
-	std::vector<std::filesystem::path> paths;
-	std::size_t offset = 0;
-	while (offset <= raw_text.size()) {
-		const auto next = raw_text.find('\n', offset);
-		auto piece = raw_text.substr(offset, next == std::string_view::npos ? raw_text.size() - offset : next - offset);
-		if (!piece.empty() && piece.back() == '\r') {
-			piece.remove_suffix(1);
-		}
-		auto path = normalize_dropped_path(std::string(piece));
-		if (!path.empty()) {
-			paths.push_back(std::move(path));
-		}
-		if (next == std::string_view::npos) {
-			break;
-		}
-		offset = next + 1;
-	}
-	return paths;
-}
-
-class DropTargetBox final : public Fl_Box {
-public:
-	explicit DropTargetBox(int x, int y, int w, int h)
-		: Fl_Box(x, y, w, h, "接收端已连接。\n将文件或文件夹拖到这里开始发送。") {
-		box(FL_BORDER_BOX);
-		align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE | FL_ALIGN_WRAP);
-		labelsize(16);
-		labelfont(FL_HELVETICA_BOLD);
-		update_visual_state();
-	}
-
-	void set_drop_handler(std::function<void(std::vector<std::filesystem::path>)> handler) {
-		on_drop_ = std::move(handler);
-	}
-
-	void set_accepting(bool value) {
-		if (accepting_ == value) {
-			return;
-		}
-		accepting_ = value;
-		if (!accepting_) {
-			highlighted_ = false;
-		}
-		update_visual_state();
-	}
-
-	void set_message(std::string message) {
-		copy_label(message.c_str());
-		redraw();
-	}
-
-	bool accepting() const {
-		return accepting_;
-	}
-
-	bool contains_point(int px, int py) const {
-		return visible() && px >= x() && px < x() + w() && py >= y() && py < y() + h();
-	}
-
-	int handle(int event) override {
-		if (!accepting_) {
-			return Fl_Box::handle(event);
-		}
-
-		switch (event) {
-		case FL_DND_ENTER:
-		case FL_DND_DRAG:
-			highlighted_ = true;
-			update_visual_state();
-			return 1;
-		case FL_DND_LEAVE:
-			highlighted_ = false;
-			update_visual_state();
-			return 1;
-		case FL_DND_RELEASE:
-			highlighted_ = true;
-			update_visual_state();
-			return 1;
-		case FL_PASTE:
-			highlighted_ = false;
-			update_visual_state();
-			if (on_drop_) {
-				auto paths = parse_dropped_paths(std::string_view(Fl::event_text(), static_cast<std::size_t>(Fl::event_length())));
-				if (!paths.empty()) {
-					on_drop_(std::move(paths));
-				}
-			}
-			return 1;
-		default:
-			return Fl_Box::handle(event);
-		}
-	}
-
-private:
-	void update_visual_state() {
-		if (!accepting_) {
-			color(fl_rgb_color(229, 224, 216));
-			labelcolor(fl_rgb_color(110, 105, 96));
-		} else if (highlighted_) {
-			color(fl_rgb_color(212, 232, 255));
-			labelcolor(fl_rgb_color(30, 62, 102));
-		} else {
-			color(fl_rgb_color(239, 235, 228));
-			labelcolor(fl_rgb_color(58, 54, 48));
-		}
-		redraw();
-	}
-
-	bool accepting_ = true;
-	bool highlighted_ = false;
-	std::function<void(std::vector<std::filesystem::path>)> on_drop_;
-};
 
 struct ProgressViewState {
 	std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
@@ -349,50 +86,163 @@ struct ProgressViewState {
 	std::string last_status_text;
 };
 
-class AppWindow final : public Fl_Double_Window {
+// Custom event for thread-safe UI updates from worker threads
+wxDECLARE_EVENT(wxEVT_UI_REFRESH, wxThreadEvent);
+wxDEFINE_EVENT(wxEVT_UI_REFRESH, wxThreadEvent);
+
+// Drop target for the send panel
+class DropTargetPanel : public wxPanel {
 public:
-	AppWindow(std::filesystem::path current_dir, std::optional<SoratransUrl> clipboard_url)
-		: Fl_Double_Window(980, 620, "SoraTransport 文件传输"),
+	DropTargetPanel(wxWindow* parent, wxWindowID id = wxID_ANY)
+		: wxPanel(parent, id, wxDefaultPosition, wxDefaultSize, wxBORDER_SIMPLE) {
+		SetDropTarget(new DropTarget(this));
+
+		drop_label_ = new wxStaticText(this, wxID_ANY,
+			L"接收端已连接。\n将文件或文件夹拖到这里开始发送。",
+			wxDefaultPosition, wxDefaultSize,
+			wxALIGN_CENTER_HORIZONTAL | wxST_NO_AUTORESIZE);
+		drop_label_->SetFont(drop_label_->GetFont().Bold().Scaled(1.4f));
+
+		auto* sizer = new wxBoxSizer(wxVERTICAL);
+		sizer->AddStretchSpacer(1);
+		sizer->Add(drop_label_, 0, wxALIGN_CENTER | wxALL, 10);
+		sizer->AddStretchSpacer(1);
+		SetSizer(sizer);
+
+		update_visual_state();
+	}
+
+	void set_drop_handler(std::function<void(std::vector<std::filesystem::path>)> handler) {
+		on_drop_ = std::move(handler);
+	}
+
+	void set_accepting(bool value) {
+		if (accepting_ == value) {
+			return;
+		}
+		accepting_ = value;
+		update_visual_state();
+	}
+
+	void set_message(const std::wstring& message) {
+		drop_label_->SetLabelText(message);
+	}
+
+	bool is_accepting() const {
+		return accepting_;
+	}
+
+	void fire_drop(std::vector<std::filesystem::path> paths) {
+		if (on_drop_) {
+			on_drop_(std::move(paths));
+		}
+	}
+
+private:
+	class DropTarget : public wxFileDropTarget {
+	public:
+		explicit DropTarget(DropTargetPanel* panel) : panel_(panel) {}
+
+		bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& filenames) override {
+			if (!panel_->is_accepting()) {
+				return false;
+			}
+			std::vector<std::filesystem::path> paths;
+			paths.reserve(filenames.size());
+			for (const auto& f : filenames) {
+				auto path = std::filesystem::path(f.ToStdWstring());
+				if (!path.empty()) {
+					paths.push_back(std::move(path));
+				}
+			}
+			if (!paths.empty()) {
+				panel_->fire_drop(std::move(paths));
+			}
+			return true;
+		}
+
+	private:
+		DropTargetPanel* panel_;
+	};
+
+	void update_visual_state() {
+		if (!accepting_) {
+			SetBackgroundColour(wxColour(229, 224, 216));
+			drop_label_->SetForegroundColour(wxColour(110, 105, 96));
+		} else {
+			SetBackgroundColour(wxColour(239, 235, 228));
+			drop_label_->SetForegroundColour(wxColour(58, 54, 48));
+		}
+		Refresh();
+	}
+
+	bool accepting_ = true;
+	wxStaticText* drop_label_ = nullptr;
+	std::function<void(std::vector<std::filesystem::path>)> on_drop_;
+};
+
+class SoraTransportFrame : public wxFrame {
+public:
+	SoraTransportFrame(std::filesystem::path current_dir, std::optional<SoratransUrl> clipboard_url)
+		: wxFrame(nullptr, wxID_ANY, L"SoraTransport 文件传输", wxDefaultPosition, wxSize(980, 620)),
 		  current_dir_(std::move(current_dir)),
 		  send_progress_(std::make_shared<TransferProgress>()),
 		  receive_progress_(std::make_shared<TransferProgress>()),
 		  send_server_(send_progress_),
 		  receive_url_(std::move(clipboard_url)) {
-		begin();
-		title_box_ = new Fl_Box(20, 18, 940, 34, "SoraTransport 文件传输");
-		tabs_ = new Fl_Tabs(20, 72, 940, 250);
+
+		SetBackgroundColour(wxColour(247, 244, 238));
+
+		auto* main_panel = new wxPanel(this);
+		auto* main_sizer = new wxBoxSizer(wxVERTICAL);
+
+		// Title
+		title_label_ = new wxStaticText(main_panel, wxID_ANY, L"SoraTransport 文件传输");
+		title_label_->SetFont(title_label_->GetFont().Bold().Scaled(2.0f));
+		main_sizer->Add(title_label_, 0, wxALL, 18);
+
+		// Notebook (tabs)
+		notebook_ = new wxNotebook(main_panel, wxID_ANY);
 		build_send_tab();
 		build_receive_tab();
-		tabs_->end();
-		detail_box_ = new Fl_Box(20, 346, 940, 28);
-		recent_box_ = new Fl_Box(20, 388, 940, 28);
-		total_box_ = new Fl_Box(20, 430, 940, 28);
-		status_box_ = new Fl_Box(20, 472, 940, 28);
-		end();
+		main_sizer->Add(notebook_, 0, wxEXPAND | wxLEFT | wxRIGHT, 20);
 
-		color(fl_rgb_color(247, 244, 238));
-		title_box_->labelfont(FL_HELVETICA_BOLD);
-		title_box_->labelsize(28);
-		for (Fl_Box* box : {detail_box_, recent_box_, total_box_, status_box_}) {
-			box->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-			box->labelsize(15);
-		}
+		// Detail line
+		detail_label_ = new wxStaticText(main_panel, wxID_ANY, "");
+		detail_label_->SetFont(detail_label_->GetFont().Scaled(1.1f));
+		main_sizer->Add(detail_label_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 20);
 
-		drop_target_->set_drop_handler([this](std::vector<std::filesystem::path> paths) {
-			handle_drop(std::move(paths));
-		});
-		copy_address_button_->callback(copy_address_callback, this);
-		connect_button_->callback(connect_callback, this);
-		receive_input_->when(FL_WHEN_ENTER_KEY_ALWAYS);
-		receive_input_->callback(connect_callback, this);
-		tabs_->callback(tabs_changed_callback, this);
-		callback(window_close_callback, this);
+		// Stats lines
+		recent_label_ = new wxStaticText(main_panel, wxID_ANY, "");
+		recent_label_->SetFont(recent_label_->GetFont().Scaled(1.1f));
+		main_sizer->Add(recent_label_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
 
+		total_label_ = new wxStaticText(main_panel, wxID_ANY, "");
+		total_label_->SetFont(total_label_->GetFont().Scaled(1.1f));
+		main_sizer->Add(total_label_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+
+		status_label_ = new wxStaticText(main_panel, wxID_ANY, "");
+		status_label_->SetFont(status_label_->GetFont().Scaled(1.1f));
+		main_sizer->Add(status_label_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 8);
+
+		main_panel->SetSizer(main_sizer);
+
+		// Bind events
+		notebook_->Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, &SoraTransportFrame::on_tab_changed, this);
+		Bind(wxEVT_CLOSE_WINDOW, &SoraTransportFrame::on_close, this);
+		Bind(wxEVT_UI_REFRESH, &SoraTransportFrame::on_ui_refresh, this);
+
+		// Timer
+		timer_ = new wxTimer(this, kTimerId);
+		Bind(wxEVT_TIMER, &SoraTransportFrame::on_timer, this, kTimerId);
+		timer_->Start(kTimerIntervalMs);
+
+		// Initial tab selection
 		if (receive_url_) {
-			receive_input_->value(receive_url_->canonical_text.c_str());
-			tabs_->value(receive_group_);
+			receive_input_->SetValue(receive_url_->canonical_text);
+			notebook_->SetSelection(1); // receive tab
 		} else {
-			tabs_->value(send_group_);
+			notebook_->SetSelection(0); // send tab
 		}
 
 		send_progress_->reset("binding listener");
@@ -403,124 +253,168 @@ public:
 			send_progress_->set_failed(error.what());
 		}
 
+		// 缓存运行时不变的字符串，避免在定时器中反复拼接
+		receive_detail_text_ = L"保存到：" + path_to_ui_text(current_dir_);
+
 		update_ui();
-		Fl::add_timeout(0.25, timer_callback, this);
 	}
 
-	~AppWindow() override {
-		Fl::remove_timeout(timer_callback, this);
+	~SoraTransportFrame() override {
+		if (timer_) {
+			timer_->Stop();
+		}
 		stop_receive_session(true);
 		send_server_.stop();
 	}
 
-	int handle(int event) override {
-		switch (event) {
-		case FL_DND_ENTER:
-		case FL_DND_DRAG:
-			if (route_drop_target_event(event)) {
-				return 1;
-			}
-			break;
-		case FL_DND_RELEASE:
-			if (route_drop_target_event(event)) {
-				awaiting_drop_paste_ = true;
-				return 1;
-			}
-			awaiting_drop_paste_ = false;
-			break;
-		case FL_DND_LEAVE:
-			awaiting_drop_paste_ = false;
-			if (dnd_over_drop_target_) {
-				dnd_over_drop_target_ = false;
-				return drop_target_->handle(FL_DND_LEAVE);
-			}
-			break;
-		case FL_PASTE:
-			if (awaiting_drop_paste_ || dnd_over_drop_target_) {
-				awaiting_drop_paste_ = false;
-				dnd_over_drop_target_ = false;
-				return drop_target_->handle(FL_PASTE);
-			}
-			break;
-		default:
-			break;
-		}
-		return Fl_Double_Window::handle(event);
-	}
-
 private:
 	void build_send_tab() {
-		send_group_ = new Fl_Group(22, 96, 936, 224, "发送");
-		send_intro_box_ = new Fl_Box(38, 124, 900, 24, "先选择并复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
-		send_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		send_intro_box_->labelsize(15);
-		send_address_title_box_ = new Fl_Box(38, 160, 900, 24, "选择发送链接");
-		send_address_title_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		send_address_title_box_->labelfont(FL_HELVETICA_BOLD);
-		send_address_title_box_->labelsize(16);
-		send_address_choice_ = new Fl_Choice(38, 194, 742, 36);
-		send_address_choice_->textsize(15);
-		send_address_choice_->down_box(FL_BORDER_BOX);
-		copy_address_button_ = new Fl_Button(796, 194, 142, 36, "复制链接");
-		copy_address_button_->color(fl_rgb_color(233, 226, 214));
-		copy_address_button_->selection_color(fl_rgb_color(212, 169, 92));
-		send_empty_box_ = new Fl_Box(38, 244, 900, 56, "正在准备发送地址...");
-		send_empty_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
-		send_empty_box_->labelsize(14);
-		drop_target_ = new DropTargetBox(38, 194, 900, 106);
-		drop_target_->hide();
-		send_group_->end();
+		send_panel_ = new wxPanel(notebook_);
+		auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+		// Intro text
+		send_intro_label_ = new wxStaticText(send_panel_, wxID_ANY,
+			L"先选择并复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
+		send_intro_label_->SetFont(send_intro_label_->GetFont().Scaled(1.1f));
+		sizer->Add(send_intro_label_, 0, wxALL, 14);
+
+		// Address title
+		send_addr_title_label_ = new wxStaticText(send_panel_, wxID_ANY, L"选择发送链接");
+		send_addr_title_label_->SetFont(send_addr_title_label_->GetFont().Bold().Scaled(1.2f));
+		sizer->Add(send_addr_title_label_, 0, wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		// Address row (choice + copy button)
+		auto* addr_sizer = new wxBoxSizer(wxHORIZONTAL);
+		send_addr_choice_ = new wxChoice(send_panel_, wxID_ANY);
+		send_addr_choice_->SetMinSize(wxSize(600, 34));
+		addr_sizer->Add(send_addr_choice_, 1, wxRIGHT, 14);
+
+		copy_button_ = new wxButton(send_panel_, wxID_ANY, L"复制链接");
+		copy_button_->SetMinSize(wxSize(142, 36));
+		copy_button_->Bind(wxEVT_BUTTON, &SoraTransportFrame::on_copy_address, this);
+		addr_sizer->Add(copy_button_, 0);
+
+		sizer->Add(addr_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		// Empty state label
+		send_empty_label_ = new wxStaticText(send_panel_, wxID_ANY, L"正在准备发送地址...");
+		send_empty_label_->SetFont(send_empty_label_->GetFont().Scaled(1.0f));
+		sizer->Add(send_empty_label_, 0, wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		// Drop target
+		drop_target_ = new DropTargetPanel(send_panel_);
+		drop_target_->SetMinSize(wxSize(-1, 106));
+		drop_target_->Hide();
+		drop_target_->set_drop_handler([this](std::vector<std::filesystem::path> paths) {
+			handle_drop(std::move(paths));
+		});
+		sizer->Add(drop_target_, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		send_panel_->SetSizer(sizer);
+		notebook_->AddPage(send_panel_, L"发送");
 	}
 
 	void build_receive_tab() {
-		receive_group_ = new Fl_Group(22, 96, 936, 224, "接收");
-		receive_intro_box_ = new Fl_Box(38, 124, 900, 24, "输入发送者链接后连接；接收到的数据会保存到当前工作目录。");
-		receive_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		receive_intro_box_->labelsize(15);
-		receive_destination_box_ = new Fl_Box(38, 160, 900, 24, "保存目录：");
-		receive_destination_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-		receive_destination_box_->labelsize(15);
-		receive_input_ = new Fl_Input(38, 204, 736, 34);
-		receive_input_->textsize(15);
-		connect_button_ = new Fl_Return_Button(790, 204, 148, 34, "连接");
-		connect_button_->color(fl_rgb_color(233, 226, 214));
-		connect_button_->selection_color(fl_rgb_color(212, 169, 92));
-		receive_hint_box_ = new Fl_Box(38, 252, 900, 46, "支持在输入框按回车，或点击右侧按钮开始连接。");
-		receive_hint_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
-		receive_hint_box_->labelsize(14);
-		receive_group_->end();
+		receive_panel_ = new wxPanel(notebook_);
+		auto* sizer = new wxBoxSizer(wxVERTICAL);
+
+		// Intro text
+		auto* intro_label = new wxStaticText(receive_panel_, wxID_ANY,
+			L"输入发送者链接后连接；接收到的数据会保存到当前工作目录。");
+		intro_label->SetFont(intro_label->GetFont().Scaled(1.1f));
+		sizer->Add(intro_label, 0, wxALL, 14);
+
+		// Destination directory (current_dir_ 运行时不变，构造时一次性设置)
+		receive_dest_label_ = new wxStaticText(receive_panel_, wxID_ANY,
+			L"保存目录：" + path_to_ui_text(current_dir_));
+		receive_dest_label_->SetFont(receive_dest_label_->GetFont().Scaled(1.1f));
+		sizer->Add(receive_dest_label_, 0, wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		// Input row
+		auto* input_sizer = new wxBoxSizer(wxHORIZONTAL);
+		receive_input_ = new wxTextCtrl(receive_panel_, wxID_ANY, L"", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+		receive_input_->SetMinSize(wxSize(600, 34));
+		receive_input_->Bind(wxEVT_TEXT_ENTER, &SoraTransportFrame::on_connect, this);
+		input_sizer->Add(receive_input_, 1, wxRIGHT, 14);
+
+		connect_button_ = new wxButton(receive_panel_, wxID_ANY, L"连接");
+		connect_button_->SetMinSize(wxSize(148, 34));
+		connect_button_->Bind(wxEVT_BUTTON, &SoraTransportFrame::on_connect, this);
+		input_sizer->Add(connect_button_, 0);
+
+		sizer->Add(input_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		// Hint
+		receive_hint_label_ = new wxStaticText(receive_panel_, wxID_ANY,
+			L"支持在输入框按回车，或点击右侧按钮开始连接。");
+		receive_hint_label_->SetFont(receive_hint_label_->GetFont().Scaled(1.0f));
+		sizer->Add(receive_hint_label_, 0, wxLEFT | wxRIGHT | wxBOTTOM, 14);
+
+		receive_panel_->SetSizer(sizer);
+		notebook_->AddPage(receive_panel_, L"接收");
 	}
 
-	static void window_close_callback(Fl_Widget*, void* context) {
-		static_cast<AppWindow*>(context)->handle_close_request();
+	void on_tab_changed(wxBookCtrlEvent&) {
+		update_ui();
 	}
 
-	static void timer_callback(void* context) {
-		auto* self = static_cast<AppWindow*>(context);
-		self->update_ui();
-		Fl::repeat_timeout(0.25, timer_callback, context);
+	void on_close(wxCloseEvent& event) {
+		if (close_requested_) {
+			event.Skip();
+			return;
+		}
+
+		const auto send_snapshot = send_server_.snapshot();
+		const auto receive_snapshot = receive_progress_->snapshot();
+		const bool active_transfer = send_snapshot.transfer_in_progress
+			|| (is_receive_session_active() && receive_snapshot.status_text == "receiving");
+
+		if (active_transfer) {
+			auto* dlg = new wxMessageDialog(this,
+				L"传输或连接仍在进行，要停止吗？",
+				L"确认关闭",
+				wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+			dlg->SetYesNoLabels(L"是", L"否");
+			if (dlg->ShowModal() != wxID_YES) {
+				dlg->Destroy();
+				return;
+			}
+			dlg->Destroy();
+		}
+
+		close_requested_ = true;
+		if (receive_cancel_event_) {
+			receive_cancel_event_->emit();
+		}
+		if (receive_thread_.joinable()) {
+			receive_thread_.request_stop();
+		}
+		event.Skip();
 	}
 
-	static void tabs_changed_callback(Fl_Widget*, void* context) {
-		static_cast<AppWindow*>(context)->update_ui();
+	void on_timer(wxTimerEvent&) {
+		update_ui();
 	}
 
-	static void copy_address_callback(Fl_Widget*, void* context) {
-		auto* self = static_cast<AppWindow*>(context);
-		const auto selected_url = self->selected_send_address_url();
+	void on_ui_refresh(wxThreadEvent&) {
+		update_ui();
+	}
+
+	void on_copy_address(wxCommandEvent&) {
+		auto selected_url = selected_send_address_url();
 		if (!selected_url) {
-			self->set_transient_status("当前没有可复制的发送链接");
+			set_transient_status(L"当前没有可复制的发送链接");
 			return;
 		}
 		write_clipboard_text(*selected_url);
-		self->set_transient_status("链接已复制到剪贴板");
+		set_transient_status(L"链接已复制到剪贴板");
 	}
 
-	static void connect_callback(Fl_Widget*, void* context) {
-		static_cast<AppWindow*>(context)->start_receive_session();
+	void on_connect(wxCommandEvent&) {
+		start_receive_session();
 	}
 
-	void set_transient_status(std::string status) {
+	void set_transient_status(std::wstring status) {
 		transient_status_ = std::move(status);
 		transient_status_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 		update_ui();
@@ -538,7 +432,7 @@ private:
 		}
 		cleanup_finished_receive_session();
 		if (!receive_thread_.joinable()) {
-			hide();
+			Hide();
 		}
 	}
 
@@ -562,13 +456,13 @@ private:
 	void start_receive_session() {
 		cleanup_finished_receive_session();
 		if (is_receive_session_active()) {
-			set_transient_status("当前接收任务仍在进行");
+			set_transient_status(L"当前接收任务仍在进行");
 			return;
 		}
 
-		auto parsed_url = parse_soratrans_url(receive_input_->value());
+		auto parsed_url = parse_soratrans_url(receive_input_->GetValue().ToStdString());
 		if (!parsed_url) {
-			set_transient_status("请输入有效的 soratrans:// 链接");
+			set_transient_status(L"请输入有效的 soratrans:// 链接");
 			return;
 		}
 
@@ -585,7 +479,8 @@ private:
 			} catch (...) {
 			}
 			receive_session_finished_.store(true, std::memory_order_release);
-			Fl::awake();
+			// Wake up UI from worker thread
+			wxQueueEvent(this, new wxThreadEvent(wxEVT_UI_REFRESH));
 		});
 		update_ui();
 	}
@@ -593,10 +488,10 @@ private:
 	void handle_drop(std::vector<std::filesystem::path> paths) {
 		auto submit_error = send_server_.submit_paths(std::move(paths));
 		if (submit_error) {
-			set_transient_status(*submit_error);
+			set_transient_status(utf8_to_utf16(*submit_error));
 			return;
 		}
-		set_transient_status("已开始发送拖放内容");
+		set_transient_status(L"已开始发送拖放内容");
 	}
 
 	void handle_close_request() {
@@ -606,12 +501,19 @@ private:
 
 		const auto send_snapshot = send_server_.snapshot();
 		const auto receive_snapshot = receive_progress_->snapshot();
-		const bool active_transfer = send_snapshot.transfer_in_progress || (is_receive_session_active() && receive_snapshot.status_text == "receiving");
+		const bool active_transfer = send_snapshot.transfer_in_progress
+			|| (is_receive_session_active() && receive_snapshot.status_text == "receiving");
 		if (active_transfer) {
-			const auto choice = fl_choice("传输或连接仍在进行，要停止吗？", "否", "是", nullptr);
-			if (choice != kStopTransferChoice) {
+			auto* dlg = new wxMessageDialog(this,
+				L"传输或连接仍在进行，要停止吗？",
+				L"确认关闭",
+				wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+			dlg->SetYesNoLabels(L"是", L"否");
+			if (dlg->ShowModal() != wxID_YES) {
+				dlg->Destroy();
 				return;
 			}
+			dlg->Destroy();
 		}
 
 		close_requested_ = true;
@@ -621,27 +523,26 @@ private:
 		if (receive_thread_.joinable()) {
 			receive_thread_.request_stop();
 		}
-		hide();
+		Hide();
 	}
 
 	std::optional<std::string> selected_send_address_url() const {
-		if (send_address_choice_ == nullptr) {
+		if (send_addr_choice_ == nullptr) {
 			return std::nullopt;
 		}
-		const auto selected_index = send_address_choice_->value();
-		if (selected_index < 0 || static_cast<std::size_t>(selected_index) >= addresses_.size()) {
+		auto selected_index = send_addr_choice_->GetSelection();
+		if (selected_index == wxNOT_FOUND || static_cast<std::size_t>(selected_index) >= addresses_.size()) {
 			return std::nullopt;
 		}
 		return addresses_[static_cast<std::size_t>(selected_index)].url;
 	}
 
 	void rebuild_address_choice(std::string_view preferred_url = {}) {
-		send_address_choice_->clear();
+		send_addr_choice_->Clear();
 
 		int selected_index = -1;
 		for (std::size_t index = 0; index < addresses_.size(); ++index) {
-			auto escaped_label = escape_choice_label(addresses_[index].url);
-			send_address_choice_->add(escaped_label.c_str());
+			send_addr_choice_->AppendString(utf8_to_utf16(addresses_[index].url));
 			if (!preferred_url.empty() && addresses_[index].url == preferred_url) {
 				selected_index = static_cast<int>(index);
 			}
@@ -650,9 +551,8 @@ private:
 			selected_index = 0;
 		}
 		if (selected_index >= 0) {
-			send_address_choice_->value(selected_index);
+			send_addr_choice_->SetSelection(selected_index);
 		}
-		send_address_choice_->redraw();
 	}
 
 	void update_send_addresses(std::uint16_t port) {
@@ -669,74 +569,58 @@ private:
 		}
 	}
 
-	bool route_drop_target_event(int event) {
-		if (drop_target_ == nullptr || !drop_target_->visible() || !drop_target_->accepting()) {
-			return false;
-		}
-		if (!drop_target_->contains_point(Fl::event_x(), Fl::event_y())) {
-			if (dnd_over_drop_target_) {
-				dnd_over_drop_target_ = false;
-				drop_target_->handle(FL_DND_LEAVE);
-			}
-			return false;
-		}
-		dnd_over_drop_target_ = true;
-		return drop_target_->handle(event) != 0;
-	}
-
 	void update_send_controls(const GuiSendServerSnapshot& snapshot) {
 		if (snapshot.receiver_connected) {
-			send_address_title_box_->hide();
-			send_address_choice_->hide();
-			copy_address_button_->hide();
-			send_empty_box_->hide();
-			drop_target_->show();
+			send_addr_title_label_->Hide();
+			send_addr_choice_->Hide();
+			copy_button_->Hide();
+			send_empty_label_->Hide();
+			drop_target_->Show();
 			if (snapshot.transfer_in_progress) {
 				drop_target_->set_accepting(false);
-				drop_target_->set_message("正在发送当前拖放内容，请等待本次传输完成。");
+				drop_target_->set_message(L"正在发送当前拖放内容，请等待本次传输完成。");
 			} else {
 				drop_target_->set_accepting(true);
-				drop_target_->set_message("接收端已连接。\n将文件或文件夹拖到这里开始发送。");
+				drop_target_->set_message(L"接收端已连接。\n将文件或文件夹拖到这里开始发送。");
 			}
 			return;
 		}
 
-		drop_target_->hide();
-		send_address_title_box_->show();
+		drop_target_->Hide();
+		send_addr_title_label_->Show();
 		if (snapshot.bound_port == 0) {
-			send_address_choice_->hide();
-			copy_address_button_->hide();
-			send_empty_box_->show();
-			send_empty_box_->copy_label("正在准备发送地址...");
+			send_addr_choice_->Hide();
+			copy_button_->Hide();
+			send_empty_label_->Show();
+			send_empty_label_->SetLabelText(L"正在准备发送地址...");
 			return;
 		}
 		if (addresses_.empty()) {
-			send_address_choice_->hide();
-			copy_address_button_->hide();
-			send_empty_box_->show();
-			send_empty_box_->copy_label("暂未找到可分享的非虚拟网卡地址。\n\n如果你刚切换网络，请稍后再试。\n接收端连入后，这里会自动切换为拖放框。");
+			send_addr_choice_->Hide();
+			copy_button_->Hide();
+			send_empty_label_->Show();
+			send_empty_label_->SetLabelText(
+				L"暂未找到可分享的非虚拟网卡地址。\n\n如果你刚切换网络，请稍后再试。\n接收端连入后，这里会自动切换为拖放框。");
 			return;
 		}
-		send_empty_box_->hide();
-		send_address_choice_->show();
-		copy_address_button_->show();
+		send_empty_label_->Hide();
+		send_addr_choice_->Show();
+		copy_button_->Show();
 	}
 
 	void update_receive_controls() {
-		receive_destination_box_->copy_label(("保存目录：" + path_to_ui_text(current_dir_)).c_str());
+		// current_dir_ 不会在运行时改变，目录标签在 build_receive_tab 中已设置
 		const bool active = is_receive_session_active();
-		if (active) {
-			receive_input_->deactivate();
-			connect_button_->deactivate();
-		} else {
-			receive_input_->activate();
-			connect_button_->activate();
-		}
+		receive_input_->Enable(!active);
+		connect_button_->Enable(!active);
 	}
 
-	void update_progress_view_state(const TransferProgressSnapshot& snapshot, ProgressViewState& state, std::chrono::steady_clock::time_point now) {
-		const bool counters_reset = snapshot.processed_bytes < state.last_bytes || snapshot.processed_files < state.last_files;
-		const bool phase_reset = snapshot.status_text != state.last_status_text && snapshot.processed_bytes == 0 && snapshot.processed_files == 0;
+	void update_progress_view_state(const TransferProgressSnapshot& snapshot, ProgressViewState& state,
+	                                  std::chrono::steady_clock::time_point now) {
+		const bool counters_reset = snapshot.processed_bytes < state.last_bytes
+			|| snapshot.processed_files < state.last_files;
+		const bool phase_reset = snapshot.status_text != state.last_status_text
+			&& snapshot.processed_bytes == 0 && snapshot.processed_files == 0;
 		if (counters_reset || phase_reset) {
 			state.started_at = now;
 			state.completed_at.reset();
@@ -770,45 +654,49 @@ private:
 
 	void update_detail_box(const GuiSendServerSnapshot& send_snapshot, bool receive_selected) {
 		if (receive_selected) {
-			auto parsed_url = parse_soratrans_url(receive_input_->value());
-			if (parsed_url) {
-				detail_box_->copy_label(("来源地址：" + parsed_url->canonical_text + "    保存到：" + path_to_ui_text(current_dir_)).c_str());
-			} else {
-				detail_box_->copy_label(("保存到：" + path_to_ui_text(current_dir_)).c_str());
-			}
+			// current_dir_ 在运行时不变，使用构造时缓存的文本
+			detail_label_->SetLabelText(receive_detail_text_);
 			return;
 		}
 
 		if (send_snapshot.bound_port == 0) {
-			detail_box_->copy_label("发送页：正在绑定监听端口...");
+			detail_label_->SetLabelText(L"发送页：正在绑定监听端口...");
 			return;
 		}
 		if (send_snapshot.receiver_connected) {
-			detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    接收端已连入，可等待拖放开始发送").c_str());
+			detail_label_->SetLabelText(
+				L"发送页：端口 " + std::to_wstring(send_snapshot.bound_port) + L"    接收端已连入，可等待拖放开始发送");
 			return;
 		}
-		detail_box_->copy_label(("发送页：端口 " + std::to_string(send_snapshot.bound_port) + "    复制当前所选链接给接收端").c_str());
+		detail_label_->SetLabelText(
+			L"发送页：端口 " + std::to_wstring(send_snapshot.bound_port) + L"    复制当前所选链接给接收端");
 	}
 
-	void update_summary_boxes(const TransferProgressSnapshot& snapshot, const ProgressViewState& state, bool receive_selected, std::chrono::steady_clock::time_point now) {
+	void update_summary_boxes(const TransferProgressSnapshot& snapshot, const ProgressViewState& state,
+	                           bool receive_selected, std::chrono::steady_clock::time_point now) {
 		const auto average_rate_end_time = state.completed_at.value_or(now);
-		const std::string io_label = receive_selected ? "磁盘写入" : "磁盘读取";
-		recent_box_->copy_label((io_label + "（最近 1 秒）：" + format_rate(state.recent_rate) + "    最近 1 秒文件数：" + std::to_string(state.recent_files)).c_str());
-		total_box_->copy_label((io_label + "（累计）：" + format_size(snapshot.processed_bytes) + "    平均速率：" + format_average_rate(snapshot.processed_bytes, average_rate_end_time - state.started_at) + "    累计文件数：" + std::to_string(snapshot.processed_files)).c_str());
+		const std::wstring io_label = receive_selected ? L"磁盘写入" : L"磁盘读取";
+		recent_label_->SetLabelText(
+			io_label + L"（最近 1 秒）：" + utf8_to_utf16(format_rate(state.recent_rate))
+			+ L"    最近 1 秒文件数：" + std::to_wstring(state.recent_files));
+		total_label_->SetLabelText(
+			io_label + L"（累计）：" + utf8_to_utf16(format_size(snapshot.processed_bytes))
+			+ L"    平均速率：" + utf8_to_utf16(format_average_rate(snapshot.processed_bytes, average_rate_end_time - state.started_at))
+			+ L"    累计文件数：" + std::to_wstring(snapshot.processed_files));
 	}
 
 	void update_status_box(const TransferProgressSnapshot& snapshot) {
-		std::string status_text = translate_status_text(snapshot.status_text);
+		std::wstring status_text = utf8_to_utf16(snapshot.status_text);
 		if (!transient_status_.empty() && std::chrono::steady_clock::now() >= transient_status_until_) {
 			transient_status_.clear();
 		}
 		if (!transient_status_.empty()) {
 			if (!status_text.empty()) {
-				status_text += "    ";
+				status_text += L"    ";
 			}
 			status_text += transient_status_;
 		}
-		status_box_->copy_label(("状态：" + status_text).c_str());
+		status_label_->SetLabelText(L"状态：" + status_text);
 	}
 
 	void update_ui() {
@@ -817,7 +705,15 @@ private:
 
 		const auto now = std::chrono::steady_clock::now();
 		const auto send_snapshot = send_server_.snapshot();
-		update_send_addresses(send_snapshot.bound_port);
+
+		// 地址枚举只需要执行一次，不应在定时器中反复轮询
+		if (!addresses_initialized_) {
+			update_send_addresses(send_snapshot.bound_port);
+			if (address_port_ != 0) {
+				addresses_initialized_ = true;
+			}
+		}
+
 		update_send_controls(send_snapshot);
 		update_receive_controls();
 
@@ -826,7 +722,7 @@ private:
 		update_progress_view_state(send_progress_snapshot, send_view_state_, now);
 		update_progress_view_state(receive_progress_snapshot, receive_view_state_, now);
 
-		const bool receive_selected = tabs_->value() == receive_group_;
+		const bool receive_selected = notebook_->GetSelection() == 1;
 		const auto& selected_progress = receive_selected ? receive_progress_snapshot : send_progress_snapshot;
 		const auto& selected_view_state = receive_selected ? receive_view_state_ : send_view_state_;
 		update_detail_box(send_snapshot, receive_selected);
@@ -843,47 +739,61 @@ private:
 	std::jthread receive_thread_;
 	std::atomic<bool> receive_session_finished_{true};
 	std::uint16_t address_port_ = 0;
+	bool addresses_initialized_ = false;
 	std::vector<InterfaceAddress> addresses_;
 	ProgressViewState send_view_state_;
 	ProgressViewState receive_view_state_;
 	bool close_requested_ = false;
-	bool dnd_over_drop_target_ = false;
-	bool awaiting_drop_paste_ = false;
-	std::string transient_status_;
+	std::wstring transient_status_;
 	std::chrono::steady_clock::time_point transient_status_until_{};
+	std::wstring receive_detail_text_; // 缓存的接收页 detail 文本（current_dir_ 不变）
 
-	Fl_Box* title_box_ = nullptr;
-	Fl_Tabs* tabs_ = nullptr;
-	Fl_Group* send_group_ = nullptr;
-	Fl_Group* receive_group_ = nullptr;
-	Fl_Box* send_intro_box_ = nullptr;
-	Fl_Box* send_address_title_box_ = nullptr;
-	Fl_Choice* send_address_choice_ = nullptr;
-	Fl_Button* copy_address_button_ = nullptr;
-	Fl_Box* send_empty_box_ = nullptr;
-	DropTargetBox* drop_target_ = nullptr;
-	Fl_Box* receive_intro_box_ = nullptr;
-	Fl_Box* receive_destination_box_ = nullptr;
-	Fl_Input* receive_input_ = nullptr;
-	Fl_Return_Button* connect_button_ = nullptr;
-	Fl_Box* receive_hint_box_ = nullptr;
-	Fl_Box* detail_box_ = nullptr;
-	Fl_Box* recent_box_ = nullptr;
-	Fl_Box* total_box_ = nullptr;
-	Fl_Box* status_box_ = nullptr;
+	// Widgets
+	wxStaticText* title_label_ = nullptr;
+	wxNotebook* notebook_ = nullptr;
+	wxPanel* send_panel_ = nullptr;
+	wxPanel* receive_panel_ = nullptr;
+	wxStaticText* send_intro_label_ = nullptr;
+	wxStaticText* send_addr_title_label_ = nullptr;
+	wxChoice* send_addr_choice_ = nullptr;
+	wxButton* copy_button_ = nullptr;
+	wxStaticText* send_empty_label_ = nullptr;
+	DropTargetPanel* drop_target_ = nullptr;
+	wxStaticText* receive_dest_label_ = nullptr;
+	wxTextCtrl* receive_input_ = nullptr;
+	wxButton* connect_button_ = nullptr;
+	wxStaticText* receive_hint_label_ = nullptr;
+	wxStaticText* detail_label_ = nullptr;
+	wxStaticText* recent_label_ = nullptr;
+	wxStaticText* total_label_ = nullptr;
+	wxStaticText* status_label_ = nullptr;
+	wxTimer* timer_ = nullptr;
 };
 
-int run_gui_app(int argc, char** argv) {
-	const auto current_dir = std::filesystem::current_path();
-	std::optional<SoratransUrl> clipboard_url;
-	if (const auto clipboard = read_clipboard_text()) {
-		clipboard_url = parse_soratrans_url(*clipboard);
-	}
+// wxApp class
+class SoraTransportApp : public wxApp {
+public:
+	bool OnInit() override {
+		if (!wxApp::OnInit()) {
+			return false;
+		}
 
-	const int fltk_argc = argc > 0 ? 1 : 0;
-	AppWindow window(current_dir, clipboard_url);
-	window.show(fltk_argc, argv);
-	return Fl::run();
+		const auto current_dir = std::filesystem::current_path();
+		std::optional<SoratransUrl> clipboard_url;
+		if (const auto clipboard = read_clipboard_text()) {
+			clipboard_url = parse_soratrans_url(*clipboard);
+		}
+
+		auto* frame = new SoraTransportFrame(current_dir, clipboard_url);
+		frame->Show(true);
+		return true;
+	}
+};
+
+wxIMPLEMENT_APP_NO_MAIN(SoraTransportApp);
+
+int run_gui_app(int argc, char** argv) {
+	return wxEntry(argc, argv);
 }
 
 } // namespace
