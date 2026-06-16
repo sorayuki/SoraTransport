@@ -62,6 +62,25 @@ find_package(Boost REQUIRED CONFIG)
 find_package(ZLIB REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
+
+# FindLibArchive.cmake 只用单路径 IMPORTED_LOCATION，vcpkg 下 debug/lib/ 和 lib/ 同名，
+# 可能误把 debug 版用于所有配置。用字符串推导 per-config 路径修复。
+if(TARGET LibArchive::LibArchive)
+	get_target_property(_la_lib LibArchive::LibArchive IMPORTED_LOCATION)
+	if(_la_lib)
+		string(REGEX REPLACE "/debug/" "/" _la_rel "${_la_lib}")
+		string(REGEX REPLACE "/lib/" "/debug/lib/" _la_dbg "${_la_rel}")
+		set_target_properties(LibArchive::LibArchive PROPERTIES
+			IMPORTED_LOCATION_RELEASE        "${_la_rel}"
+			IMPORTED_LOCATION_RELWITHDEBINFO "${_la_rel}"
+			IMPORTED_LOCATION_MINSIZEREL     "${_la_rel}"
+			IMPORTED_LOCATION_DEBUG          "${_la_dbg}"
+		)
+		unset(_la_dbg)
+		unset(_la_rel)
+	endif()
+	unset(_la_lib)
+endif()
 # find_package(FLTK CONFIG REQUIRED)
 
 if(TARGET fltk AND NOT TARGET fltk::fltk)
