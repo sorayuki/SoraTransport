@@ -28,7 +28,7 @@ std::shared_ptr<BufferedFileWriter> BufferedFileWriter::create(
 	TaskExecutor& executor,
 	PipelineTuning tuning,
 	std::optional<std::uint64_t> expected_size,
-	CancelEvent* cancel_event) {
+	const CancelEvent* cancel_event) {
 	return std::shared_ptr<BufferedFileWriter>(new BufferedFileWriter(output_path, executor, std::move(tuning), expected_size, cancel_event));
 }
 
@@ -37,7 +37,7 @@ BufferedFileWriter::BufferedFileWriter(
 	TaskExecutor& executor,
 	PipelineTuning tuning,
 	std::optional<std::uint64_t> expected_size,
-	CancelEvent* cancel_event)
+	const CancelEvent* cancel_event)
 	: output_path_(output_path),
 	  executor_(executor),
 	  tuning_(std::move(tuning)),
@@ -48,8 +48,9 @@ BufferedFileWriter::BufferedFileWriter(
 	  max_slots_(std::max<std::size_t>(1, tuning_.writer_slots.max_slots)) {
 	current_slot_.reserve(slot_capacity_);
 	if (cancel_event_ != nullptr) {
-		sink_->listenCancelSignal(*cancel_event_);
-		cancel_connection_ = cancel_event_->connect([this] {
+		auto* mutable_cancel = const_cast<CancelEvent*>(cancel_event_);
+		sink_->listenCancelSignal(*mutable_cancel);
+		cancel_connection_ = mutable_cancel->connect([this] {
 			{
 				std::lock_guard lock(mutex_);
 				cancel_requested_ = true;

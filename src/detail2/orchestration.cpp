@@ -416,22 +416,19 @@ void receive_transport_from_source(
 	CancelEvent& cancel_event) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
-	auto config = make_runtime_config();
+	auto tuning = detail2::make_pipeline_tuning();
 
-	RuntimeExecutors executors(config.worker_threads);
+	detail2::TaskExecutor executor(tuning.worker_threads);
 	BufferPool pool;
-	auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
-	write_budget->listenCancelSignal(cancel_event);
-	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
+	BoundedQueue<DataChunk> tar_queue(tuning.tar_queue_capacity, executor.executor());
 	tar_queue.listenCancelSignal(cancel_event);
 	PipelineState state;
 	detail2::TarUnpacker unpacker(
 		destination_dir,
 		pool,
-		executors,
-		write_budget,
-		config.max_in_flight_write_ops,
-		config.max_parallel_extract_files);
+		executor,
+		tuning,
+		&cancel_event);
 	print_receive_progress_legend();
 	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed, &cancel_event);
 
@@ -439,9 +436,7 @@ void receive_transport_from_source(
 		[&](std::uint64_t bytes_per_second) {
 			std::ostringstream out;
 			out << "[receive] " << format_rate(bytes_per_second)
-				<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}'
-				<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
-				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
+				<< " q{" << queue_usage("n/u", tar_queue.size(), tar_queue.capacity()) << '}';
 			return out.str();
 		},
 		uncompressed_bytes_processed,
@@ -844,21 +839,18 @@ void unpack_file_to_directory(
 	CancelEvent* cancel_event) {
 	CancelEvent local_cancel_event;
 	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
-	auto config = make_runtime_config(options);
-	RuntimeExecutors executors(config.worker_threads);
+	auto tuning = detail2::make_pipeline_tuning(options);
+	detail2::TaskExecutor executor(tuning.worker_threads);
 	BufferPool pool;
-	auto write_budget = std::make_shared<InFlightWriteBudget>(config.max_in_flight_write_bytes);
-	write_budget->listenCancelSignal(effective_cancel_event);
-	BoundedQueue<DataChunk> tar_queue(config.tar_queue_depth, executors.executor());
+	BoundedQueue<DataChunk> tar_queue(tuning.tar_queue_capacity, executor.executor());
 	tar_queue.listenCancelSignal(effective_cancel_event);
 	PipelineState state;
 	detail2::TarUnpacker unpacker(
 		destination_dir,
 		pool,
-		executors,
-		write_budget,
-		config.max_in_flight_write_ops,
-		config.max_parallel_extract_files);
+		executor,
+		tuning,
+		&effective_cancel_event);
 	FileByteSource source(input_file);
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	print_unpack_progress_legend();
@@ -867,9 +859,7 @@ void unpack_file_to_directory(
 		[&](std::uint64_t bytes_per_second) {
 			std::ostringstream out;
 			out << "[unpack] " << format_rate(bytes_per_second)
-				<< " q{" << queue_usage("s/u", tar_queue.size(), tar_queue.capacity()) << '}'
-				<< " wb=" << format_scaled_bytes(write_budget->used_bytes(), "")
-				<< '/' << format_scaled_bytes(write_budget->max_bytes(), "");
+				<< " q{" << queue_usage("s/u", tar_queue.size(), tar_queue.capacity()) << '}';
 			return out.str();
 		},
 		uncompressed_bytes_processed,

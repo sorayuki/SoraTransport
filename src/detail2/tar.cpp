@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace soratransport::detail2 {
 
@@ -183,6 +184,280 @@ void TarPacker::add_entry(struct archive* writer, OpenedFile& opened_file, std::
 	}
 
 	archive_entry_free(entry);
+}
+
+// ---------------------------------------------------------------------------
+// TarUnpacker (native detail2 implementation using BufferedFileWriter)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct RestorableMetadata {
+	std::filesystem::path output_path;
+	std::uint64_t file_size = 0;
+	std::filesystem::perms permissions = std::filesystem::perms::unknown;
+	std::optional<FileTimestamp> creation_time;
+	std::optional<FileTimestamp> last_access_time;
+	std::optional<FileTimestamp> last_write_time;
+};
+
+std::optional<FileTimestamp> to_file_timestamp(time_t sec, long nsec) {
+	if (sec == 0 && nsec == 0) {
+		return std::nullopt;
+	}
+	return FileTimestamp{sec, static_cast<long>(nsec)};
+}
+
+FILETIME timestamp_to_filetime(const FileTimestamp& ts) {
+	ULARGE_INTEGER uli;
+	uli.QuadPart = (static_cast<std::uint64_t>(ts.seconds) + 11644473600ULL) * 10000000ULL
+		+ static_cast<std::uint64_t>(ts.nanoseconds) / 100ULL;
+	FILETIME ft;
+	ft.dwLowDateTime = uli.LowPart;
+	ft.dwHighDateTime = uli.HighPart;
+	return ft;
+}
+
+RestorableMetadata capture_restorable_metadata(archive_entry* entry, const std::filesystem::path& output_path) {
+	RestorableMetadata m;
+	m.output_path = output_path;
+	m.file_size = static_cast<std::uint64_t>(std::max<la_int64_t>(0, archive_entry_size(entry)));
+	m.permissions = static_cast<std::filesystem::perms>(archive_entry_perm(entry) & 0777);
+	m.creation_time = to_file_timestamp(archive_entry_birthtime(entry), archive_entry_birthtime_nsec(entry));
+	m.last_access_time = to_file_timestamp(archive_entry_atime(entry), archive_entry_atime_nsec(entry));
+	m.last_write_time = to_file_timestamp(archive_entry_mtime(entry), archive_entry_mtime_nsec(entry));
+	return m;
+}
+
+void apply_permissions_if_possible(const RestorableMetadata& metadata) {
+	if (metadata.permissions == std::filesystem::perms::unknown) {
+		return;
+	}
+	std::error_code ec;
+	std::filesystem::permissions(metadata.output_path, metadata.permissions,
+		std::filesystem::perm_options::replace, ec);
+	if (ec && ec.value() != static_cast<int>(std::errc::operation_not_supported)
+		&& ec.value() != static_cast<int>(std::errc::function_not_supported)) {
+		throw std::runtime_error("failed to set permissions: " + path_to_utf8_string(metadata.output_path) + ": " + ec.message());
+	}
+}
+
+void apply_timestamps(const RestorableMetadata& metadata, bool is_directory) {
+	if (!metadata.creation_time && !metadata.last_access_time && !metadata.last_write_time) {
+		return;
+	}
+	auto display = path_to_utf8_string(metadata.output_path);
+	UniqueWin32Handle handle(::CreateFileW(
+		metadata.output_path.c_str(),
+		FILE_WRITE_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr,
+		OPEN_EXISTING,
+		is_directory ? (FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL) : FILE_ATTRIBUTE_NORMAL,
+		nullptr));
+	if (!handle.valid()) {
+		throw make_win32_error("failed to open for timestamp restore: " + display);
+	}
+	FILETIME ct{}, lat{}, lwt{};
+	FILETIME* pct = nullptr;
+	FILETIME* plat = nullptr;
+	FILETIME* plwt = nullptr;
+	if (metadata.creation_time) {
+		ct = timestamp_to_filetime(*metadata.creation_time);
+		pct = &ct;
+	}
+	if (metadata.last_access_time) {
+		lat = timestamp_to_filetime(*metadata.last_access_time);
+		plat = &lat;
+	}
+	if (metadata.last_write_time) {
+		lwt = timestamp_to_filetime(*metadata.last_write_time);
+		plwt = &lwt;
+	}
+	if (!::SetFileTime(handle.get(), pct, plat, plwt)) {
+		throw make_win32_error("failed to restore timestamps: " + display);
+	}
+}
+
+void apply_restorable_metadata(const RestorableMetadata& metadata, bool is_directory, const CancelEvent* cancel_event) {
+	throw_if_cancelled(cancel_event);
+	apply_timestamps(metadata, is_directory);
+	throw_if_cancelled(cancel_event);
+	apply_permissions_if_possible(metadata);
+}
+
+struct TarReadContext {
+	BoundedQueue<DataChunk>* in_tar = nullptr;
+	std::optional<DataChunk> current_chunk;
+	std::uint64_t offset = 0;
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter = nullptr;
+	const CancelEvent* cancel_event = nullptr;
+};
+
+void ensure_directory_exists(const std::filesystem::path& path) {
+	std::error_code ec;
+	if (std::filesystem::exists(path, ec)) {
+		return;
+	}
+	std::filesystem::create_directories(path, ec);
+	if (ec) {
+		throw std::runtime_error("failed to create directory: " + path_to_utf8_string(path) + ": " + ec.message());
+	}
+}
+
+} // namespace
+
+TarUnpacker::TarUnpacker(
+	const std::filesystem::path& destination_root,
+	BufferPool& pool,
+	TaskExecutor& executor,
+	PipelineTuning tuning,
+	CancelEvent* cancel_event)
+	: destination_root_(destination_root),
+	  pool_(pool),
+	  executor_(executor),
+	  tuning_(std::move(tuning)),
+	  cancel_event_(cancel_event) {
+	ensure_directory_exists(destination_root_);
+}
+
+void TarUnpacker::unpack(
+	BoundedQueue<DataChunk>& in_tar,
+	std::atomic<std::uint64_t>* uncompressed_bytes_counter,
+	std::atomic<std::uint64_t>* file_counter,
+	const CancelEvent* cancel_event) {
+	auto* effective_cancel = cancel_event != nullptr ? cancel_event : cancel_event_;
+	TarReadContext context{&in_tar, std::nullopt, 0, uncompressed_bytes_counter, effective_cancel};
+
+	auto* reader = archive_read_new();
+	if (reader == nullptr) {
+		throw std::runtime_error("failed to allocate libarchive reader");
+	}
+
+	try {
+		if (archive_read_support_format_tar(reader) != ARCHIVE_OK) {
+			throw_archive_error(reader, "failed to enable tar format support");
+		}
+		if (archive_read_open(reader, &context, nullptr, &TarUnpacker::archive_read_callback, &TarUnpacker::archive_close_callback) != ARCHIVE_OK) {
+			throw_archive_error(reader, "failed to open tar input stream");
+		}
+
+		archive_entry* entry = nullptr;
+		while (true) {
+			throw_if_cancelled(effective_cancel);
+			const auto status = archive_read_next_header(reader, &entry);
+			if (status == ARCHIVE_EOF) {
+				break;
+			}
+			if (status != ARCHIVE_OK) {
+				throw_archive_error(reader, "failed to read tar header");
+			}
+
+			const auto file_type = archive_entry_filetype(entry);
+			if (file_type == AE_IFLNK) {
+				archive_read_data_skip(reader);
+				continue;
+			}
+
+			const auto* utf8_name = archive_entry_pathname_utf8(entry);
+			if (utf8_name == nullptr) {
+				throw std::runtime_error("archive entry has non-UTF-8 pathname");
+			}
+			const auto output_path = resolve_output_path(utf8_name);
+			auto metadata = capture_restorable_metadata(entry, output_path);
+
+			if (file_type == AE_IFDIR) {
+				ensure_directory_exists(metadata.output_path);
+				apply_restorable_metadata(metadata, true, effective_cancel);
+				continue;
+			}
+			if (file_type != AE_IFREG) {
+				archive_read_data_skip(reader);
+				continue;
+			}
+
+			// Buffer all chunks for this file, then write via BufferedFileWriter
+			struct FileChunk {
+				std::shared_ptr<std::uint8_t> data;
+				std::size_t length = 0;
+				std::uint64_t offset = 0;
+			};
+			std::vector<FileChunk> chunks;
+			const void* buffer = nullptr;
+			size_t length = 0;
+			la_int64_t data_offset = 0;
+			while (true) {
+				throw_if_cancelled(effective_cancel);
+				const auto block_status = archive_read_data_block(reader, &buffer, &length, &data_offset);
+				if (block_status == ARCHIVE_EOF) {
+					break;
+				}
+				if (block_status != ARCHIVE_OK) {
+					throw_archive_error(reader, "failed to stream tar payload");
+				}
+				auto owned = pool_.acquire(length);
+				std::memcpy(owned.get(), buffer, length);
+				chunks.push_back({std::move(owned), length, static_cast<std::uint64_t>(data_offset)});
+			}
+
+			ensure_directory_exists(metadata.output_path.parent_path());
+
+			auto writer = BufferedFileWriter::create(
+				metadata.output_path,
+				executor_,
+				tuning_,
+				metadata.file_size,
+				effective_cancel);
+
+			for (const auto& chunk : chunks) {
+				throw_if_cancelled(effective_cancel);
+				writer->write(std::span(chunk.data.get(), chunk.length));
+			}
+			writer->close();
+
+			apply_restorable_metadata(metadata, false, effective_cancel);
+			if (file_counter != nullptr) {
+				file_counter->fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+
+		archive_read_close(reader);
+		archive_read_free(reader);
+	} catch (...) {
+		archive_read_free(reader);
+		throw;
+	}
+}
+
+la_ssize_t TarUnpacker::archive_read_callback(struct archive*, void* client_data, const void** buffer) {
+	auto* context = static_cast<TarReadContext*>(client_data);
+	throw_if_cancelled(context->cancel_event);
+	context->current_chunk = context->in_tar->pop();
+	if (!context->current_chunk.has_value()) {
+		*buffer = nullptr;
+		return 0;
+	}
+	*buffer = context->current_chunk->data.get();
+	if (context->uncompressed_bytes_counter != nullptr) {
+		context->uncompressed_bytes_counter->fetch_add(context->current_chunk->length, std::memory_order_relaxed);
+	}
+	context->offset += context->current_chunk->length;
+	return static_cast<la_ssize_t>(context->current_chunk->length);
+}
+
+int TarUnpacker::archive_close_callback(struct archive*, void*) {
+	return ARCHIVE_OK;
+}
+
+std::filesystem::path TarUnpacker::resolve_output_path(const char* utf8_path) const {
+	auto relative = std::filesystem::path(reinterpret_cast<const char8_t*>(utf8_path)).lexically_normal();
+	if (relative.empty() || relative == ".") {
+		return destination_root_;
+	}
+	if (relative.is_absolute()) {
+		relative = relative.lexically_relative("/");
+	}
+	return destination_root_ / relative;
 }
 
 } // namespace soratransport::detail2

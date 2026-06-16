@@ -20,7 +20,7 @@ public:
 		TaskExecutor& executor,
 		PipelineTuning tuning,
 		std::optional<std::uint64_t> expected_size = std::nullopt,
-		CancelEvent* cancel_event = nullptr);
+		const CancelEvent* cancel_event = nullptr);
 
 	~BufferedFileWriter();
 	BufferedFileWriter(const BufferedFileWriter&) = delete;
@@ -38,7 +38,7 @@ private:
 		TaskExecutor& executor,
 		PipelineTuning tuning,
 		std::optional<std::uint64_t> expected_size,
-		CancelEvent* cancel_event);
+		const CancelEvent* cancel_event);
 
 	void ensure_writeable_locked() const;
 	void wait_for_available_slot_locked(std::unique_lock<std::mutex>& lock);
@@ -50,7 +50,7 @@ private:
 	TaskExecutor& executor_;
 	PipelineTuning tuning_;
 	std::optional<std::uint64_t> expected_size_;
-	CancelEvent* cancel_event_ = nullptr;
+	const CancelEvent* cancel_event_ = nullptr;
 	std::unique_ptr<FileByteSink> sink_;
 	std::size_t slot_capacity_ = 0;
 	std::size_t max_slots_ = 1;

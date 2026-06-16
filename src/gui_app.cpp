@@ -356,7 +356,10 @@ public:
 		  current_dir_(std::move(current_dir)),
 		  send_progress_(std::make_shared<TransferProgress>()),
 		  receive_progress_(std::make_shared<TransferProgress>()),
-		  send_server_(send_progress_, RuntimeOptions{}, [] { Fl::awake(); }),
+		  send_server_(send_progress_, RuntimeOptions{}, [this] {
+			send_state_dirty_.store(true, std::memory_order_release);
+			Fl::awake();
+		  }),
 		  receive_url_(std::move(clipboard_url)) {
 		begin();
 		title_box_ = new Fl_Box(20, 18, 940, 34, "SoraTransport 文件传输");
@@ -500,11 +503,16 @@ private:
 		auto* self = static_cast<AppWindow*>(context);
 		self->cleanup_finished_receive_session();
 		self->maybe_finish_close_request();
-		self->update_static_ui();
+		if (self->send_state_dirty_.exchange(false, std::memory_order_acq_rel)) {
+			self->update_static_ui();
+		}
 	}
 
 	static void timer_callback(void* context) {
 		auto* self = static_cast<AppWindow*>(context);
+		if (self->send_state_dirty_.exchange(false, std::memory_order_acq_rel)) {
+			self->update_static_ui();
+		}
 		self->update_dynamic_ui();
 		Fl::repeat_timeout(0.25, timer_callback, context);
 	}
@@ -634,7 +642,7 @@ private:
 
 		close_requested_ = true;
 		stop_receive_session(false);
-		send_server_.stop();
+		update_static_ui();
 		if (receive_thread_.joinable()) {
 			set_transient_status("正在停止接收，请稍候");
 			return;
@@ -874,6 +882,7 @@ private:
 	bool close_requested_ = false;
 	bool dnd_over_drop_target_ = false;
 	bool awaiting_drop_paste_ = false;
+	std::atomic<bool> send_state_dirty_{false};
 	std::string transient_status_;
 	std::chrono::steady_clock::time_point transient_status_until_{};
 
