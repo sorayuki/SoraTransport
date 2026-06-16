@@ -356,7 +356,7 @@ public:
 		  current_dir_(std::move(current_dir)),
 		  send_progress_(std::make_shared<TransferProgress>()),
 		  receive_progress_(std::make_shared<TransferProgress>()),
-		  send_server_(send_progress_),
+		  send_server_(send_progress_, RuntimeOptions{}, [] { Fl::awake(); }),
 		  receive_url_(std::move(clipboard_url)) {
 		begin();
 		title_box_ = new Fl_Box(20, 18, 940, 34, "SoraTransport 文件传输");
@@ -404,6 +404,7 @@ public:
 		}
 
 		update_ui();
+		Fl::awake(awake_callback, this);
 		Fl::add_timeout(0.25, timer_callback, this);
 	}
 
@@ -495,9 +496,16 @@ private:
 		static_cast<AppWindow*>(context)->handle_close_request();
 	}
 
+	static void awake_callback(void* context) {
+		auto* self = static_cast<AppWindow*>(context);
+		self->cleanup_finished_receive_session();
+		self->maybe_finish_close_request();
+		self->update_static_ui();
+	}
+
 	static void timer_callback(void* context) {
 		auto* self = static_cast<AppWindow*>(context);
-		self->update_ui();
+		self->update_dynamic_ui();
 		Fl::repeat_timeout(0.25, timer_callback, context);
 	}
 
@@ -560,34 +568,44 @@ private:
 	}
 
 	void start_receive_session() {
-		cleanup_finished_receive_session();
-		if (is_receive_session_active()) {
-			set_transient_status("当前接收任务仍在进行");
-			return;
-		}
-
-		auto parsed_url = parse_soratrans_url(receive_input_->value());
-		if (!parsed_url) {
-			set_transient_status("请输入有效的 soratrans:// 链接");
-			return;
-		}
-
-		receive_url_ = *parsed_url;
-		receive_progress_->reset("connecting");
-		receive_cancel_event_ = std::make_unique<CancelEvent>();
-		receive_session_finished_.store(false, std::memory_order_release);
-		receive_thread_ = std::jthread([
-			this,
-			url = *receive_url_,
-			cancel_event = receive_cancel_event_.get()](std::stop_token stop_token) {
-			try {
-				receive_directory(url.host, url.port, current_dir_, receive_progress_, stop_token, cancel_event, true);
-			} catch (...) {
+		try {
+			cleanup_finished_receive_session();
+			if (is_receive_session_active()) {
+				set_transient_status("当前接收任务仍在进行");
+				return;
 			}
+
+			auto parsed_url = parse_soratrans_url(receive_input_->value());
+			if (!parsed_url) {
+				set_transient_status("请输入有效的 soratrans:// 链接");
+				return;
+			}
+
+			receive_url_ = *parsed_url;
+			receive_progress_->reset("connecting");
+			receive_cancel_event_ = std::make_unique<CancelEvent>();
+			receive_session_finished_.store(false, std::memory_order_release);
+			receive_thread_ = std::jthread([
+				this,
+				url = *receive_url_,
+				cancel_event = receive_cancel_event_.get()](std::stop_token stop_token) {
+				try {
+					receive_directory(url.host, url.port, current_dir_, receive_progress_, stop_token, cancel_event, true);
+				} catch (...) {
+				}
+				receive_session_finished_.store(true, std::memory_order_release);
+				Fl::awake();
+			});
+			update_ui();
+		} catch (const std::exception& error) {
+			receive_progress_->set_failed(error.what());
 			receive_session_finished_.store(true, std::memory_order_release);
-			Fl::awake();
-		});
-		update_ui();
+			set_transient_status(std::string("连接失败：") + error.what());
+		} catch (...) {
+			receive_progress_->set_failed("unknown error");
+			receive_session_finished_.store(true, std::memory_order_release);
+			set_transient_status("连接失败：未知错误");
+		}
 	}
 
 	void handle_drop(std::vector<std::filesystem::path> paths) {
@@ -811,15 +829,18 @@ private:
 		status_box_->copy_label(("状态：" + status_text).c_str());
 	}
 
-	void update_ui() {
-		cleanup_finished_receive_session();
-		maybe_finish_close_request();
-
-		const auto now = std::chrono::steady_clock::now();
+	void update_static_ui() {
 		const auto send_snapshot = send_server_.snapshot();
 		update_send_addresses(send_snapshot.bound_port);
 		update_send_controls(send_snapshot);
 		update_receive_controls();
+
+		const bool receive_selected = tabs_->value() == receive_group_;
+		update_detail_box(send_snapshot, receive_selected);
+	}
+
+	void update_dynamic_ui() {
+		const auto now = std::chrono::steady_clock::now();
 
 		const auto send_progress_snapshot = send_progress_->snapshot();
 		const auto receive_progress_snapshot = receive_progress_->snapshot();
@@ -829,9 +850,13 @@ private:
 		const bool receive_selected = tabs_->value() == receive_group_;
 		const auto& selected_progress = receive_selected ? receive_progress_snapshot : send_progress_snapshot;
 		const auto& selected_view_state = receive_selected ? receive_view_state_ : send_view_state_;
-		update_detail_box(send_snapshot, receive_selected);
 		update_summary_boxes(selected_progress, selected_view_state, receive_selected, now);
 		update_status_box(selected_progress);
+	}
+
+	void update_ui() {
+		update_static_ui();
+		update_dynamic_ui();
 	}
 
 	std::filesystem::path current_dir_;

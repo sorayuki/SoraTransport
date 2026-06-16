@@ -197,14 +197,22 @@ std::optional<SoratransUrl> parse_soratrans_url(std::string_view text) {
 			return std::nullopt;
 		}
 		result.host = normalized.substr(1, end - 1);
-		result.port = static_cast<std::uint16_t>(std::stoul(normalized.substr(end + 2)));
+		try {
+			result.port = static_cast<std::uint16_t>(std::stoul(normalized.substr(end + 2)));
+		} catch (const std::exception&) {
+			return std::nullopt;
+		}
 	} else {
 		const auto colon = normalized.rfind(':');
 		if (colon == std::string::npos) {
 			return std::nullopt;
 		}
 		result.host = normalized.substr(0, colon);
-		result.port = static_cast<std::uint16_t>(std::stoul(normalized.substr(colon + 1)));
+		try {
+			result.port = static_cast<std::uint16_t>(std::stoul(normalized.substr(colon + 1)));
+		} catch (const std::exception&) {
+			return std::nullopt;
+		}
 	}
 
 	result.canonical_text = format_soratrans_url(result.host, result.port);

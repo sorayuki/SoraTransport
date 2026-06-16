@@ -324,8 +324,9 @@ void send_paths_to_socket(
 
 class GuiSendServer::State {
 public:
-	State(std::shared_ptr<TransferProgress> progress, RuntimeOptions options)
-		: progress_(std::move(progress)), options_(std::move(options)) {}
+	State(std::shared_ptr<TransferProgress> progress, RuntimeOptions options, std::function<void()> on_state_changed)
+		: progress_(std::move(progress)), options_(std::move(options)),
+		  on_state_changed_(std::move(on_state_changed)) {}
 
 	~State() {
 		stop();
@@ -393,6 +394,12 @@ public:
 	}
 
 private:
+	void notify_state_changed() {
+		if (on_state_changed_) {
+			on_state_changed_();
+		}
+	}
+
 	void run(std::stop_token stop_token) {
 		try {
 			if (progress_) {
@@ -409,6 +416,7 @@ private:
 				startup_complete_ = true;
 			}
 			startup_cv_.notify_all();
+			notify_state_changed();
 
 			if (progress_) {
 				progress_->set_status("waiting for receiver");
@@ -423,6 +431,7 @@ private:
 					receiver_connected_ = true;
 					transfer_in_progress_ = false;
 				}
+				notify_state_changed();
 				if (progress_) {
 					progress_->set_status("receiver connected, waiting for drop");
 				}
@@ -445,6 +454,7 @@ private:
 							transfer_in_progress_ = true;
 						}
 					}
+					notify_state_changed();
 
 					if (!receiver_connected) {
 						break;
@@ -492,6 +502,7 @@ private:
 						std::lock_guard lock(mutex_);
 						transfer_in_progress_ = false;
 					}
+					notify_state_changed();
 				}
 
 				sink.close_socket();
@@ -501,6 +512,7 @@ private:
 					transfer_in_progress_ = false;
 					pending_paths_.reset();
 				}
+				notify_state_changed();
 
 				if (!stop_token.stop_requested() && !cancel_event_.is_cancelled() && progress_) {
 					progress_->set_status("waiting for receiver");
@@ -533,6 +545,7 @@ private:
 
 	std::shared_ptr<TransferProgress> progress_;
 	RuntimeOptions options_;
+	std::function<void()> on_state_changed_;
 	mutable std::mutex mutex_;
 	std::condition_variable cv_;
 	std::condition_variable startup_cv_;
@@ -547,8 +560,8 @@ private:
 	std::uint16_t bound_port_ = 0;
 };
 
-GuiSendServer::GuiSendServer(const std::shared_ptr<TransferProgress>& progress, RuntimeOptions options)
-	: state_(std::make_unique<State>(progress, std::move(options))) {}
+GuiSendServer::GuiSendServer(const std::shared_ptr<TransferProgress>& progress, RuntimeOptions options, std::function<void()> on_state_changed)
+	: state_(std::make_unique<State>(progress, std::move(options), std::move(on_state_changed))) {}
 
 GuiSendServer::~GuiSendServer() = default;
 

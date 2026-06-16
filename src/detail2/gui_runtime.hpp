@@ -2,6 +2,7 @@
 
 #include "../core.hpp"
 
+#include <functional>
 #include <optional>
 
 namespace soratransport {
@@ -15,7 +16,9 @@ struct GuiSendServerSnapshot {
 
 class GuiSendServer {
 public:
-	explicit GuiSendServer(const std::shared_ptr<TransferProgress>& progress, RuntimeOptions options = {});
+	explicit GuiSendServer(const std::shared_ptr<TransferProgress>& progress,
+		RuntimeOptions options = {},
+		std::function<void()> on_state_changed = {});
 	~GuiSendServer();
 	GuiSendServer(const GuiSendServer&) = delete;
 	GuiSendServer& operator=(const GuiSendServer&) = delete;
