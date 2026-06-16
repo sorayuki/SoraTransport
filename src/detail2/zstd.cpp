@@ -16,7 +16,7 @@ namespace {
 
 constexpr int kMinAdaptiveCompressionLevel = 1;
 constexpr int kMaxAdaptiveCompressionLevel = 12;
-constexpr auto kAdaptiveAdjustmentBaseCooldown = std::chrono::seconds(1);
+constexpr auto kBaseCooldown = std::chrono::seconds(1);
 
 void throw_if_cancelled(const CancelEvent* cancel_event) {
 	if (cancel_event != nullptr && cancel_event->is_cancelled()) {
@@ -24,7 +24,117 @@ void throw_if_cancelled(const CancelEvent* cancel_event) {
 	}
 }
 
+void push_compressed_output(
+	BufferPool& pool,
+	std::shared_ptr<std::uint8_t>& output_buffer,
+	std::size_t output_pos,
+	SemaphoreCor* output_budget,
+	BoundedQueue<DataChunk>& out_zstd) {
+	auto owned = pool.acquire(output_pos);
+	std::memcpy(owned.get(), output_buffer.get(), output_pos);
+	auto budget = output_budget == nullptr
+		? SemaphoreCor::Guard{}
+		: output_budget->acquire_blocking(output_pos);
+	out_zstd.push(make_budgeted_chunk(std::move(owned), output_pos, 0, std::move(budget)));
+}
+
+void log_decision(int level, const char* reason, bool reversed,
+	std::size_t up_size, std::size_t up_cap,
+	std::size_t down_size, std::size_t down_cap,
+	std::chrono::steady_clock::duration cooldown) {
+	std::cerr << "\n[adaptive] lvl=" << level
+		<< " reason=" << reason
+		<< (reversed ? "-reversed" : "")
+		<< " upstream=" << up_size << '/' << up_cap
+		<< " downstream=" << down_size << '/' << down_cap
+		<< " cooldown=" << std::chrono::duration_cast<std::chrono::seconds>(cooldown).count() << 's'
+		<< std::flush;
+}
+
 } // namespace
+
+// ===========================================================================
+// AdaptiveLevelController
+// ===========================================================================
+
+AdaptiveLevelController::AdaptiveLevelController(
+	int initial_level, int min_level, int max_level,
+	std::atomic<int>* active_level, bool log)
+	: min_level_(min_level),
+	  max_level_(max_level),
+	  active_level_(active_level),
+	  log_(log),
+	  last_target_level_(initial_level),
+	  current_cooldown_(kBaseCooldown) {}
+
+AdaptiveLevelController::Decision
+AdaptiveLevelController::on_upstream_full(int current_level,
+	std::size_t up_size, std::size_t up_cap,
+	std::size_t down_size, std::size_t down_cap) {
+	return evaluate(current_level + 1, Direction::Up,
+		"upstream-full-on-pop", up_size, up_cap, down_size, down_cap);
+}
+
+AdaptiveLevelController::Decision
+AdaptiveLevelController::on_downstream_full(int current_level,
+	std::size_t up_size, std::size_t up_cap,
+	std::size_t down_size, std::size_t down_cap) {
+	return evaluate(current_level + 1, Direction::Up,
+		"downstream-full-on-push", up_size, up_cap, down_size, down_cap);
+}
+
+AdaptiveLevelController::Decision
+AdaptiveLevelController::on_downstream_empty_then_upstream_full(int current_level,
+	std::size_t up_size, std::size_t up_cap,
+	std::size_t down_size, std::size_t down_cap) {
+	return evaluate(current_level - 1, Direction::Down,
+		"downstream-empty-then-upstream-full", up_size, up_cap, down_size, down_cap);
+}
+
+AdaptiveLevelController::Decision
+AdaptiveLevelController::evaluate(int requested_level, Direction direction,
+	const char* reason, std::size_t up_size, std::size_t up_cap,
+	std::size_t down_size, std::size_t down_cap) {
+	const auto now = std::chrono::steady_clock::now();
+
+	// cooldown: skip if within the cooldown window
+	if (last_adjustment_ != std::chrono::steady_clock::time_point::min() &&
+		now - last_adjustment_ < current_cooldown_) {
+		return Decision{requested_level, false};
+	}
+
+	int target_level = std::clamp(requested_level, min_level_, max_level_);
+
+	// reversal annealing: if direction flipped, cap the target and double cooldown
+	bool reversed = false;
+	if (last_direction_ != Direction::None && direction != Direction::None &&
+		direction != last_direction_) {
+		reversed = true;
+		target_level = std::min(target_level, last_target_level_);
+		current_cooldown_ *= 2;
+	} else {
+		current_cooldown_ = kBaseCooldown;
+	}
+
+	// update tracking state
+	last_direction_ = direction;
+	last_target_level_ = target_level;
+	last_adjustment_ = now;
+
+	if (log_) {
+		log_decision(target_level, reason, reversed, up_size, up_cap,
+			down_size, down_cap, current_cooldown_);
+	}
+
+	if (active_level_ != nullptr) {
+		active_level_->store(target_level, std::memory_order_relaxed);
+	}
+	return Decision{target_level, true};
+}
+
+// ===========================================================================
+// ZstdCompressor
+// ===========================================================================
 
 ZstdCompressor::ZstdCompressor(
 	BufferPool& pool,
@@ -51,16 +161,18 @@ void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<Data
 	const auto output_capacity = ZSTD_CStreamOutSize();
 	auto output_buffer = pool_.acquire(output_capacity);
 	const bool adaptive_enabled = queue_telemetry_ != nullptr;
-	bool pending_downstream_empty_check = false;
-	enum class AdjustmentDirection {
-		None,
-		Up,
-		Down,
+	bool pending_downstream_empty = false;
+
+	AdaptiveLevelController adaptive(
+		compression_level_,
+		kMinAdaptiveCompressionLevel, kMaxAdaptiveCompressionLevel,
+		nullptr, log_adaptive_decisions_);
+
+	auto apply_decision = [&](const AdaptiveLevelController::Decision& d) {
+		if (!d.changed) return;
+		set_zstd_compression_level(context, d.level);
+		compression_level_ = d.level;
 	};
-	AdjustmentDirection last_adjustment_direction = AdjustmentDirection::None;
-	int last_adjustment_target_level = compression_level_;
-	auto current_adjustment_cooldown = kAdaptiveAdjustmentBaseCooldown;
-	auto last_adjustment_at = std::chrono::steady_clock::time_point::min();
 
 	try {
 		configure_zstd_context(context, compression_level_, worker_count_);
@@ -68,88 +180,24 @@ void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<Data
 			active_level_->store(compression_level_, std::memory_order_relaxed);
 		}
 
-		const auto apply_level = [&](int requested_level, AdjustmentDirection direction, const char* reason, std::size_t upstream_size, std::size_t upstream_capacity, std::size_t downstream_size, std::size_t downstream_capacity) {
-			if (!adaptive_enabled) {
-				return;
-			}
-
-			const auto now = std::chrono::steady_clock::now();
-			if (last_adjustment_at != std::chrono::steady_clock::time_point::min() && now - last_adjustment_at < current_adjustment_cooldown) {
-				return;
-			}
-
-			int target_level = std::clamp(requested_level, kMinAdaptiveCompressionLevel, kMaxAdaptiveCompressionLevel);
-			bool reversed = false;
-			if (last_adjustment_direction != AdjustmentDirection::None && direction != AdjustmentDirection::None && direction != last_adjustment_direction) {
-				reversed = true;
-				target_level = std::min(target_level, last_adjustment_target_level);
-				current_adjustment_cooldown *= 2;
-			} else {
-				current_adjustment_cooldown = kAdaptiveAdjustmentBaseCooldown;
-			}
-
-			if (target_level == compression_level_) {
-				last_adjustment_direction = direction;
-				last_adjustment_target_level = target_level;
-				last_adjustment_at = now;
-				if (log_adaptive_decisions_) {
-					std::cerr << "\n[adaptive] lvl=" << compression_level_
-						<< " reason=" << reason
-						<< (reversed ? "-reversed" : "")
-						<< " upstream=" << upstream_size << '/' << upstream_capacity
-						<< " downstream=" << downstream_size << '/' << downstream_capacity
-						<< " cooldown=" << std::chrono::duration_cast<std::chrono::seconds>(current_adjustment_cooldown).count() << 's'
-						<< std::flush;
-				}
-				return;
-			}
-
-			set_zstd_compression_level(context, target_level);
-			compression_level_ = target_level;
-			if (active_level_ != nullptr) {
-				active_level_->store(compression_level_, std::memory_order_relaxed);
-			}
-			last_adjustment_direction = direction;
-			last_adjustment_target_level = target_level;
-			last_adjustment_at = now;
-			if (log_adaptive_decisions_) {
-				std::cerr << "\n[adaptive] lvl=" << compression_level_
-					<< " reason=" << reason
-					<< (reversed ? "-reversed" : "")
-					<< " upstream=" << upstream_size << '/' << upstream_capacity
-					<< " downstream=" << downstream_size << '/' << downstream_capacity
-					<< " cooldown=" << std::chrono::duration_cast<std::chrono::seconds>(current_adjustment_cooldown).count() << 's'
-					<< std::flush;
-			}
-		};
-
+		// ---- main compression loop ----
 		for (;;) {
 			throw_if_cancelled(cancel_event);
-			const auto upstream_size_before_pop = in_tar.size();
-			const auto upstream_capacity = in_tar.capacity();
-			const bool upstream_is_full = upstream_size_before_pop >= upstream_capacity;
+			const auto up_size = in_tar.size();
+			const auto up_cap = in_tar.capacity();
 
-			if (pending_downstream_empty_check) {
-				if (upstream_is_full) {
-					apply_level(
-						compression_level_ - 1,
-						AdjustmentDirection::Down,
-						"downstream-empty-then-upstream-full",
-						upstream_size_before_pop,
-						upstream_capacity,
-						out_zstd.size(),
-						out_zstd.capacity());
+			// adaptive: detect downstream-empty-then-upstream-full
+			if (pending_downstream_empty) {
+				if (up_size >= up_cap) {
+					apply_decision(adaptive.on_downstream_empty_then_upstream_full(
+						compression_level_, up_size, up_cap,
+						out_zstd.size(), out_zstd.capacity()));
 				}
-				pending_downstream_empty_check = false;
-			} else if (upstream_is_full) {
-				apply_level(
-					compression_level_ + 1,
-					AdjustmentDirection::Up,
-					"upstream-full-on-pop",
-					upstream_size_before_pop,
-					upstream_capacity,
-					out_zstd.size(),
-					out_zstd.capacity());
+				pending_downstream_empty = false;
+			} else if (up_size >= up_cap) {
+				apply_decision(adaptive.on_upstream_full(
+					compression_level_, up_size, up_cap,
+					out_zstd.size(), out_zstd.capacity()));
 			}
 
 			auto chunk = in_tar.pop();
@@ -157,6 +205,7 @@ void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<Data
 				break;
 			}
 
+			// ---- compress one chunk ----
 			ZSTD_inBuffer input{chunk->data.get(), chunk->length, 0};
 			while (input.pos < input.size) {
 				throw_if_cancelled(cancel_event);
@@ -166,31 +215,23 @@ void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<Data
 					throw std::runtime_error(ZSTD_getErrorName(result));
 				}
 				if (output.pos > 0) {
-					const auto downstream_size_before_push = out_zstd.size();
-					const auto downstream_capacity = out_zstd.capacity();
-					if (downstream_size_before_push == 0) {
-						pending_downstream_empty_check = true;
+					const auto down_size = out_zstd.size();
+					const auto down_cap = out_zstd.capacity();
+					if (down_size == 0) {
+						pending_downstream_empty = true;
 					}
-					if (downstream_size_before_push >= downstream_capacity) {
-						apply_level(
-							compression_level_ + 1,
-							AdjustmentDirection::Up,
-							"downstream-full-on-push",
-							in_tar.size(),
-							in_tar.capacity(),
-							downstream_size_before_push,
-							downstream_capacity);
+					if (down_size >= down_cap) {
+						apply_decision(adaptive.on_downstream_full(
+							compression_level_, in_tar.size(), in_tar.capacity(),
+							down_size, down_cap));
 					}
-					auto owned_output = pool_.acquire(output.pos);
-					std::memcpy(owned_output.get(), output_buffer.get(), output.pos);
-					auto budget_guard = output_budget_ == nullptr
-						? SemaphoreCor::Guard{}
-						: output_budget_->acquire_blocking(output.pos);
-					out_zstd.push(make_budgeted_chunk(std::move(owned_output), output.pos, 0, std::move(budget_guard)));
+					push_compressed_output(pool_, output_buffer, output.pos,
+						output_budget_, out_zstd);
 				}
 			}
 		}
 
+		// ---- end-of-stream flush ----
 		for (;;) {
 			throw_if_cancelled(cancel_event);
 			ZSTD_inBuffer input{nullptr, 0, 0};
@@ -200,27 +241,8 @@ void ZstdCompressor::compress(BoundedQueue<DataChunk>& in_tar, BoundedQueue<Data
 				throw std::runtime_error(ZSTD_getErrorName(remaining));
 			}
 			if (output.pos > 0) {
-				const auto downstream_size_before_push = out_zstd.size();
-				const auto downstream_capacity = out_zstd.capacity();
-				if (downstream_size_before_push == 0) {
-					pending_downstream_empty_check = true;
-				}
-				if (downstream_size_before_push >= downstream_capacity) {
-					apply_level(
-						compression_level_ + 1,
-						AdjustmentDirection::Up,
-						"downstream-full-on-flush",
-						in_tar.size(),
-						in_tar.capacity(),
-						downstream_size_before_push,
-						downstream_capacity);
-				}
-				auto owned_output = pool_.acquire(output.pos);
-				std::memcpy(owned_output.get(), output_buffer.get(), output.pos);
-				auto budget_guard = output_budget_ == nullptr
-					? SemaphoreCor::Guard{}
-					: output_budget_->acquire_blocking(output.pos);
-				out_zstd.push(make_budgeted_chunk(std::move(owned_output), output.pos, 0, std::move(budget_guard)));
+				push_compressed_output(pool_, output_buffer, output.pos,
+					output_budget_, out_zstd);
 			}
 			if (remaining == 0) {
 				break;

@@ -7,6 +7,7 @@
 #include "zstd.hpp"
 
 #include "../detail/internal.hpp"
+#include "../detail/network_util.hpp"
 #include "../detail/win32_util.hpp"
 
 #include <boost/asio/awaitable.hpp>
@@ -35,63 +36,6 @@ namespace asio = boost::asio;
 namespace soratransport {
 
 namespace {
-
-std::runtime_error make_boost_error(const std::string& message, const boost::system::error_code& error) {
-	if (error.category() == boost::system::system_category()) {
-		return std::runtime_error(message + ": " + win32_error_message_utf8(static_cast<DWORD>(error.value())));
-	}
-	return std::runtime_error(message + ": " + error.message());
-}
-
-void close_transport_socket(asio::ip::tcp::socket& socket) {
-	boost::system::error_code ignored;
-	socket.cancel(ignored);
-	socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
-	socket.close(ignored);
-}
-
-void close_transport_socket(TransportWebSocket& websocket) {
-	close_transport_socket(websocket.next_layer());
-}
-
-template <typename Rep, typename Period>
-bool wait_for_stop_or_timeout(
-	std::stop_token stop_token,
-	const CancelEvent* cancel_event,
-	std::chrono::duration<Rep, Period> timeout) {
-	if (stop_token.stop_requested() || (cancel_event != nullptr && cancel_event->is_cancelled())) {
-		return true;
-	}
-
-	constexpr auto kStopWaitPollInterval = std::chrono::milliseconds(50);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
-	const auto poll_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(kStopWaitPollInterval);
-
-	std::mutex mutex;
-	std::condition_variable cv;
-	std::atomic<bool> stop_requested{false};
-	std::stop_callback on_stop(stop_token, [&] {
-		stop_requested.store(true, std::memory_order_release);
-		cv.notify_all();
-	});
-	std::unique_lock lock(mutex);
-	for (;;) {
-		if (stop_requested.load(std::memory_order_acquire) || (cancel_event != nullptr && cancel_event->is_cancelled())) {
-			return true;
-		}
-
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			return false;
-		}
-
-		const auto remaining = deadline - now;
-		const auto wait_slice = remaining < poll_interval ? remaining : poll_interval;
-		cv.wait_for(lock, wait_slice, [&] {
-			return stop_requested.load(std::memory_order_acquire);
-		});
-	}
-}
 
 std::string format_scaled_bytes(std::uint64_t bytes, std::string_view suffix) {
 	static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -203,16 +147,6 @@ std::jthread start_progress_thread(
 	});
 }
 
-void join_and_capture(std::jthread& thread, PipelineState& state) {
-	try {
-		if (thread.joinable()) {
-			thread.join();
-		}
-	} catch (...) {
-		state.fail(std::current_exception());
-	}
-}
-
 void set_progress_status(const std::shared_ptr<TransferProgress>& progress, std::string status) {
 	if (progress) {
 		progress->set_status(std::move(status));
@@ -262,32 +196,6 @@ std::jthread start_progress_sync_thread(
 			progress->add_processed_files(current_files - previous_files);
 		}
 	});
-}
-
-bool is_transfer_cancelled(const std::exception_ptr& error) {
-	if (!error) {
-		return false;
-	}
-	try {
-		std::rethrow_exception(error);
-	} catch (const CancelledError&) {
-		return true;
-	} catch (...) {
-		return false;
-	}
-}
-
-bool should_throw_cancelled_error(const CancelEvent& cancel_event, const boost::system::error_code& error) {
-	return cancel_event.is_cancelled()
-		&& (error == asio::error::operation_aborted
-			|| error == asio::error::bad_descriptor
-			|| error == asio::error::connection_reset
-			|| error == asio::error::eof
-			|| error == boost::beast::websocket::error::closed);
-}
-
-bool should_report_transfer_error(const CancelEvent& cancel_event, const std::exception_ptr& error) {
-	return !cancel_event.is_cancelled() && !is_transfer_cancelled(error);
 }
 
 asio::awaitable<asio::ip::tcp::socket> connect_socket_async(std::string host, std::uint16_t port, CancelEvent& cancel_event) {
@@ -475,18 +383,7 @@ void receive_transport_from_source(
 	state.rethrow_if_failed();
 }
 
-void close_pack_queues(
-	BoundedQueue<detail2::TraversalEntry>& traversal_queue,
-	BoundedQueue<detail2::OpenedFile>& opened_queue,
-	BoundedQueue<detail2::OpenedFile>& prefetched_queue,
-	BoundedQueue<DataChunk>& tar_queue,
-	BoundedQueue<DataChunk>& zstd_queue) {
-	traversal_queue.close();
-	opened_queue.close();
-	prefetched_queue.close();
-	tar_queue.close();
-	zstd_queue.close();
-}
+
 
 asio::awaitable<void> listen_directory_task(
 	const std::filesystem::path source_dir,
@@ -559,17 +456,23 @@ asio::awaitable<void> listen_directory_task(
 		auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
 
 		std::jthread sender_thread([&] {
+			PipelineGuard guard;
+			guard.watch(traversal_queue);
+			guard.watch(opened_queue);
+			guard.watch(prefetched_queue);
+			guard.watch(tar_queue);
+			guard.watch(zstd_queue);
 			try {
 				packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, &files_processed, &cancel_event);
+				guard.dismiss();
 			} catch (...) {
 				state.fail(std::current_exception());
-				close_pack_queues(traversal_queue, opened_queue, prefetched_queue, tar_queue, zstd_queue);
 			}
 		});
 
 		std::jthread compressor_thread([&] {
 			try {
-				if (CompressionMode::Zstd == CompressionMode::Zstd) {
+				{
 					detail2::ZstdCompressor compressor(
 						pool,
 						tuning.worker_threads,
@@ -604,7 +507,12 @@ asio::awaitable<void> listen_directory_task(
 			prefetch_future.get();
 		} catch (...) {
 			state.fail(std::current_exception());
-			close_pack_queues(traversal_queue, opened_queue, prefetched_queue, tar_queue, zstd_queue);
+			PipelineGuard guard;
+			guard.watch(traversal_queue);
+			guard.watch(opened_queue);
+			guard.watch(prefetched_queue);
+			guard.watch(tar_queue);
+			guard.watch(zstd_queue);
 		}
 
 		join_and_capture(sender_thread, state);
@@ -756,13 +664,19 @@ void pack_directory_to_file(
 	auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
 
 	std::jthread writer_thread([&] {
+		PipelineGuard guard;
+		guard.watch(traversal_queue);
+		guard.watch(opened_queue);
+		guard.watch(prefetched_queue);
+		guard.watch(tar_queue);
+		guard.watch(zstd_queue);
 		try {
 			packer.pack(prefetched_queue, tar_queue, &uncompressed_bytes_processed, nullptr, &effective_cancel_event);
+			guard.dismiss();
 		} catch (...) {
 			if (!is_transfer_cancelled(std::current_exception())) {
 				state.fail(std::current_exception());
 			}
-			close_pack_queues(traversal_queue, opened_queue, prefetched_queue, tar_queue, zstd_queue);
 		}
 	});
 
@@ -815,7 +729,12 @@ void pack_directory_to_file(
 		if (!is_transfer_cancelled(std::current_exception())) {
 			state.fail(std::current_exception());
 		}
-		close_pack_queues(traversal_queue, opened_queue, prefetched_queue, tar_queue, zstd_queue);
+		PipelineGuard guard;
+		guard.watch(traversal_queue);
+		guard.watch(opened_queue);
+		guard.watch(prefetched_queue);
+		guard.watch(tar_queue);
+		guard.watch(zstd_queue);
 	}
 	join_and_capture(writer_thread, state);
 	join_and_capture(compression_thread, state);

@@ -4,6 +4,10 @@
 
 #include <zstd.h>
 
+#include <functional>
+#include <thread>
+#include <vector>
+
 namespace soratransport {
 
 struct RuntimeConfig {
@@ -28,6 +32,54 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::exception_ptr error_;
+};
+
+// ---------------------------------------------------------------------------
+// join_and_capture  — join jthread and capture exceptions to PipelineState
+// ---------------------------------------------------------------------------
+inline void join_and_capture(std::jthread& thread, PipelineState& state) {
+	try {
+		if (thread.joinable()) {
+			thread.join();
+		}
+	} catch (...) {
+		state.fail(std::current_exception());
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PipelineGuard  — RAII wrapper that auto-closes registered BoundedQueues
+// ---------------------------------------------------------------------------
+class PipelineGuard {
+public:
+	PipelineGuard() = default;
+	PipelineGuard(const PipelineGuard&) = delete;
+	PipelineGuard& operator=(const PipelineGuard&) = delete;
+	PipelineGuard(PipelineGuard&&) = default;
+	PipelineGuard& operator=(PipelineGuard&&) = default;
+
+	~PipelineGuard() {
+		close_all();
+	}
+
+	template <typename T>
+	void watch(BoundedQueue<T>& queue) {
+		closers_.push_back([&queue] { queue.close(); });
+	}
+
+	void close_all() {
+		for (auto& closer : closers_) {
+			closer();
+		}
+		closers_.clear();
+	}
+
+	void dismiss() {
+		closers_.clear();
+	}
+
+private:
+	std::vector<std::function<void()>> closers_;
 };
 
 } // namespace soratransport
