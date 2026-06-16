@@ -627,6 +627,8 @@ private:
 
 	void handle_close_request() {
 		if (close_requested_) {
+			// 已经发出过关闭请求，检查后台线程是否已经结束，如果可以就完成关闭
+			maybe_finish_close_request();
 			return;
 		}
 
