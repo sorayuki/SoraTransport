@@ -140,10 +140,11 @@
 
 ## 下一步
 
-1. ~~把 `BufferedFileWriter` 接进 `unpack` / `receive` 的落盘链路~~ ✅ 已完成
-2. ~~把接收侧包装节点逐步替换为真正的 detail2 内部实现~~ ✅ 已完成
-3. `fs_benchmark` 迁移到 detail2 类型
-4. 继续补强符号链接、取消与大文件场景的专项验证
+所有计划的重构项已完成。后续可考虑：
+
+1. 将 `detail/runtime.cpp` / `detail/io.cpp` 中的底层实现迁移到 detail2（`BufferPool`、`OverlappedFileReader`、`FileByteSink` 等）
+2. 移除 `detail/` 目录，将剩余类型定义移入 detail2
+3. 符号链接、大文件、取消场景的专项压力测试
 
 ---
 
@@ -164,8 +165,20 @@
 - 修复 `GuiSendServer` 状态变更通知 (`send_state_dirty_` 脏标记 + `Fl::awake()` 双重保障)
 - 修复 `handle_close_request()` 移除阻塞的 `send_server_.stop()`
 
-### 11. 当前接线状态
+### 12. fs_benchmark 迁移到 detail2
 
-- `pack`、`listen`、`unpack`、`receive`、GUI 发送/接收页全部走 `detail2` 原生节点
-- `detail/` 中保留：`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`win32_util.hpp`、`windows_helpers.hpp`（类型定义和底层工具）
-- `detail/` 中保留的 .cpp：`runtime.cpp`、`io.cpp`、`filesystem.cpp`（供 `fs_benchmark` 使用）、`cli.cpp`、`windows_helpers.cpp`
+- `fs_benchmark.cpp` 改用 detail2 原生类：
+  - `detail2::FileTraverser` 替代旧 `DirScanner`
+  - `detail2::FileOpener` 替代旧隐式打开逻辑
+  - `detail2::FilePrefetcher` 替代旧 `FileReaderPrefetcher`
+  - `detail2::SequentialFileReader` 替代旧 `FileReader`
+  - `detail2::TaskExecutor` 替代旧 `RuntimeExecutors`
+- 清理 `detail/filesystem.cpp`（零引用死代码）
+
+### 13. 当前最终接线状态
+
+- `pack`、`listen`、`unpack`、`receive`、GUI 发送/接收页、`fs_benchmark` 全部走 detail2 原生节点
+- `detail/` 保留的最小集合：
+  - 头文件：`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`win32_util.hpp`、`windows_helpers.hpp`
+  - 源文件：`runtime.cpp`、`io.cpp`、`cli.cpp`、`windows_helpers.cpp`
+- 已删除的死代码：`detail/tar.cpp`、`detail/zstd.cpp`、`detail/filesystem.cpp`、`detail/orchestration.cpp`、`detail/gui_runtime.cpp`
