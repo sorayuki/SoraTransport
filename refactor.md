@@ -140,6 +140,32 @@
 
 ## 下一步
 
-1. 把 `BufferedFileWriter` 接进 `unpack` / `receive` 的落盘链路
-2. 把接收侧包装节点逐步替换为真正的 detail2 内部实现
-3. 继续补强符号链接、取消与大文件场景的专项验证
+1. ~~把 `BufferedFileWriter` 接进 `unpack` / `receive` 的落盘链路~~ ✅ 已完成
+2. ~~把接收侧包装节点逐步替换为真正的 detail2 内部实现~~ ✅ 已完成
+3. `fs_benchmark` 迁移到 detail2 类型
+4. 继续补强符号链接、取消与大文件场景的专项验证
+
+---
+
+### 9. TarUnpacker 原生实现 + BufferedFileWriter 接入落盘
+
+- 在 `detail2/tar.hpp` / `detail2/tar.cpp` 中实现原生 `TarUnpacker`
+  - 使用 libarchive 读取 tar → 按文件聚块 → `BufferedFileWriter` 写盘 → 还原时间戳/权限
+  - 接口改用 detail2 原生类型 (`TaskExecutor&`、`PipelineTuning`、`const CancelEvent*`)
+- `detail2/writer.hpp` / `writer.cpp` 的 `create()` 参数改为 `const CancelEvent*`
+- `detail2/orchestration.cpp` 中 `unpack_file_to_directory()` 和 `receive_transport_from_source()` 改用 detail2 类型
+- `detail2/stream.hpp` / `stream.cpp` 移除旧的 TarUnpacker 包装类
+- 清理 `detail/tar.cpp`（零引用死代码）
+
+### 10. 接收侧节点原生实现 + 死代码清理
+
+- `detail2/stream.cpp` 中 `QueueWriter`、`RawTarReader`、`ZstdDecompressor` 改为原生实现，不再委托旧 `detail/zstd.cpp`
+- 清理 `detail/zstd.cpp`（零引用死代码）
+- 修复 `GuiSendServer` 状态变更通知 (`send_state_dirty_` 脏标记 + `Fl::awake()` 双重保障)
+- 修复 `handle_close_request()` 移除阻塞的 `send_server_.stop()`
+
+### 11. 当前接线状态
+
+- `pack`、`listen`、`unpack`、`receive`、GUI 发送/接收页全部走 `detail2` 原生节点
+- `detail/` 中保留：`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`win32_util.hpp`、`windows_helpers.hpp`（类型定义和底层工具）
+- `detail/` 中保留的 .cpp：`runtime.cpp`、`io.cpp`、`filesystem.cpp`（供 `fs_benchmark` 使用）、`cli.cpp`、`windows_helpers.cpp`
