@@ -127,25 +127,6 @@
 
 当前这组接收侧节点先用包装方式委托旧实现，目标是先统一 detail2 的对外节点边界，再继续替换内部落盘和解包细节。
 
-## 验证
-
-- 已构建通过：`soratransport_core`
-- 已构建通过：`soratransport`
-- 已构建通过：`fasttar`
-- 已构建通过：`soratransport_app`
-- 已验证：`fasttar pack -z` / `unpack -z` roundtrip smoke test
-- 已验证：`fasttar pack -n` / `unpack -n` roundtrip smoke test
-- 已验证：接收侧包装切换后的 `fasttar pack -z` / `unpack -z` focused smoke test
-- 已验证：本机 `soratransport listen` / `receive` 回环 smoke test
-
-## 下一步
-
-所有计划的重构项已完成。后续可考虑：
-
-1. 将 `detail/runtime.cpp` / `detail/io.cpp` 中的底层实现迁移到 detail2（`BufferPool`、`OverlappedFileReader`、`FileByteSink` 等）
-2. 移除 `detail/` 目录，将剩余类型定义移入 detail2
-3. 符号链接、大文件、取消场景的专项压力测试
-
 ---
 
 ### 9. TarUnpacker 原生实现 + BufferedFileWriter 接入落盘
@@ -175,10 +156,57 @@
   - `detail2::TaskExecutor` 替代旧 `RuntimeExecutors`
 - 清理 `detail/filesystem.cpp`（零引用死代码）
 
-### 13. 当前最终接线状态
+### 13. 当前最终接线状态（重构阶段终态）
 
 - `pack`、`listen`、`unpack`、`receive`、GUI 发送/接收页、`fs_benchmark` 全部走 detail2 原生节点
 - `detail/` 保留的最小集合：
-  - 头文件：`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`win32_util.hpp`、`windows_helpers.hpp`
+  - 头文件：`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`network_util.hpp`、`win32_util.hpp`、`windows_helpers.hpp`
   - 源文件：`runtime.cpp`、`io.cpp`、`cli.cpp`、`windows_helpers.cpp`
-- 已删除的死代码：`detail/tar.cpp`、`detail/zstd.cpp`、`detail/filesystem.cpp`、`detail/orchestration.cpp`、`detail/gui_runtime.cpp`
+- 已删除的死代码：`detail/tar.cpp`、`detail/zstd.cpp`、`detail/filesystem.cpp`、`detail/orchestration.cpp`、`detail/gui_runtime.cpp`、`detail/gui_runtime.hpp`
+
+---
+
+### 14. 代码清洁优化：公共工具提取、PipelineGuard RAII、AdaptiveLevelController
+
+- 新建 `src/detail/network_util.hpp`，集中存放原先散布在 `detail2/orchestration.cpp` 与 `detail2/gui_runtime.cpp` 中的公共网络辅助函数：
+  - `make_boost_error`
+  - `close_transport_socket`（TCP socket / WebSocket 两个重载）
+  - `wait_for_stop_or_timeout`（同时支持 `stop_token` 与 `CancelEvent*` 双路中断）
+  - `is_transfer_cancelled`
+  - `should_throw_cancelled_error`
+  - `should_report_transfer_error`
+  - 消除约 200 行重复代码
+- 在 `detail/internal.hpp` 中添加 `PipelineGuard` RAII 类：
+  - 析构时自动 `close()` 所有已注册的 `BoundedQueue`
+  - 替换原先手动调用 `close_pack_queues` / `close_send_queues` 的模式
+  - 支持 `dismiss()` 放弃自动关闭（用于正常完成路径）
+- 将 `ZstdCompressor::compress()` 中约 100+ 行的内联自适应调节 lambda 提取为独立的 `detail2::AdaptiveLevelController` 类（位于 `detail2/zstd.hpp`）：
+  - 职责单一：仅根据上/下游队列压力决策压缩级别升降档
+  - 通过三个方法驱动：`on_upstream_full()`、`on_downstream_full()`、`on_downstream_empty_then_upstream_full()`
+  - 内部封装冷却窗口与反向退火逻辑
+- 移除 `CompressionMode::Zstd == CompressionMode::Zstd` 恒真条件判断
+
+### 15. 修复 LibArchive CMake debug 库误链问题
+
+- `FindLibArchive.cmake` 只为 `LibArchive::LibArchive` 目标设置单一 `IMPORTED_LOCATION`
+- vcpkg 下 `debug/lib/archive.lib` 与 `lib/archive.lib` 同名，FindLibArchive 可能把 debug 版本用于所有配置，导致非 Debug 构建引入 `LIBCMTD` 并触发 LNK4098 警告
+- 修复方式：在 `CMakeLists.txt` 中通过字符串推导出 per-config 路径，为 `IMPORTED_LOCATION_RELEASE`、`IMPORTED_LOCATION_RELWITHDEBINFO`、`IMPORTED_LOCATION_MINSIZEREL`、`IMPORTED_LOCATION_DEBUG` 分别设置正确路径
+
+## 验证
+
+- 已构建通过：`soratransport_core`
+- 已构建通过：`soratransport`
+- 已构建通过：`fasttar`
+- 已构建通过：`soratransport_app`
+- 已验证：`fasttar pack -z` / `unpack -z` roundtrip smoke test
+- 已验证：`fasttar pack -n` / `unpack -n` roundtrip smoke test
+- 已验证：接收侧包装切换后的 `fasttar pack -z` / `unpack -z` focused smoke test
+- 已验证：本机 `soratransport listen` / `receive` 回环 smoke test
+
+## 下一步
+
+所有计划的重构项已完成。后续可考虑：
+
+1. 将 `detail/runtime.cpp` / `detail/io.cpp` 中的底层实现迁移到 detail2（`BufferPool`、`OverlappedFileReader`、`FileByteSink` 等）
+2. 移除 `detail/` 目录，将剩余类型定义移入 detail2
+3. 符号链接、大文件、取消场景的专项压力测试

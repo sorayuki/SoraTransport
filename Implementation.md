@@ -57,28 +57,18 @@
   - `FileByteSink`
   - `SocketByteSource`
   - `SocketByteSink`
-- [src/detail/filesystem.cpp](src/detail/filesystem.cpp)
-  - `DirScanner`
-  - `InFlightReadBudget`
-  - `FileReader`
-  - `FileReaderPrefetcher`
-- [src/detail/tar.cpp](src/detail/tar.cpp)
-  - `TarPacker`
-  - `TarUnpacker`
-- [src/detail/zstd.cpp](src/detail/zstd.cpp)
-  - `ZstdCompressor`
-  - `ZstdDecompressor`
-  - `RawTarReader`
-- [src/detail/orchestration.cpp](src/detail/orchestration.cpp)
-  - 顶层本地/网络编排
+  - `PipelineGuard`（RAII 自动关闭已注册的 `BoundedQueue`）
+- [src/detail/network_util.hpp](src/detail/network_util.hpp)
+  - `make_boost_error`
+  - `close_transport_socket`
+  - `wait_for_stop_or_timeout`
+  - `is_transfer_cancelled`
+  - `should_throw_cancelled_error`
+  - `should_report_transfer_error`
 - [src/detail/cli.cpp](src/detail/cli.cpp)
   - CLI 解析与 usage
-- [src/detail/gui_runtime.hpp](src/detail/gui_runtime.hpp)
-  - GUI 发送页的监听、接收端接入、拖放发送状态机
-- [src/detail/gui_runtime.cpp](src/detail/gui_runtime.cpp)
-  - GUI 发送页复用现有流水线，将多根路径打包并推送到网络套接字
 - [src/detail/windows_helpers.hpp](src/detail/windows_helpers.hpp)
-  - Windows 错误文本和 GUI 辅助函数
+  - Windows 错误文本和 GUI 辅助函数（包含 `UniqueWin32Handle`）
 - [src/detail2/config.hpp](src/detail2/config.hpp)
   - `PipelineTuning`
   - `make_pipeline_tuning()`
@@ -94,6 +84,7 @@
   - `detail2::TarPacker`
 - [src/detail2/zstd.hpp](src/detail2/zstd.hpp)
   - `detail2::ZstdCompressor`
+  - `detail2::AdaptiveLevelController`（自适应压缩级别调节器，从 `ZstdCompressor` 提取为独立类）
 - [src/detail2/orchestration.cpp](src/detail2/orchestration.cpp)
   - 顶层 `pack` / `listen` 编排
   - 保留旧 `unpack` / `receive` 路径的搬运实现
@@ -157,8 +148,7 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 2. 接收端先连入该端口并完成 WebSocket handshake，发送页界面切换为拖放框
 3. 用户一次拖放可提交多个文件或目录
 4. 每次 drop 都会发送一组 `transport_begin -> 二进制数据 -> transport_end`
-5. `GuiSendServer` 复用现有 `DirScanner -> FileReaderPrefetcher -> TarPacker -> ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
-5. `GuiSendServer` 当前已经改为复用 `detail2::FileTraverser -> detail2::FileOpener -> detail2::FilePrefetcher -> detail2::TarPacker -> detail2::ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
+5. `GuiSendServer` 使用 `detail2::FileTraverser -> detail2::FileOpener -> detail2::FilePrefetcher -> detail2::TarPacker -> detail2::ZstdCompressor -> SocketByteSink` 流水线，把这些根路径按给定顺序发送出去
 6. 单次拖放完成后连接保持不变，继续等待下一次拖放；空闲期间由服务端定时发出 WebSocket ping 保活
 
 ### 3.4 网络接收
@@ -176,46 +166,24 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 ## 4. 文件读取实现现状
 
-### 4.1 DirScanner
+### 4.1 FileTraverser / FileOpener / FilePrefetcher
 
-当前 `DirScanner` 已经承担“扫描 + 填充元数据 + 并发打开普通文件”的职责：
+当前文件读取链由 `detail2` 中的三个节点顺序组成：
 
-- 递归遍历目录，并保留根目录条目
-- 也支持一次接收多个根路径，供 GUI 发送页直接打包多个文件或目录
-- 生成 `FileMeta`，其中包含 UTF-8 tar 相对路径
-- 通过 `std::filesystem` 和 `GetFileInformationByHandleEx()` 填充大小、时间戳、Windows 文件属性
-- 普通文件会在线程池中并发打开，再按扫描顺序输出 `OpenedFileReader`
-- symlink 当前直接跳过，不进入 tar 流
+- `detail2::FileTraverser`：
+  - 支持单根和多根输入（供 GUI 发送页打包多个文件或目录）
+  - BFS 遍历，保留根目录条目，跳过 symlink
+  - 生成 `TraversalEntry`，包含 UTF-8 tar 相对路径及元数据
+- `detail2::FileOpener`：
+  - 按遍历顺序并发打开普通文件，并发度由 `SemaphoreCor` 控制
+  - open guard 绑定到 `OpenedFile` 生命周期，自动释放
+- `detail2::FilePrefetcher`：
+  - 在字节预算信号量允许范围内触发初始预读
+  - 预读 guard 绑定到 `OpenedFile`，由 `TarPacker` 消费前释放
 
-### 4.2 FileReader / OverlappedFileReader
+底层文件读取仍使用 `OverlappedFileReader`（位于 `detail/io.cpp`），提供 Windows overlapped 顺序读取和取消支持。
 
-当前 `FileReader` 是单文件、顺序消费语义的读取器外观，底层实际由 `OverlappedFileReader` 执行 Windows overlapped 读取：
-
-- 一个 `FileReader` 只绑定一个文件
-- 构造时直接接收已打开的文件句柄
-- `read_next_chunk()` 始终按 offset 顺序消费
-- 内部维护最多 8 个 overlapped read slot
-- `start_prefetch()` 用于预热初始读取窗口
-- 支持取消信号并在需要时调用 `CancelIoEx()`
-
-### 4.3 FileReaderPrefetcher
-
-这是当前文件读取链上的第二阶段：
-
-- 输入是已经 open 的 `OpenedFileReader`
-- 根据 `InFlightReadBudget` 申请预算
-- 调用 `reader.start_prefetch(max_bytes)`
-- 将完成初始预读的 reader 推给 `TarPacker`
-- 预算租约会随 `OpenedFileReader` 一起进入 `p/t` 队列
-- 对象一旦被 `TarPacker` 从 `p/t` 取出，就立刻释放预算
-
-这里需要特别注意：
-
-- 当前预算直接约束 `p/t` 队列中的预读常驻内存
-- `TarPacker` 消费速度变慢时，背压会通过预算和队列容量共同限制新的预读对象进入 `p/t`
-- `TarPacker` 拿到对象后的文件读取与打包过程不再继续占用这部分预算
-
-### 4.4 缓冲区策略
+### 4.2 缓冲区策略
 
 当前约定：
 
@@ -241,72 +209,56 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 目录扫描、文件 open 和 zstd 压缩共享这一执行器；默认文件打开并发度是 `worker_threads * 4`，上限 48。
 
-### 5.2.1 detail2 基础设施状态
+### 5.2.1 detail2 并发基础设施
 
-为了把新的节点逻辑从旧实现中拆开，当前已经新增一组尚未切主路径的基础设施：
+`detail2` 提供了两个核心并发原语，供各节点统一使用：
 
-- `detail2::TaskExecutor`：继续基于 Boost.Asio `post()`，但对外暴露可 `co_await` 的等待接口
-- `detail2::SemaphoreCor`：提供支持 move-only guard 的协程信号量，并带有批量取消等待者的语义
+- `detail2::TaskExecutor`：基于 Boost.Asio `post()`，对外暴露可 `co_await` 的任务提交接口
+- `detail2::SemaphoreCor`：支持 move-only guard 的协程信号量，带批量取消等待者语义
 
-这两个类当前主要用于后续重写节点时降低控制流复杂度；由于主路径尚未切换，所以运行结果仍然由旧实现决定。
+### 5.2.2 detail2 文件链路
 
-### 5.2.2 detail2 文件链路状态
-
-当前已经新增但尚未切主路径的文件链路节点包括：
+`detail2` 文件读取链节点已全部接入主路径：
 
 - `detail2::FileTraverser`：负责多根输入、BFS 遍历、目录元数据输出以及 symlink 跳过
-- `detail2::FileOpener`：负责按遍历顺序重排输出，同时把打开并发度限制交给 `SemaphoreCor`
-- `detail2::FilePrefetcher`：负责在字节预算信号量控制下触发初始预读，并把预算 guard 绑定到 `OpenedFile`
+- `detail2::FileOpener`：负责按遍历顺序重排输出，并发度由 `SemaphoreCor` 控制
+- `detail2::FilePrefetcher`：在字节预算信号量控制下触发初始预读，并把预算 guard 绑定到 `OpenedFile`
 
-这些节点当前已经进入 `soratransport_core` 构建并通过编译，但还没有接入 pack/listen 的实际执行路径。
+### 5.2.3 detail2 打包侧
 
-### 5.2.3 detail2 打包侧状态
-
-当前已经新增但尚未切主路径的打包侧节点包括：
+`detail2` 打包侧节点已全部接入主路径：
 
 - `detail2::TarPacker`：消费 `OpenedFile`，在真正读文件前释放预读预算 guard，并生成 tar 数据块
-- `detail2::ZstdCompressor`：延续原有自适应压缩判定，同时把输出字节预算绑定到数据块生命周期
-- `detail2::chunk.hpp`：用 aliasing `shared_ptr` 把预算 guard 与 `DataChunk` 生命周期绑定，供 tar/zstd 输出队列复用
-
-这些模块的目标是为接下来的 pack/listen 切流准备一个完整但仍可逐步接线的 pack 侧实现。
+- `detail2::ZstdCompressor`：内置自适应压缩调节（通过 `AdaptiveLevelController`），把输出字节预算绑定到数据块生命周期
+- `detail2::chunk.hpp`：用 aliasing `shared_ptr` 把预算 guard 与 `DataChunk` 生命周期绑定
 
 ### 5.2.4 detail2 顶层接线状态
 
-当前已经完成的主路径替换包括：
+所有主路径已完成切换：
 
-- `pack_directory_to_file()` 改为调用 `detail2` 的发送侧节点
-- `listen_directory()` 改为调用 `detail2` 的发送侧节点
-- GUI 发送页内部的 `send_paths_to_socket()` 改为调用 `detail2` 的发送侧节点
+- `pack_directory_to_file()`：`detail2` 发送侧节点
+- `listen_directory()`：`detail2` 发送侧节点
+- `unpack_file_to_directory()`：`detail2` 接收侧节点
+- `receive_directory()`：`detail2` 接收侧节点
+- GUI 发送/接收页：`detail2` 节点
 
-当前仍保留旧实现的主路径包括：
-
-- 解包阶段内部的落盘写入实现
-
-### 5.2.5 detail2 文件写入对象状态
-
-当前已经新增一个尚未接入解包主路径的新写入对象：
+### 5.2.5 detail2 文件写入对象
 
 - `detail2::BufferedFileWriter`
   - 对外暴露 `write()` / `close()`
   - 使用槽位缓冲聚合写入请求
   - 通过 `TaskExecutor` 后台排空待写槽位
   - 关闭时等待后台排空完成并保持取消语义
+  - 当前用于 `TarUnpacker` 落盘路径
 
-这个对象用于承接后续 `unpack` / `receive` 的落盘重构，目前已经进入构建但尚未替换旧的解包写入实现。
+### 5.2.6 detail2 接收侧节点
 
-### 5.2.6 detail2 接收侧包装状态
+接收侧节点全部为原生实现：
 
-为了让顶层编排统一指向 `detail2`，当前已经新增：
-
-- `detail2::QueueWriter`
-- `detail2::RawTarReader`
-- `detail2::ZstdDecompressor`
-- `detail2::TarUnpacker`
-
-这组类当前通过包装方式委托现有稳定实现，因此：
-
-- `unpack_file_to_directory()` 与 `receive_directory()` 的顶层编排已经只引用 `detail2` 节点
-- 复杂的解包与落盘内部细节暂时仍委托给旧实现，以保持结果一致
+- `detail2::QueueWriter`：将队列数据写入字节汇
+- `detail2::RawTarReader`：从字节源读取 raw tar 流
+- `detail2::ZstdDecompressor`：从字节源读取 zstd 流并解压
+- `detail2::TarUnpacker`：解析 tar 条目并通过 `BufferedFileWriter` 落盘
 
 ### 5.3 队列
 
@@ -322,7 +274,7 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 ### 5.4 取消机制
 
 - `CancelEvent` 是当前统一的取消信号源
-- `BoundedQueue`、`InFlightReadBudget`、`FileReader`、`FileByteSink`、`SocketByteSink`、`SocketByteSource` 都可监听取消
+- `BoundedQueue`、`SemaphoreCor`（`InFlightReadBudget`）、`FileByteSink`、`SocketByteSink`、`SocketByteSource` 都可监听取消
 - `listen_directory()` / `receive_directory()` 会把 `std::stop_token` 转换为 `CancelEvent`
 - 取消后会抛出 `CancelledError`，并主动关闭队列或取消挂起 I/O
 
@@ -336,23 +288,22 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 
 ### 6.1 TarPacker
 
-当前 `TarPacker`：
+当前 `detail2::TarPacker`：
 
-- 顺序消费 `OpenedFileReader`
+- 顺序消费 `OpenedFile`（来自 `FilePrefetcher`）
+- 在真正读取文件前释放 `OpenedFile` 携带的预读预算 guard
 - 通过 libarchive 写 tar header 和 payload
-- 在写入 tar 前释放 `OpenedFileReader` 携带的预读预算租约
 - 不承担额外并发调度职责
 
 ### 6.2 TarUnpacker
 
-当前 `TarUnpacker` 会把目录、权限和时间戳恢复与普通文件内容写入拆开处理：
+当前 `detail2::TarUnpacker` 使用 libarchive 解析 tar 并通过 `BufferedFileWriter` 落盘：
 
 - 只接受相对路径条目
 - 拒绝 `..` 越界路径
 - 当前跳过 symlink 条目
-- 目录创建和目录元数据恢复由 `CreatedDirectoryIndex` / `DirectoryMetadataFinalizer` 协调
-- 普通文件内容通过 `ExtractWriteScheduler` 分发到后台任务；每个文件内部由 `ExtractFileWriter` 执行 buffered + overlapped 写出
-- 小文件同步写路径 `write_small_extracted_file()` 也不再按 chunk 直写，而是先聚合到缓冲区后再落盘
+- 目录创建和元数据恢复由 `CreatedDirectoryIndex` / `DirectoryMetadataFinalizer` 协调
+- 普通文件内容通过 `BufferedFileWriter` 批量异步写回磁盘
 
 ### 6.3 Zstd
 
@@ -362,11 +313,10 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - 自适应压缩级别只在未指定 `-l <level>` 时启用
 - 一旦 CLI 解析到 `-l <level>`，运行时就把该值视为用户锁定值，压缩线程不得再自动升降档
 - `ZstdCompressor` 现在作为独立节点运行：`TarQueue -> ZstdQueue -> QueueWriter -> sink`
-- 当前自适应策略是：
-- 取上游数据时，如果发现 `t/z` 已满，就立即升档
-- 向下游写数据时，如果发现 `z/s` 已满，就立即升档
-- 向下游写数据时，如果发现 `z/s` 为空，就设置一个标记
-- 下一次迭代取上游数据时，如果标记存在且 `t/z` 已满，就降档并清除标记
+- 自适应调节逻辑已提取为独立的 `detail2::AdaptiveLevelController` 类，通过三个回调方法驱动：
+  - `on_upstream_full()`：取上游数据时发现 `t/z` 已满，立即升档
+  - `on_downstream_full()`：向下游写数据时发现 `z/s` 已满，立即升档
+  - `on_downstream_empty_then_upstream_full()`：下游为空后再次取到满上游，降档并清除标记
 - 调节存在冷却窗口，默认每 1 秒最多允许调节一次
 - 如果本次调节方向与上次相反，则取两次目标中更低的压缩级别，并把冷却窗口翻倍为 2 秒、4 秒、8 秒递增
 - 如果本次调节方向与上次相同，则按当前目标调节，并把冷却窗口重置回 1 秒
@@ -455,13 +405,15 @@ GUI 发送页不再直接调用 `listen_directory()`，而是使用 `GuiSendServ
 - `soratransport_app`
 - 工程要求 `cmake_minimum_required(VERSION 4.0.0)`，并通过 vcpkg manifest 管理依赖
 - `fltk` 与 `nlohmann_json` 都通过 `FetchContent` 拉取，其中 `nlohmann_json` 用于解析 WebSocket 文本控制帧
+- `FindLibArchive.cmake` 只提供单一 `IMPORTED_LOCATION`，vcpkg 下 debug/lib/ 与 lib/ 同名可能误用 debug 库（引入 LIBCMTD）；已通过 per-config 属性修复，Release/RelWithDebInfo/MinSizeRel 使用 release 路径，Debug 使用 debug 路径
 
 ## 11. 维护建议
 
 后续维护时，优先注意以下事实：
 
-1. 当前打包流水线已经收敛为 `DirScanner -> Prefetcher -> TarPacker -> (QueueWriter | ZstdCompressor -> QueueWriter)`。
-2. `DirScanner` 已经合并了文件元数据填充和普通文件并发打开逻辑，不再有独立的 `FileReaderOpener`。
-3. `InFlightReadBudget` 只绑定预读阶段，预算租约会在 `TarPacker` 真正消费对象前释放。
+1. 当前打包流水线已经收敛为 `FileTraverser -> FileOpener -> FilePrefetcher -> TarPacker -> (QueueWriter | ZstdCompressor -> QueueWriter)`，全部走 `detail2` 原生节点。
+2. `detail/` 目录已精简到最小集合（`types.hpp`、`pipeline.hpp`、`runtime.hpp`、`io.hpp`、`internal.hpp`、`network_util.hpp`、`win32_util.hpp`、`windows_helpers.hpp` 及对应 `.cpp`）；旧 `DirScanner`、`TarPacker`、`ZstdCompressor`、`ZstdDecompressor` 等已随对应源文件一并删除。
+3. `InFlightReadBudget`（位于 `detail2/filesystem`）只绑定预读阶段，预算租约会在 `TarPacker` 真正消费对象前释放。
 4. `FileByteSink` / `FileByteSource` 已不再暴露 direct/buffered 切换；若重新引入该能力，必须同步修改 CLI 语义和文档。
 5. GUI、CLI、网络入口现在共用 `CancelEvent` / `TransferProgress`；后续若调整取消或状态语义，必须同步更新三者。
+6. `PipelineGuard`（位于 `detail/internal.hpp`）统一替代了手动 close 队列的模式；新增流水线节点时应使用 `guard.watch(queue)` 注册队列，避免异常路径漏关。
