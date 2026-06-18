@@ -3,8 +3,11 @@
 #include "detail/pipeline.hpp"
 
 #include <stop_token>
+#include <tuple>
 
 namespace soratransport {
+
+using StatusText = std::tuple<std::string, std::string>;
 
 struct TransferProgressSnapshot {
 	std::uint64_t processed_bytes = 0;
@@ -12,18 +15,18 @@ struct TransferProgressSnapshot {
 	bool completed = false;
 	bool failed = false;
 	bool cancelled = false;
-	std::string status_text;
+	StatusText status_text;
 };
 
 class TransferProgress {
 public:
 	void add_processed_bytes(std::uint64_t bytes);
 	void add_processed_files(std::uint64_t files = 1);
-	void reset(std::string status_text = "idle");
-	void set_status(std::string status_text);
-	void set_completed(std::string status_text = "completed");
-	void set_failed(std::string status_text);
-	void set_cancelled(std::string status_text = "cancelled");
+	void reset(StatusText status_text = {"idle", "空闲"});
+	void set_status(StatusText status_text);
+	void set_completed(StatusText status_text = {"completed", "已完成"});
+	void set_failed(StatusText status_text);
+	void set_cancelled(StatusText status_text = {"cancelled", "已取消"});
 	TransferProgressSnapshot snapshot() const;
 
 private:
@@ -33,7 +36,7 @@ private:
 	std::atomic<bool> failed_{false};
 	std::atomic<bool> cancelled_{false};
 	mutable std::mutex mutex_;
-	std::string status_text_ = "idle";
+	StatusText status_text_{"idle", "空闲"};
 };
 
 void pack_directory_to_file(

@@ -147,13 +147,13 @@ std::jthread start_progress_thread(
 	});
 }
 
-void set_progress_status(const std::shared_ptr<TransferProgress>& progress, std::string status) {
+void set_progress_status(const std::shared_ptr<TransferProgress>& progress, StatusText status) {
 	if (progress) {
 		progress->set_status(std::move(status));
 	}
 }
 
-void complete_progress(const std::shared_ptr<TransferProgress>& progress, bool failed, bool cancelled, std::string status) {
+void complete_progress(const std::shared_ptr<TransferProgress>& progress, bool failed, bool cancelled, StatusText status) {
 	if (!progress) {
 		return;
 	}
@@ -396,9 +396,9 @@ asio::awaitable<void> listen_directory_task(
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
-		set_progress_status(progress, "binding listener");
+		set_progress_status(progress, {"binding listener", "正在绑定监听端口"});
 		auto websocket = co_await accept_websocket_async(port, bound_port, cancel_event);
-		set_progress_status(progress, "receiver connected");
+		set_progress_status(progress, {"receiver connected", "接收端已连接，等待拖放"});
 		std::cerr << "listening on port " << websocket.next_layer().local_endpoint().port() << ", waiting for receiver...\n";
 		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(websocket), true);
@@ -531,13 +531,13 @@ asio::awaitable<void> listen_directory_task(
 		sink.send_transport_end();
 		sink.check_connection();
 		sink.close_socket();
-		complete_progress(progress, false, false, "send completed");
+		complete_progress(progress, false, false, {"send completed", "发送完成"});
 	} catch (...) {
 		*task_error = std::current_exception();
 		if (should_report_transfer_error(cancel_event, *task_error)) {
-			complete_progress(progress, true, false, "send failed");
+			complete_progress(progress, true, false, {"send failed", "发送失败"});
 		} else if (is_transfer_cancelled(*task_error) || cancel_event.is_cancelled()) {
-			complete_progress(progress, false, true, "cancelled");
+			complete_progress(progress, false, true, {"cancelled", "已取消"});
 		}
 	}
 
@@ -553,7 +553,7 @@ asio::awaitable<void> receive_directory_task(
 	CancelEvent& cancel_event,
 	std::exception_ptr* task_error) {
 	try {
-		set_progress_status(progress, "connecting");
+		set_progress_status(progress, {"connecting", "正在连接"});
 		std::cerr << "connecting to " << host << ':' << port << "...\n";
 		auto websocket = co_await connect_websocket_async(std::move(host), port, cancel_event);
 		std::cerr << "connected, waiting for transfer...\n";
@@ -562,11 +562,11 @@ asio::awaitable<void> receive_directory_task(
 		bool received_any_transport = false;
 		for (;;) {
 			if (received_any_transport) {
-				set_progress_status(progress, "waiting for next transfer");
+				set_progress_status(progress, {"waiting for next transfer", "等待下一次传输"});
 			}
 			if (!source.await_transport_begin()) {
 				if (keep_connection_open) {
-					set_progress_status(progress, "waiting");
+					set_progress_status(progress, {"waiting", "等待操作"});
 					break;
 				}
 				if (!received_any_transport) {
@@ -575,12 +575,12 @@ asio::awaitable<void> receive_directory_task(
 				break;
 			}
 			if (progress) {
-				progress->reset("receiving");
+				progress->reset({"receiving", "正在接收"});
 			}
 			std::cerr << "transport started, receiving...\n";
 			receive_transport_from_source(source, destination_dir, progress, cancel_event);
 			received_any_transport = true;
-			complete_progress(progress, false, false, "receive completed");
+			complete_progress(progress, false, false, {"receive completed", "接收完成"});
 			if (!keep_connection_open) {
 				break;
 			}
@@ -589,9 +589,9 @@ asio::awaitable<void> receive_directory_task(
 	} catch (...) {
 		*task_error = std::current_exception();
 		if (should_report_transfer_error(cancel_event, *task_error)) {
-			complete_progress(progress, true, false, "receive failed");
+			complete_progress(progress, true, false, {"receive failed", "接收失败"});
 		} else if (is_transfer_cancelled(*task_error) || cancel_event.is_cancelled()) {
-			complete_progress(progress, false, true, "cancelled");
+			complete_progress(progress, false, true, {"cancelled", "已取消"});
 		}
 	}
 

@@ -341,7 +341,7 @@ private:
 	void run(std::stop_token stop_token) {
 		try {
 			if (progress_) {
-				progress_->reset("binding listener");
+				progress_->reset({"binding listener", "正在绑定监听端口"});
 			}
 
 			asio::io_context io_context;
@@ -357,7 +357,7 @@ private:
 			notify_state_changed();
 
 			if (progress_) {
-				progress_->set_status("waiting for receiver");
+				progress_->set_status({"waiting for receiver", "等待接收端连接"});
 			}
 
 			while (!stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
@@ -371,7 +371,7 @@ private:
 				}
 				notify_state_changed();
 				if (progress_) {
-					progress_->set_status("receiver connected, waiting for drop");
+					progress_->set_status({"receiver connected, waiting for drop", "接收端已连接，等待拖放"});
 				}
 
 				bool receiver_connected = true;
@@ -403,7 +403,7 @@ private:
 						} catch (...) {
 							receiver_connected = false;
 							if (progress_ && cancel_event_.is_cancelled()) {
-								progress_->set_cancelled("cancelled");
+								progress_->set_cancelled({"cancelled", "已取消"});
 							}
 						}
 						continue;
@@ -411,12 +411,12 @@ private:
 
 					try {
 						if (progress_) {
-							progress_->reset("sending");
+							progress_->reset({"sending", "正在发送"});
 						}
 						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_);
 						if (progress_) {
-							progress_->set_completed("send completed");
-							progress_->set_status("receiver connected, waiting for drop");
+							progress_->set_completed({"send completed", "发送完成"});
+							progress_->set_status({"receiver connected, waiting for drop", "接收端已连接，等待拖放"});
 						}
 					} catch (...) {
 						receiver_connected = false;
@@ -424,11 +424,11 @@ private:
 							try {
 								throw;
 							} catch (const CancelledError&) {
-								progress_->set_cancelled("cancelled");
+								progress_->set_cancelled({"cancelled", "已取消"});
 							} catch (const std::exception& error) {
-								progress_->set_failed(error.what());
+								progress_->set_failed({error.what(), error.what()});
 							} catch (...) {
-								progress_->set_failed("send failed");
+								progress_->set_failed({"send failed", "发送失败"});
 							}
 						}
 						if (cancel_event_.is_cancelled()) {
@@ -453,7 +453,7 @@ private:
 				notify_state_changed();
 
 				if (!stop_token.stop_requested() && !cancel_event_.is_cancelled() && progress_) {
-					progress_->set_status("waiting for receiver");
+					progress_->set_status({"waiting for receiver", "等待接收端连接"});
 				}
 			}
 		} catch (...) {
@@ -467,9 +467,9 @@ private:
 				try {
 					std::rethrow_exception(startup_error_);
 				} catch (const std::exception& error) {
-					progress_->set_failed(error.what());
+					progress_->set_failed({error.what(), error.what()});
 				} catch (...) {
-					progress_->set_failed("send failed");
+					progress_->set_failed({"send failed", "发送失败"});
 				}
 			}
 		}

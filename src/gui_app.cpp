@@ -60,61 +60,6 @@ std::string path_to_ui_text(const std::filesystem::path& path) {
 	return path_to_utf8_string(path);
 }
 
-std::string translate_status_text(std::string_view status_text) {
-	if (status_text == "idle") {
-		return "空闲";
-	}
-	if (status_text == "waiting") {
-		return "等待操作";
-	}
-	if (status_text == "starting receiver") {
-		return "正在启动接收端";
-	}
-	if (status_text == "binding listener") {
-		return "正在绑定监听端口";
-	}
-	if (status_text == "waiting for receiver") {
-		return "等待接收端连接";
-	}
-	if (status_text == "receiver connected") {
-		return "接收端已连接，等待拖放";
-	}
-	if (status_text == "receiver connected, waiting for drop") {
-		return "接收端已连接，等待拖放";
-	}
-	if (status_text == "sending") {
-		return "正在发送";
-	}
-	if (status_text == "connecting") {
-		return "正在连接";
-	}
-	if (status_text == "receiving") {
-		return "正在接收";
-	}
-	if (status_text == "waiting for next transfer") {
-		return "等待下一次传输";
-	}
-	if (status_text == "send completed") {
-		return "发送完成";
-	}
-	if (status_text == "receive completed") {
-		return "接收完成";
-	}
-	if (status_text == "completed") {
-		return "已完成";
-	}
-	if (status_text == "send failed") {
-		return "发送失败";
-	}
-	if (status_text == "receive failed") {
-		return "接收失败";
-	}
-	if (status_text == "cancelled") {
-		return "已取消";
-	}
-	return std::string(status_text);
-}
-
 std::wstring utf8_to_utf16(std::string_view text) {
 	if (text.empty()) {
 		return {};
@@ -346,7 +291,7 @@ struct ProgressViewState {
 	std::uint64_t last_files = 0;
 	std::uint64_t recent_rate = 0;
 	std::uint64_t recent_files = 0;
-	std::string last_status_text;
+	StatusText last_status_text;
 };
 
 class AppWindow final : public Fl_Double_Window {
@@ -398,12 +343,12 @@ public:
 			tabs_->value(send_group_);
 		}
 
-		send_progress_->reset("binding listener");
-		receive_progress_->reset("waiting");
+		send_progress_->reset({"binding listener", "正在绑定监听端口"});
+		receive_progress_->reset({"waiting", "等待操作"});
 		try {
 			send_server_.start();
 		} catch (const std::exception& error) {
-			send_progress_->set_failed(error.what());
+			send_progress_->set_failed({error.what(), error.what()});
 		}
 
 		update_ui();
@@ -590,7 +535,7 @@ private:
 			}
 
 			receive_url_ = *parsed_url;
-			receive_progress_->reset("connecting");
+			receive_progress_->reset({"connecting", "正在连接"});
 			receive_cancel_event_ = std::make_unique<CancelEvent>();
 			receive_session_finished_.store(false, std::memory_order_release);
 			receive_thread_ = std::jthread([
@@ -606,11 +551,11 @@ private:
 			});
 			update_ui();
 		} catch (const std::exception& error) {
-			receive_progress_->set_failed(error.what());
+			receive_progress_->set_failed({error.what(), error.what()});
 			receive_session_finished_.store(true, std::memory_order_release);
 			set_transient_status(std::string("连接失败：") + error.what());
 		} catch (...) {
-			receive_progress_->set_failed("unknown error");
+			receive_progress_->set_failed({"unknown error", "未知错误"});
 			receive_session_finished_.store(true, std::memory_order_release);
 			set_transient_status("连接失败：未知错误");
 		}
@@ -634,7 +579,7 @@ private:
 
 		const auto send_snapshot = send_server_.snapshot();
 		const auto receive_snapshot = receive_progress_->snapshot();
-		const bool active_transfer = send_snapshot.transfer_in_progress || (is_receive_session_active() && receive_snapshot.status_text == "receiving");
+		const bool active_transfer = send_snapshot.transfer_in_progress || (is_receive_session_active() && std::get<0>(receive_snapshot.status_text) == "receiving");
 		if (active_transfer) {
 			const auto choice = fl_choice("传输或连接仍在进行，要停止吗？", "否", "是", nullptr);
 			if (choice != kStopTransferChoice) {
@@ -693,7 +638,7 @@ private:
 			addresses_ = enumerate_shareable_addresses(port);
 			rebuild_address_choice(selected_url.value_or(""));
 		} catch (const std::exception& error) {
-			send_progress_->set_failed(error.what());
+			send_progress_->set_failed({error.what(), error.what()});
 		}
 	}
 
@@ -826,7 +771,7 @@ private:
 	}
 
 	void update_status_box(const TransferProgressSnapshot& snapshot) {
-		std::string status_text = translate_status_text(snapshot.status_text);
+		std::string status_text = std::get<1>(snapshot.status_text);
 		if (!transient_status_.empty() && std::chrono::steady_clock::now() >= transient_status_until_) {
 			transient_status_.clear();
 		}

@@ -10,7 +10,7 @@ void TransferProgress::add_processed_files(std::uint64_t files) {
 	processed_files_.fetch_add(files, std::memory_order_relaxed);
 }
 
-void TransferProgress::reset(std::string status_text) {
+void TransferProgress::reset(StatusText status_text) {
 	processed_bytes_.store(0, std::memory_order_relaxed);
 	processed_files_.store(0, std::memory_order_relaxed);
 	completed_.store(false, std::memory_order_relaxed);
@@ -20,12 +20,12 @@ void TransferProgress::reset(std::string status_text) {
 	status_text_ = std::move(status_text);
 }
 
-void TransferProgress::set_status(std::string status_text) {
+void TransferProgress::set_status(StatusText status_text) {
 	std::lock_guard lock(mutex_);
 	status_text_ = std::move(status_text);
 }
 
-void TransferProgress::set_completed(std::string status_text) {
+void TransferProgress::set_completed(StatusText status_text) {
 	{
 		std::lock_guard lock(mutex_);
 		status_text_ = std::move(status_text);
@@ -35,7 +35,7 @@ void TransferProgress::set_completed(std::string status_text) {
 	cancelled_.store(false, std::memory_order_relaxed);
 }
 
-void TransferProgress::set_failed(std::string status_text) {
+void TransferProgress::set_failed(StatusText status_text) {
 	{
 		std::lock_guard lock(mutex_);
 		status_text_ = std::move(status_text);
@@ -45,7 +45,7 @@ void TransferProgress::set_failed(std::string status_text) {
 	cancelled_.store(false, std::memory_order_relaxed);
 }
 
-void TransferProgress::set_cancelled(std::string status_text) {
+void TransferProgress::set_cancelled(StatusText status_text) {
 	{
 		std::lock_guard lock(mutex_);
 		status_text_ = std::move(status_text);
