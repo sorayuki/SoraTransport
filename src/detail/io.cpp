@@ -847,9 +847,9 @@ struct SocketByteSink::State {
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
-		// JSON 消息会经过控制 WriteBuffer 聚合发送
-		auto bytes = make_string_span(json_payload);
-		control_writer->write(bytes);
+		flush_data_buffer();
+		control_writer->flush();
+		do_send_control_frame(make_string_span(json_payload));
 	}
 
 	void flush_control_buffer() {
