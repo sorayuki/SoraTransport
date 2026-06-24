@@ -1,17 +1,5 @@
 cmake_minimum_required(VERSION 4.0.0)
 
-if(NOT DEFINED VCPKG_MANIFEST_MODE)
-	set(VCPKG_MANIFEST_MODE ON CACHE BOOL "Use the vcpkg manifest in the source tree")
-endif()
-
-if(NOT DEFINED VCPKG_MANIFEST_DIR)
-	set(VCPKG_MANIFEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Path to the vcpkg manifest directory")
-endif()
-
-if(NOT DEFINED VCPKG_TARGET_TRIPLET)
-	set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "vcpkg target triplet")
-endif()
-
 project(SoraTransport)
 
 # boost
@@ -28,6 +16,57 @@ set(FLTK_BUILD_PDF_DOCS OFF CACHE BOOL "" FORCE)
 set(FLTK_OPTION_PRINT_SUPPORT OFF CACHE BOOL "" FORCE)
 set(FLTK_MSVC_RUNTIME_DLL OFF CACHE BOOL "" FORCE)
 
+# ---- zlib (v1.3.2) ----
+# Note: zlib 1.3.2 has a CMake bug where zconf.h.cmakein may not be generated
+# before configure_file() is called. Work around it by writing a stub first.
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG        v1.3.2
+    GIT_SHALLOW    TRUE
+)
+
+# ---- zstd (v1.5.7) ----
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG        v1.5.7
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  build/cmake
+)
+
+# ---- libarchive (v3.8.8) ----
+set(ENABLE_LZ4 OFF CACHE BOOL "" FORCE)
+set(ENABLE_LZO OFF CACHE BOOL "" FORCE)
+set(ENABLE_LZMA OFF CACHE BOOL "" FORCE)
+set(ENABLE_BZip2 OFF CACHE BOOL "" FORCE)
+set(ENABLE_LIBXML2 OFF CACHE BOOL "" FORCE)
+set(ENABLE_EXPAT OFF CACHE BOOL "" FORCE)
+set(ENABLE_PCREPOSIX OFF CACHE BOOL "" FORCE)
+set(ENABLE_LibGCC OFF CACHE BOOL "" FORCE)
+set(ENABLE_CNG OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPENSSL OFF CACHE BOOL "" FORCE)
+set(ENABLE_NETTLE OFF CACHE BOOL "" FORCE)
+set(ENABLE_TAR OFF CACHE BOOL "" FORCE)
+set(ENABLE_CPIO OFF CACHE BOOL "" FORCE)
+set(ENABLE_CAT OFF CACHE BOOL "" FORCE)
+set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
+set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    LibArchive
+    GIT_REPOSITORY https://github.com/libarchive/libarchive.git
+    GIT_TAG        v3.8.8
+    GIT_SHALLOW    TRUE
+)
+
 FetchContent_Declare(
     fltk
     GIT_REPOSITORY https://github.com/fltk/fltk.git
@@ -42,7 +81,67 @@ FetchContent_Declare(
 	GIT_SHALLOW TRUE
 )
 
+# Build order: FLTK first (creates "uninstall" target), then zlib+zstd (zstd has guard),
+# then libarchive (depends on zlib+zstd).
+
 FetchContent_MakeAvailable(fltk)
+
+FetchContent_MakeAvailable(zlib)
+FetchContent_MakeAvailable(zstd)
+
+# Fix zlib v1.3.2 CMakeLists.txt bug: ensure zconf.h.cmakein exists
+if(NOT EXISTS "${zlib_BINARY_DIR}/zconf.h.cmakein")
+    file(COPY "${zlib_SOURCE_DIR}/zconf.h.in"
+         DESTINATION "${zlib_BINARY_DIR}")
+    file(RENAME "${zlib_BINARY_DIR}/zconf.h.in"
+         "${zlib_BINARY_DIR}/zconf.h.cmakein")
+endif()
+
+# Create ALIAS targets so legacy code using ZLIB::ZLIB / zstd::libzstd works
+if(TARGET zlibstatic AND NOT TARGET ZLIB::ZLIB)
+    add_library(ZLIB::ZLIB ALIAS zlibstatic)
+endif()
+if(TARGET libzstd_static AND NOT TARGET zstd::libzstd)
+    add_library(zstd::libzstd ALIAS libzstd_static)
+endif()
+
+# Expose include dirs for libarchive's internal find_package(ZLIB) / find_package(zstd)
+# (libarchive uses FindZLIB.cmake / FindZSTD.cmake which look for these variables)
+if(TARGET ZLIB::ZLIB)
+    get_target_property(_zlib_inc ZLIB::ZLIB INTERFACE_INCLUDE_DIRECTORIES)
+    if(_zlib_inc)
+        set(ZLIB_INCLUDE_DIR "${_zlib_inc}" CACHE PATH "zlib include dir" FORCE)
+    endif()
+    get_target_property(_zlib_lib ZLIB::ZLIB IMPORTED_LOCATION)
+    if(NOT _zlib_lib)
+        set(_zlib_lib zlibstatic)
+    endif()
+    set(ZLIB_LIBRARY "${_zlib_lib}" CACHE FILEPATH "zlib library" FORCE)
+    unset(_zlib_inc)
+    unset(_zlib_lib)
+endif()
+
+if(TARGET zstd::libzstd)
+    get_target_property(_zstd_inc zstd::libzstd INTERFACE_INCLUDE_DIRECTORIES)
+    if(_zstd_inc)
+        set(ZSTD_INCLUDE_DIR "${_zstd_inc}" CACHE PATH "zstd include dir" FORCE)
+    endif()
+    get_target_property(_zstd_lib zstd::libzstd IMPORTED_LOCATION)
+    if(NOT _zstd_lib)
+        set(_zstd_lib libzstd_static)
+    endif()
+    set(ZSTD_LIBRARY "${_zstd_lib}" CACHE FILEPATH "zstd library" FORCE)
+    unset(_zstd_inc)
+    unset(_zstd_lib)
+endif()
+
+FetchContent_MakeAvailable(LibArchive)
+
+# Create ALIAS for LibArchive
+if(TARGET archive_static AND NOT TARGET LibArchive::LibArchive)
+    add_library(LibArchive::LibArchive ALIAS archive_static)
+endif()
+
 FetchContent_MakeAvailable(nlohmann_json)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -59,29 +158,8 @@ endif()
 write_file("${CMAKE_CURRENT_BINARY_DIR}/.gitignore" "**")
 
 find_package(Boost REQUIRED CONFIG)
-find_package(ZLIB REQUIRED)
-find_package(zstd CONFIG REQUIRED)
-find_package(LibArchive REQUIRED)
 
-# FindLibArchive.cmake 只用单路径 IMPORTED_LOCATION，vcpkg 下 debug/lib/ 和 lib/ 同名，
-# 可能误把 debug 版用于所有配置。用字符串推导 per-config 路径修复。
-if(TARGET LibArchive::LibArchive)
-	get_target_property(_la_lib LibArchive::LibArchive IMPORTED_LOCATION)
-	if(_la_lib)
-		string(REGEX REPLACE "/debug/" "/" _la_rel "${_la_lib}")
-		string(REGEX REPLACE "/lib/" "/debug/lib/" _la_dbg "${_la_rel}")
-		set_target_properties(LibArchive::LibArchive PROPERTIES
-			IMPORTED_LOCATION_RELEASE        "${_la_rel}"
-			IMPORTED_LOCATION_RELWITHDEBINFO "${_la_rel}"
-			IMPORTED_LOCATION_MINSIZEREL     "${_la_rel}"
-			IMPORTED_LOCATION_DEBUG          "${_la_dbg}"
-		)
-		unset(_la_dbg)
-		unset(_la_rel)
-	endif()
-	unset(_la_lib)
-endif()
-# find_package(FLTK CONFIG REQUIRED)
+# ALIAS targets are already created above (after FetchContent_MakeAvailable calls).
 
 if(TARGET fltk AND NOT TARGET fltk::fltk)
 	add_library(fltk::fltk INTERFACE IMPORTED)
