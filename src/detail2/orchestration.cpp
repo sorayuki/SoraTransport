@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "protocol.hpp"
 #include "stream.hpp"
 #include "tar.hpp"
 #include "zstd.hpp"
@@ -19,6 +20,8 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/use_future.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +32,7 @@
 #include <mutex>
 #include <sstream>
 #include <stop_token>
+#include <unordered_set>
 #include <vector>
 
 namespace asio = boost::asio;
@@ -392,7 +396,8 @@ asio::awaitable<void> listen_directory_task(
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint16_t>* bound_port,
 	CancelEvent& cancel_event,
-	std::exception_ptr* task_error) {
+	std::exception_ptr* task_error,
+	bool enable_file_comparison = false) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 	try {
@@ -403,7 +408,7 @@ asio::awaitable<void> listen_directory_task(
 		std::cerr << "receiver connected, starting transfer...\n";
 		SocketByteSink sink(std::move(websocket), true);
 		sink.listenCancelSignal(cancel_event);
-		sink.send_transport_begin();
+		sink.send_transport_begin(enable_file_comparison);
 
 		auto tuning = detail2::make_pipeline_tuning(options);
 		const auto compression_level = options.compression_level.value_or(tuning.default_compression_level);
@@ -414,11 +419,13 @@ asio::awaitable<void> listen_directory_task(
 		detail2::SemaphoreCor tar_budget(executors.executor(), tuning.tar_output_budget_bytes);
 		detail2::SemaphoreCor zstd_budget(executors.executor(), tuning.zstd_output_budget_bytes);
 		BoundedQueue<detail2::TraversalEntry> traversal_queue(tuning.opened_queue_capacity, executors.executor());
+		BoundedQueue<detail2::TraversalEntry> filtered_traversal_queue(tuning.opened_queue_capacity, executors.executor());
 		BoundedQueue<detail2::OpenedFile> opened_queue(tuning.opened_queue_capacity, executors.executor());
 		BoundedQueue<detail2::OpenedFile> prefetched_queue(tuning.prefetched_queue_capacity, executors.executor());
 		BoundedQueue<DataChunk> tar_queue(tuning.tar_queue_capacity, executors.executor());
 		BoundedQueue<DataChunk> zstd_queue(tuning.zstd_queue_capacity, executors.executor());
 		traversal_queue.listenCancelSignal(cancel_event);
+		filtered_traversal_queue.listenCancelSignal(cancel_event);
 		opened_queue.listenCancelSignal(cancel_event);
 		prefetched_queue.listenCancelSignal(cancel_event);
 		tar_queue.listenCancelSignal(cancel_event);
@@ -451,13 +458,109 @@ asio::awaitable<void> listen_directory_task(
 			uncompressed_bytes_processed,
 			&cancel_event);
 
-		auto traverse_future = asio::co_spawn(executors.executor(), traverser.traverse(source_dir, traversal_queue), asio::use_future);
-		auto open_future = asio::co_spawn(executors.executor(), opener.open(traversal_queue, opened_queue), asio::use_future);
-		auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
+		std::future<void> traverse_future;
+		std::future<void> open_future;
+		std::future<void> prefetch_future;
+		bool traverse_already_consumed = false;
+
+		if (enable_file_comparison) {
+			// ================================================================
+			// 文件比较模式：FileTraverser → 控制通道交换 → FileOpener
+			// ================================================================
+
+			// Phase 1: 遍历目录，收集所有 TraversalEntry
+			traverse_future = asio::co_spawn(
+				executors.executor(),
+				traverser.traverse(source_dir, traversal_queue),
+				asio::use_future);
+			traverse_future.get();
+			traverse_already_consumed = true;
+			traversal_queue.close();
+
+			// Phase 2: 收集遍历结果，并提取 regular file 的比较信息
+			std::vector<detail2::control_msg::FileInfoEntry> file_infos;
+			std::vector<detail2::TraversalEntry> traversed_entries;
+			while (auto entry_opt = traversal_queue.pop()) {
+				auto entry = std::move(*entry_opt);
+				if (entry.regular_file) {
+					if (!entry.meta.last_write_time.has_value()) {
+						detail2::populate_file_metadata(entry.meta);
+					}
+
+					detail2::control_msg::FileInfoEntry info;
+					info.relative_path = entry.meta.relative_path_in_tar;
+					info.size = entry.meta.size;
+					if (entry.meta.last_write_time) {
+						info.mtime_sec = entry.meta.last_write_time->seconds;
+						info.mtime_nsec = entry.meta.last_write_time->nanoseconds;
+					}
+					file_infos.push_back(info);
+				}
+				traversed_entries.push_back(std::move(entry));
+			}
+
+			// Phase 3: 发送文件信息到接收端，按原顺序筛回需要继续打开的条目。
+			// FileOpener 的顺序重排要求 sequence 连续，因此这里必须重编号。
+			std::unordered_set<std::string> diff_paths;
+			if (!file_infos.empty()) {
+				auto batch_json = detail2::control_msg::serialize_file_info_batch(
+					detail2::control_msg::kTypeFileInfoBatch, file_infos);
+				sink.send_control_message(batch_json);
+				sink.flush_control_buffer();
+
+				auto response_json = sink.await_control_response();
+				auto diff_entries = detail2::control_msg::deserialize_file_info_batch(response_json);
+
+				for (auto& diff : diff_entries) {
+					diff_paths.insert(diff.relative_path);
+				}
+			}
+
+			std::size_t next_filtered_sequence = 0;
+			for (auto& entry : traversed_entries) {
+				const bool should_forward = !entry.regular_file
+					|| diff_paths.contains(entry.meta.relative_path_in_tar);
+				if (!should_forward) {
+					continue;
+				}
+
+				entry.sequence = next_filtered_sequence++;
+				filtered_traversal_queue.push(std::move(entry));
+			}
+
+			filtered_traversal_queue.close();
+
+			// Phase 4: 启动下游流水线
+			open_future = asio::co_spawn(
+				executors.executor(),
+				opener.open(filtered_traversal_queue, opened_queue),
+				asio::use_future);
+			prefetch_future = asio::co_spawn(
+				executors.executor(),
+				prefetcher.prefetch(opened_queue, prefetched_queue),
+				asio::use_future);
+		} else {
+			// ================================================================
+			// 直连模式：FileTraverser → FileOpener 直接连接（原有行为）
+			// ================================================================
+			traverse_future = asio::co_spawn(
+				executors.executor(),
+				traverser.traverse(source_dir, traversal_queue),
+				asio::use_future);
+			open_future = asio::co_spawn(
+				executors.executor(),
+				opener.open(traversal_queue, opened_queue),
+				asio::use_future);
+			prefetch_future = asio::co_spawn(
+				executors.executor(),
+				prefetcher.prefetch(opened_queue, prefetched_queue),
+				asio::use_future);
+		}
 
 		std::jthread sender_thread([&] {
 			PipelineGuard guard;
 			guard.watch(traversal_queue);
+			guard.watch(filtered_traversal_queue);
 			guard.watch(opened_queue);
 			guard.watch(prefetched_queue);
 			guard.watch(tar_queue);
@@ -502,7 +605,9 @@ asio::awaitable<void> listen_directory_task(
 		});
 
 		try {
-			traverse_future.get();
+			if (!traverse_already_consumed) {
+				traverse_future.get();
+			}
 			open_future.get();
 			prefetch_future.get();
 		} catch (...) {
@@ -574,6 +679,69 @@ asio::awaitable<void> receive_directory_task(
 				}
 				break;
 			}
+
+			// ================================================================
+			// 文件比较交换（如果发送端启用了 file_comparison）
+			// ================================================================
+			if (source.transport_has_file_comparison()) {
+				std::cerr << "file comparison enabled, waiting for file info batch...\n";
+				std::string control_json;
+				if (!source.await_control_message(control_json)) {
+					throw std::runtime_error("connection closed while waiting for file info batch");
+				}
+
+				auto file_infos = detail2::control_msg::deserialize_file_info_batch(control_json);
+				std::cerr << "received file info batch: " << file_infos.size() << " files\n";
+
+				// 使用线程池并发对比本地文件
+				auto tuning = detail2::make_pipeline_tuning();
+				detail2::TaskExecutor compare_executor(tuning.worker_threads);
+
+				// 分批提交到线程池（每批最多 64 个文件，控制堆积）
+				constexpr std::size_t kCompareBatchSize = 64;
+				std::vector<std::future<bool>> compare_futures;
+				compare_futures.reserve(file_infos.size());
+
+				for (std::size_t batch_start = 0; batch_start < file_infos.size(); batch_start += kCompareBatchSize) {
+					const auto batch_end = std::min(batch_start + kCompareBatchSize, file_infos.size());
+
+					// 提交当前批次
+					for (std::size_t i = batch_start; i < batch_end; ++i) {
+						const auto info = file_infos[i];
+						compare_futures.push_back(compare_executor.submit(
+							[&dest = destination_dir, info]() -> bool {
+								return detail2::file_differs_from_local(
+									dest,
+									info.relative_path,
+									info.size,
+									info.mtime_sec,
+									info.mtime_nsec);
+							}));
+					}
+
+					// 等待当前批次完成再提交下一批（控制线程池堆积）
+					for (std::size_t i = batch_start; i < batch_end; ++i) {
+						compare_futures[i].wait();
+					}
+				}
+
+				// 收集差异文件（保持原顺序）
+				std::vector<detail2::control_msg::FileInfoEntry> diff_files;
+				for (std::size_t i = 0; i < file_infos.size(); ++i) {
+					if (compare_futures[i].get()) {
+						diff_files.push_back(file_infos[i]);
+					}
+				}
+
+				std::cerr << "file comparison done: " << diff_files.size()
+				          << " / " << file_infos.size() << " files differ\n";
+
+				// 发送差异列表回发送端
+				auto diff_json = detail2::control_msg::serialize_file_info_batch(
+					detail2::control_msg::kTypeFileInfoDiff, diff_files);
+				source.send_control_message(diff_json);
+			}
+
 			if (progress) {
 				progress->reset({"receiving", "正在接收"});
 			}
@@ -832,7 +1000,8 @@ void listen_directory(
 	const std::shared_ptr<TransferProgress>& progress,
 	std::atomic<std::uint16_t>* bound_port,
 	std::stop_token stop_token,
-	CancelEvent* cancel_event) {
+	CancelEvent* cancel_event,
+	bool enable_file_comparison) {
 	CancelEvent local_cancel_event;
 	CancelEvent& effective_cancel_event = cancel_event != nullptr ? *cancel_event : local_cancel_event;
 	std::stop_callback on_stop(stop_token, [&effective_cancel_event] {
@@ -840,7 +1009,7 @@ void listen_directory(
 	});
 	asio::io_context io_context;
 	std::exception_ptr task_error;
-	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, effective_cancel_event, &task_error), asio::detached);
+	asio::co_spawn(io_context, listen_directory_task(source_dir, port, options, progress, bound_port, effective_cancel_event, &task_error, enable_file_comparison), asio::detached);
 	io_context.run();
 	if (task_error && should_report_transfer_error(effective_cancel_event, task_error)) {
 		std::rethrow_exception(task_error);

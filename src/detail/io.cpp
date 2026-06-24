@@ -1,6 +1,9 @@
 #include "io.hpp"
 #include "win32_util.hpp"
 
+#include "../detail2/buffered_sender.hpp"
+#include "../detail2/protocol.hpp"
+
 #include <boost/asio/buffer.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 
@@ -25,6 +28,7 @@ constexpr std::size_t kBufferedWriteBatchSize = 8 * 1024 * 1024;
 constexpr std::size_t kFileByteSourceChunkSize = 4 * 1024 * 1024;
 constexpr std::size_t kSocketIoBufferSize = 1 * 1024 * 1024;
 constexpr auto kSocketIoMaxBufferedSendDelay = std::chrono::milliseconds(100);
+constexpr std::size_t kControlBufferCapacity = 256 * 1024;  // 控制通道缓冲 256KB
 constexpr auto kSocketKeepaliveIdleInterval = std::chrono::seconds(15);
 constexpr auto kSocketKeepalivePollInterval = std::chrono::seconds(5);
 constexpr std::string_view kTransportBeginEvent = "transport_begin";
@@ -741,7 +745,13 @@ std::size_t FileByteSource::read(uint8_t* buffer, std::size_t length) {
 struct SocketByteSink::State {
 	explicit State(TransportWebSocket ws, bool enable_keepalive)
 		: websocket(std::move(ws)), keepalive_enabled(enable_keepalive) {
-		buffer.resize(kSocketIoBufferSize);
+		data_buffer.resize(kSocketIoBufferSize);
+		control_writer = std::make_unique<detail2::WriteBuffer>(
+			kControlBufferCapacity,
+			kSocketIoMaxBufferedSendDelay,
+			[this](std::span<const uint8_t> data) {
+				do_send_control_frame(data);
+			});
 		touch_activity();
 		if (keepalive_enabled) {
 			keepalive_thread = std::jthread([this](std::stop_token stop_token) {
@@ -754,7 +764,7 @@ struct SocketByteSink::State {
 		stop();
 	}
 
-	void send_transport_begin() {
+	void send_transport_begin(bool file_comparison = false) {
 		rethrow_async_error();
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
@@ -762,8 +772,17 @@ struct SocketByteSink::State {
 		if (transport_active) {
 			throw std::runtime_error("transport has already begun");
 		}
-		flush_buffer();
-		send_text_message(make_transport_event_payload(kTransportBeginEvent));
+		flush_data_buffer();
+		control_writer->flush();
+
+		nlohmann::json payload = {
+			{"type", "event"},
+			{"event_id", kTransportBeginEvent},
+		};
+		if (file_comparison) {
+			payload["file_comparison"] = true;
+		}
+		do_send_control_frame(make_string_span(payload.dump()));
 		transport_active = true;
 	}
 
@@ -778,25 +797,24 @@ struct SocketByteSink::State {
 
 		std::size_t offset = 0;
 		while (offset < bytes.size()) {
-			auto& fill_size = buffered_size;
-			const auto available = buffer.size() - fill_size;
+			const auto available = data_buffer.size() - data_buffered_size;
 			if (available == 0) {
-				flush_buffer();
+				flush_data_buffer();
 				continue;
 			}
 
-			const auto was_empty = fill_size == 0;
+			const auto was_empty = data_buffered_size == 0;
 			const auto now = std::chrono::steady_clock::now();
 			const auto chunk = std::min<std::size_t>(available, bytes.size() - offset);
-			std::memcpy(buffer.data() + fill_size, bytes.data() + offset, chunk);
-			fill_size += chunk;
+			std::memcpy(data_buffer.data() + data_buffered_size, bytes.data() + offset, chunk);
+			data_buffered_size += chunk;
 			offset += chunk;
 			if (was_empty) {
-				fill_started_at = now;
+				data_fill_started_at = now;
 			}
-			if (fill_size == buffer.size()
-				|| (fill_started_at.has_value() && now - *fill_started_at >= kSocketIoMaxBufferedSendDelay)) {
-				flush_buffer();
+			if (data_buffered_size == data_buffer.size()
+				|| (data_fill_started_at.has_value() && now - *data_fill_started_at >= kSocketIoMaxBufferedSendDelay)) {
+				flush_data_buffer();
 			}
 		}
 	}
@@ -806,7 +824,8 @@ struct SocketByteSink::State {
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
-		flush_buffer();
+		flush_data_buffer();
+		control_writer->flush();
 	}
 
 	void send_transport_end() {
@@ -817,9 +836,28 @@ struct SocketByteSink::State {
 		if (!transport_active) {
 			throw std::runtime_error("transport has not begun");
 		}
-		flush_buffer();
-		send_text_message(make_transport_event_payload(kTransportEndEvent));
+		flush_data_buffer();
+		control_writer->flush();
+		do_send_control_frame(make_string_span(make_transport_event_payload(kTransportEndEvent)));
 		transport_active = false;
+	}
+
+	void send_control_message(std::string_view json_payload) {
+		rethrow_async_error();
+		if (cancel_requested.load(std::memory_order_relaxed)) {
+			throw CancelledError("socket send cancelled");
+		}
+		// JSON 消息会经过控制 WriteBuffer 聚合发送
+		auto bytes = make_string_span(json_payload);
+		control_writer->write(bytes);
+	}
+
+	void flush_control_buffer() {
+		rethrow_async_error();
+		if (cancel_requested.load(std::memory_order_relaxed)) {
+			throw CancelledError("socket send cancelled");
+		}
+		control_writer->flush();
 	}
 
 	void check_connection() const {
@@ -850,47 +888,79 @@ struct SocketByteSink::State {
 		socket_closed.store(true, std::memory_order_relaxed);
 	}
 
-	void flush_buffer() {
-		if (buffered_size == 0) {
+	// 发送数据通道帧：header(kData) + payload
+	void flush_data_buffer() {
+		if (data_buffered_size == 0) {
 			return;
 		}
 		rethrow_async_error();
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
+		do_send_data_frame(std::span<const uint8_t>(data_buffer.data(), data_buffered_size));
+		data_buffered_size = 0;
+		data_fill_started_at.reset();
+	}
+
+	// 发送数据通道帧（带 header）
+	void do_send_data_frame(std::span<const uint8_t> payload) {
+		// 构建: [8 字节 header] + [payload]
+		std::vector<uint8_t> framed;
+		framed.reserve(detail2::TransportFrameHeader::kSerializedSize + payload.size());
+		detail2::TransportFrameHeader::write_header(
+			framed,
+			detail2::TransportFrameHeader::kData,
+			payload.size());
+		framed.insert(framed.end(), payload.begin(), payload.end());
 
 		boost::system::error_code error;
 		{
 			std::scoped_lock lock(operation_mutex);
 			websocket.binary(true);
-			websocket.write(boost::asio::buffer(buffer.data(), buffered_size), error);
+			websocket.write(boost::asio::buffer(framed.data(), framed.size()), error);
 		}
 		if (error) {
 			if (is_cancelled_socket_error(cancel_requested.load(std::memory_order_relaxed), error)) {
 				throw CancelledError("socket send cancelled");
 			}
-			throw make_socket_error("websocket binary write failed", error);
+			throw make_socket_error("websocket data frame write failed", error);
 		}
-		buffered_size = 0;
-		fill_started_at.reset();
 		touch_activity();
 	}
 
-	void send_text_message(const std::string& payload) {
+	// 发送控制通道帧：header(kControl) + JSON payload
+	void do_send_control_frame(std::span<const uint8_t> payload) {
 		rethrow_async_error();
+		if (cancel_requested.load(std::memory_order_relaxed)) {
+			throw CancelledError("socket send cancelled");
+		}
+
+		std::vector<uint8_t> framed;
+		framed.reserve(detail2::TransportFrameHeader::kSerializedSize + payload.size());
+		detail2::TransportFrameHeader::write_header(
+			framed,
+			detail2::TransportFrameHeader::kControl,
+			payload.size());
+		framed.insert(framed.end(), payload.begin(), payload.end());
+
 		boost::system::error_code error;
 		{
 			std::scoped_lock lock(operation_mutex);
-			websocket.text(true);
-			websocket.write(boost::asio::buffer(payload.data(), payload.size()), error);
+			websocket.binary(true);
+			websocket.write(boost::asio::buffer(framed.data(), framed.size()), error);
 		}
 		if (error) {
 			if (is_cancelled_socket_error(cancel_requested.load(std::memory_order_relaxed), error)) {
 				throw CancelledError("socket send cancelled");
 			}
-			throw make_socket_error("websocket text write failed", error);
+			throw make_socket_error("websocket control frame write failed", error);
 		}
 		touch_activity();
+	}
+
+	static std::span<const uint8_t> make_string_span(std::string_view sv) {
+		return std::span<const uint8_t>(
+			reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
 	}
 
 	void run_keepalive(std::stop_token stop_token) {
@@ -960,11 +1030,12 @@ struct SocketByteSink::State {
 	}
 
 	TransportWebSocket websocket;
-	std::vector<uint8_t> buffer;
-	std::size_t buffered_size = 0;
-	std::optional<std::chrono::steady_clock::time_point> fill_started_at;
+	std::vector<uint8_t> data_buffer;
+	std::size_t data_buffered_size = 0;
+	std::optional<std::chrono::steady_clock::time_point> data_fill_started_at;
 	bool transport_active = false;
 	const bool keepalive_enabled = false;
+	std::unique_ptr<detail2::WriteBuffer> control_writer;
 	std::jthread keepalive_thread;
 	mutable std::mutex async_error_mutex;
 	std::exception_ptr async_error;
@@ -1000,8 +1071,8 @@ void SocketByteSink::listenCancelSignal(CancelEvent& event) {
 	}
 }
 
-void SocketByteSink::send_transport_begin() {
-	state_->send_transport_begin();
+void SocketByteSink::send_transport_begin(bool file_comparison) {
+	state_->send_transport_begin(file_comparison);
 }
 
 void SocketByteSink::send_transport_end() {
@@ -1014,6 +1085,58 @@ void SocketByteSink::write(std::span<const uint8_t> bytes) {
 
 void SocketByteSink::close() {
 	state_->close();
+}
+
+void SocketByteSink::send_control_message(std::string_view json_payload) {
+	state_->send_control_message(json_payload);
+}
+
+void SocketByteSink::flush_control_buffer() {
+	state_->flush_control_buffer();
+}
+
+std::string SocketByteSink::await_control_response() {
+	if (!state_) {
+		throw std::runtime_error("socket sink is closed");
+	}
+	// 复用 SocketByteSource 的帧读取逻辑来读一条控制帧
+	detail2::TransportFrameHeader header;
+	std::vector<uint8_t> payload;
+
+	boost::beast::flat_buffer input_buffer;
+	input_buffer.reserve(kSocketIoBufferSize);
+	boost::system::error_code error;
+	state_->websocket.read(input_buffer, error);
+	if (error == boost::beast::websocket::error::closed) {
+		throw std::runtime_error("websocket closed while awaiting control response");
+	}
+	if (error) {
+		if (is_cancelled_socket_error(state_->cancel_requested.load(std::memory_order_relaxed), error)) {
+			throw CancelledError("socket send cancelled");
+		}
+		throw make_socket_error("websocket control response read failed", error);
+	}
+
+	const auto total_size = input_buffer.size();
+	if (total_size < detail2::TransportFrameHeader::kSerializedSize) {
+		throw std::runtime_error("received frame too small for transport header");
+	}
+
+	std::vector<uint8_t> raw_frame(total_size);
+	boost::asio::buffer_copy(boost::asio::buffer(raw_frame), input_buffer.data());
+
+	std::array<uint8_t, detail2::TransportFrameHeader::kSerializedSize> header_buf{};
+	std::memcpy(header_buf.data(), raw_frame.data(), header_buf.size());
+	header = detail2::TransportFrameHeader::deserialize_from(
+		std::span<const uint8_t, detail2::TransportFrameHeader::kSerializedSize>(header_buf));
+
+	if (header.channel != detail2::TransportFrameHeader::kControl) {
+		throw std::runtime_error("expected control frame but received data frame");
+	}
+
+	return std::string(
+		reinterpret_cast<const char*>(raw_frame.data() + detail2::TransportFrameHeader::kSerializedSize),
+		header.payload_size);
 }
 
 void SocketByteSink::check_connection() {
@@ -1055,28 +1178,96 @@ struct SocketByteSource::State {
 			throw CancelledError("socket receive cancelled");
 		}
 		transport_finished = false;
+		file_comparison_enabled = false;
 		active_message.clear();
 		active_offset = 0;
 
 		for (;;) {
-			bool got_text = false;
+			detail2::TransportFrameHeader header;
 			std::vector<uint8_t> payload;
-			if (!read_next_message(got_text, payload)) {
+			if (!read_next_frame(header, payload)) {
 				return false;
 			}
-			if (!got_text) {
-				throw std::runtime_error("received binary websocket frame before transport_begin");
+			if (header.channel != detail2::TransportFrameHeader::kControl) {
+				throw std::runtime_error("received data frame before transport_begin");
 			}
-			auto event_id = parse_transport_event_payload(
-				std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()));
+			auto payload_text = std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size());
+			auto event_id = parse_transport_event_payload(payload_text);
 			if (event_id == kTransportBeginEvent) {
+				// 解析可选的 file_comparison 标记
+				try {
+					auto json = nlohmann::json::parse(payload_text);
+					if (json.is_object()) {
+						auto fc_it = json.find("file_comparison");
+						if (fc_it != json.end() && fc_it->is_boolean() && fc_it->get<bool>()) {
+							file_comparison_enabled = true;
+						}
+					}
+				} catch (...) {
+					// JSON 解析失败忽略
+				}
 				transport_active = true;
 				return true;
 			}
 			if (event_id == kTransportEndEvent) {
 				throw std::runtime_error("received transport_end before transport_begin");
 			}
-			throw std::runtime_error("unexpected websocket control event: " + event_id);
+			// 其他控制消息在此阶段忽略（兼容未来扩展）
+		}
+	}
+
+	bool await_control_message(std::string& json_out) {
+		if (cancel_requested.load(std::memory_order_relaxed)) {
+			throw CancelledError("socket receive cancelled");
+		}
+
+		for (;;) {
+			detail2::TransportFrameHeader header;
+			std::vector<uint8_t> payload;
+			if (!read_next_frame(header, payload)) {
+				return false;
+			}
+			if (header.channel != detail2::TransportFrameHeader::kControl) {
+				throw std::runtime_error("received unexpected data frame while awaiting control message");
+			}
+
+			auto payload_text = std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size());
+
+			// 先检查 type 字段，区分 event 类控制消息和普通控制消息
+			try {
+				auto json = nlohmann::json::parse(payload_text);
+				if (!json.is_object()) {
+					throw std::runtime_error("control frame must be a JSON object");
+				}
+				const auto type_it = json.find("type");
+				std::string msg_type;
+				if (type_it != json.end() && type_it->is_string()) {
+					msg_type = type_it->get<std::string>();
+				}
+
+				if (msg_type == "event") {
+					// 标准事件消息
+					auto event_id = parse_transport_event_payload(payload_text);
+					if (event_id == kTransportEndEvent) {
+						json_out = std::string(payload_text);
+						return true;
+					}
+					if (event_id == kTransportBeginEvent) {
+						throw std::runtime_error("received unexpected transport_begin");
+					}
+					// 其他事件消息也返回原始 JSON
+					json_out = std::string(payload_text);
+					return true;
+				}
+
+				// 非 event 类型的控制消息（如 file_info_batch, file_info_diff）
+				json_out = std::string(payload_text);
+				return true;
+			} catch (const std::runtime_error&) {
+				throw;
+			} catch (const nlohmann::json::exception& error) {
+				throw std::runtime_error(std::string("failed to parse control frame: ") + error.what());
+			}
 		}
 	}
 
@@ -1109,24 +1300,25 @@ struct SocketByteSource::State {
 			active_message.clear();
 			active_offset = 0;
 
-			bool got_text = false;
+			detail2::TransportFrameHeader header;
 			std::vector<uint8_t> payload;
-			if (!read_next_message(got_text, payload)) {
+			if (!read_next_frame(header, payload)) {
 				if (copied_total != 0) {
 					return copied_total;
 				}
 				throw std::runtime_error("websocket connection closed before transport_end");
 			}
-			if (got_text) {
+			if (header.channel == detail2::TransportFrameHeader::kControl) {
 				auto event_id = parse_transport_event_payload(
 					std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()));
 				if (event_id != kTransportEndEvent) {
-					throw std::runtime_error("unexpected websocket control event while receiving data: " + event_id);
+					throw std::runtime_error("unexpected control event while receiving data: " + event_id);
 				}
 				transport_active = false;
 				transport_finished = true;
 				return copied_total;
 			}
+			// 数据帧：直接作为 active_message 供后续 read 消费
 			active_message = std::move(payload);
 		}
 		return copied_total;
@@ -1151,7 +1343,8 @@ struct SocketByteSource::State {
 		close_socket();
 	}
 
-	bool read_next_message(bool& got_text, std::vector<uint8_t>& payload) {
+	// 读取一个 WebSocket 二进制消息，解析帧头，返回 channel + payload
+	bool read_next_frame(detail2::TransportFrameHeader& header, std::vector<uint8_t>& payload) {
 		boost::beast::flat_buffer input_buffer;
 		input_buffer.reserve(kSocketIoBufferSize);
 		boost::system::error_code error;
@@ -1166,9 +1359,30 @@ struct SocketByteSource::State {
 			}
 			throw make_socket_error("websocket read failed", error);
 		}
-		got_text = websocket.got_text();
-		payload.resize(input_buffer.size());
-		boost::asio::buffer_copy(boost::asio::buffer(payload), input_buffer.data());
+
+		const auto total_size = input_buffer.size();
+		if (total_size < detail2::TransportFrameHeader::kSerializedSize) {
+			throw std::runtime_error("received websocket frame too small for transport header");
+		}
+
+		// 先全部拷出为原始字节，再切分 header + payload
+		std::vector<uint8_t> raw_frame(total_size);
+		boost::asio::buffer_copy(boost::asio::buffer(raw_frame), input_buffer.data());
+
+		std::array<uint8_t, detail2::TransportFrameHeader::kSerializedSize> header_buf{};
+		std::memcpy(header_buf.data(), raw_frame.data(), header_buf.size());
+		header = detail2::TransportFrameHeader::deserialize_from(
+			std::span<const uint8_t, detail2::TransportFrameHeader::kSerializedSize>(header_buf));
+
+		const auto payload_size = total_size - detail2::TransportFrameHeader::kSerializedSize;
+		if (payload_size != header.payload_size) {
+			throw std::runtime_error("transport frame payload size mismatch");
+		}
+
+		payload.assign(
+			raw_frame.begin() + detail2::TransportFrameHeader::kSerializedSize,
+			raw_frame.end());
+
 		return true;
 	}
 
@@ -1177,6 +1391,7 @@ struct SocketByteSource::State {
 	std::size_t active_offset = 0;
 	bool transport_active = false;
 	bool transport_finished = false;
+	bool file_comparison_enabled = false;
 	std::atomic<bool> socket_closed{false};
 	std::atomic<bool> stop_completed{false};
 	boost::signals2::scoped_connection cancel_connection;
@@ -1207,8 +1422,47 @@ bool SocketByteSource::await_transport_begin() {
 	return state_->await_transport_begin();
 }
 
+bool SocketByteSource::transport_has_file_comparison() const {
+	return state_ != nullptr && state_->file_comparison_enabled;
+}
+
 std::size_t SocketByteSource::read(uint8_t* buffer, std::size_t length) {
 	return state_->read(buffer, length);
+}
+
+bool SocketByteSource::await_control_message(std::string& json_out) {
+	return state_->await_control_message(json_out);
+}
+
+void SocketByteSource::send_control_message(std::string_view json_payload) {
+	if (!state_) {
+		throw std::runtime_error("socket source is closed");
+	}
+	if (state_->cancel_requested.load(std::memory_order_relaxed)) {
+		throw CancelledError("socket receive cancelled");
+	}
+
+	// 构建控制帧: [header(kControl)] + [JSON payload]
+	auto payload_bytes = std::span<const uint8_t>(
+		reinterpret_cast<const uint8_t*>(json_payload.data()), json_payload.size());
+
+	std::vector<uint8_t> framed;
+	framed.reserve(detail2::TransportFrameHeader::kSerializedSize + payload_bytes.size());
+	detail2::TransportFrameHeader::write_header(
+		framed,
+		detail2::TransportFrameHeader::kControl,
+		payload_bytes.size());
+	framed.insert(framed.end(), payload_bytes.begin(), payload_bytes.end());
+
+	boost::system::error_code error;
+	state_->websocket.binary(true);
+	state_->websocket.write(boost::asio::buffer(framed.data(), framed.size()), error);
+	if (error) {
+		if (is_cancelled_socket_error(state_->cancel_requested.load(std::memory_order_relaxed), error)) {
+			throw CancelledError("socket receive cancelled");
+		}
+		throw make_socket_error("websocket control write failed", error);
+	}
 }
 
 void SocketByteSource::close_socket() {

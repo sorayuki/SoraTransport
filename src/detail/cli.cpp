@@ -126,6 +126,7 @@ PackUnpackOptions parse_pack_unpack_options(int argc, char** argv, int first_arg
 
 struct ListenOptions {
 	RuntimeOptions runtime_options;
+	bool enable_file_comparison = false;
 	std::vector<std::string_view> positional;
 };
 
@@ -133,6 +134,10 @@ ListenOptions parse_listen_options(int argc, char** argv, int first_arg) {
 	ListenOptions options;
 	for (int index = first_arg; index < argc; ++index) {
 		const std::string_view argument = argv[index];
+		if (argument == "--compare") {
+			options.enable_file_comparison = true;
+			continue;
+		}
 		if (argument == "-r" || argument == "-l") {
 			if (try_parse_runtime_option(options.runtime_options, argument, argc, argv, index)) {
 				continue;
@@ -164,14 +169,15 @@ void print_soratransport_usage() {
 		<< "Usage:\n"
 		<< "  soratransport pack [-r <MiB>] [-w <count>] [-l <level>] <source-dir> <output.tar.zst>\n"
 		<< "  soratransport unpack [-r <MiB>] [-w <count>] <input.tar.zst> <destination-dir>\n"
-		<< "  soratransport listen [-r <MiB>] [-l <level>] [--log-adaptive] <source-dir> <port>\n"
+		<< "  soratransport listen [-r <MiB>] [-l <level>] [--log-adaptive] [--compare] <source-dir> <port>\n"
 		<< "  soratransport receive <host> <port> <destination-dir>\n"
 		<< "\n"
 		<< "Options:\n"
 		<< "  -r <MiB>    Max in-flight read budget in MiB\n"
 		<< "  -w <count>  Max in-flight output write operations\n"
 		<< "  -l <level>  Zstd compression level, range -131072..22\n"
-		<< "  --log-adaptive  Print adaptive compression decisions\n";
+		<< "  --log-adaptive  Print adaptive compression decisions\n"
+		<< "  --compare   Enable file comparison via control channel (skip unchanged files)\n";
 }
 void validate_fasttar_path_mode(std::string_view path_text, CompressionMode mode, std::string_view verb) {
 	const auto is_zstd_path = ends_with(path_text, ".tar.zst") || ends_with(path_text, ".tzst") || ends_with(path_text, ".zst");
@@ -232,7 +238,7 @@ int run_soratransport_cli(int argc, char** argv) {
 				print_soratransport_usage();
 				return 1;
 			}
-			listen_directory(options.positional[0], parse_port(options.positional[1]), options.runtime_options);
+			listen_directory(options.positional[0], parse_port(options.positional[1]), options.runtime_options, {}, nullptr, {}, nullptr, options.enable_file_comparison);
 			return 0;
 		}
 		if (command == "receive") {

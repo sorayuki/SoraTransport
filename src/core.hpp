@@ -58,7 +58,8 @@ void listen_directory(
 	const std::shared_ptr<TransferProgress>& progress = {},
 	std::atomic<std::uint16_t>* bound_port = nullptr,
 	std::stop_token stop_token = {},
-	CancelEvent* cancel_event = nullptr);
+	CancelEvent* cancel_event = nullptr,
+	bool enable_file_comparison = false);
 void receive_directory(
 	std::string_view host,
 	std::uint16_t port,

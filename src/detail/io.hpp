@@ -103,10 +103,20 @@ public:
 	SocketByteSink(SocketByteSink&&) noexcept;
 	SocketByteSink& operator=(SocketByteSink&&) noexcept;
 	void listenCancelSignal(CancelEvent& event);
-	void send_transport_begin();
+	void send_transport_begin(bool file_comparison = false);
 	void send_transport_end();
 	void write(std::span<const uint8_t> bytes) override;
 	void close() override;
+
+	// 控制通道消息发送（带缓冲聚合）
+	// 使用内部 WriteBuffer 聚合，达到容量/时间阈值后自动 flush
+	void send_control_message(std::string_view json_payload);
+	void flush_control_buffer();
+
+	// 阻塞读取一条控制通道响应消息，返回 JSON 字符串
+	// 仅用于文件比较交换等需要读取响应的场景
+	std::string await_control_response();
+
 	void check_connection();
 	void close_socket();
 	void stop();
@@ -128,7 +138,19 @@ public:
 	SocketByteSource& operator=(SocketByteSource&&) noexcept;
 	void listenCancelSignal(CancelEvent& event);
 	bool await_transport_begin();
+
+	// 查询上次 await_transport_begin() 收到的 transport_begin 是否包含 file_comparison 标记
+	bool transport_has_file_comparison() const;
+
 	std::size_t read(uint8_t* buffer, std::size_t length) override;
+
+	// 控制通道消息接收
+	// 返回 false 表示连接关闭，true 表示成功读取一条控制消息
+	bool await_control_message(std::string& json_out);
+
+	// 控制通道消息发送（用于接收端回传 file_info_diff 等响应）
+	void send_control_message(std::string_view json_payload);
+
 	void close_socket();
 	void stop();
 	bool is_cancelled() const;

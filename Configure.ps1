@@ -20,4 +20,4 @@ if ($git) {
 cmake -S . -B $BuildDir `
     -G "Visual Studio 18 2026" `
     -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded`$<`$<CONFIG:Debug>:Debug>" `
-    -DCMAKE_BUILD_TYPE=$Config
+    "-DCMAKE_BUILD_TYPE=${Config}"

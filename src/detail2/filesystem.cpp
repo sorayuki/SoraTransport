@@ -183,6 +183,10 @@ SequentialFileReader::SequentialFileReader(
 	HANDLE handle)
 	: reader_(std::make_unique<OverlappedFileReader>(pool, path, size, buffer_size, handle)) {}
 
+void populate_file_metadata(FileMeta& meta) {
+	populate_file_meta(meta);
+}
+
 SequentialFileReader::~SequentialFileReader() = default;
 
 SequentialFileReader::SequentialFileReader(SequentialFileReader&& other) = default;
@@ -474,6 +478,62 @@ std::size_t compute_prefetch_bytes(const OpenedFile& opened_file, const Pipeline
 
 	const auto max_bytes = tuning.reader_slots.max_slots * tuning.reader_slots.max_slot_bytes;
 	return static_cast<std::size_t>(std::min<std::uint64_t>(opened_file.meta.size, max_bytes));
+}
+
+// ============================================================================
+// 文件对比工具
+// ============================================================================
+
+bool file_differs_from_local(
+	const std::filesystem::path& base_dir,
+	const std::string& relative_path,
+	std::uint64_t expected_size,
+	std::int64_t expected_mtime_sec,
+	long expected_mtime_nsec) {
+	static_cast<void>(expected_mtime_nsec);
+	std::error_code ec;
+	const auto full_path = base_dir / std::filesystem::path(relative_path);
+
+	if (!std::filesystem::exists(full_path, ec) || ec) {
+		return true;  // 本地文件不存在 → 需要传输
+	}
+	if (!std::filesystem::is_regular_file(full_path, ec) || ec) {
+		return true;  // 不是普通文件 → 需要传输
+	}
+
+	FileMeta local_meta;
+	local_meta.full_path = full_path;
+	populate_file_status(local_meta);
+
+	UniqueWin32Handle handle(::CreateFileW(
+		full_path.c_str(),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+		nullptr));
+	if (!handle.valid()) {
+		return true;  // 无法读取本地元数据 → 需要传输
+	}
+
+	populate_file_meta_from_handle(local_meta, handle.get());
+
+	if (local_meta.size != expected_size) {
+		return true;  // 大小不同 → 需要传输
+	}
+
+	if (!local_meta.last_write_time.has_value()) {
+		return true;  // 无法获取 mtime → 需要传输
+	}
+
+	// 当前传输/解包链路对 mtime 的稳定比较粒度按秒处理，
+	// 避免接收端恢复后的子秒精度丢失导致重复传输。
+	if (local_meta.last_write_time->seconds != expected_mtime_sec) {
+		return true;  // mtime 不同 → 需要传输
+	}
+
+	return false;  // 文件匹配，跳过
 }
 
 } // namespace soratransport::detail2

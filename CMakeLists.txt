@@ -196,10 +196,12 @@ endif()
 add_library(soratransport_core
 	src/core.cpp
 	src/core.hpp
+	src/detail2/buffered_sender.cpp
 	src/detail2/config.cpp
 	src/detail2/filesystem.cpp
 	src/detail2/infra.cpp
 	src/detail2/orchestration.cpp
+	src/detail2/protocol.cpp
 	src/detail2/stream.cpp
 	src/detail2/tar.cpp
 	src/detail2/writer.cpp

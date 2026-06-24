@@ -111,4 +111,19 @@ private:
 
 std::size_t compute_prefetch_bytes(const OpenedFile& opened_file, const PipelineTuning& tuning);
 
+void populate_file_metadata(FileMeta& meta);
+
+// ============================================================================
+// 文件对比工具（用于控制通道文件信息交换）
+// ============================================================================
+
+// 比较 FileInfoEntry 与本地 base_dir/relative_path 处的文件
+// 返回 true 表示文件不同（大小或 mtime 不匹配，或本地文件不存在）
+bool file_differs_from_local(
+	const std::filesystem::path& base_dir,
+	const std::string& relative_path,
+	std::uint64_t expected_size,
+	std::int64_t expected_mtime_sec,
+	long expected_mtime_nsec);
+
 } // namespace soratransport::detail2
