@@ -109,6 +109,40 @@ std::optional<std::string> read_clipboard_text() {
 	return result;
 }
 
+std::vector<std::filesystem::path> read_clipboard_file_paths() {
+	std::vector<std::filesystem::path> paths;
+	if (!OpenClipboard(nullptr)) {
+		return paths;
+	}
+
+	struct ClipboardCloser {
+		~ClipboardCloser() {
+			CloseClipboard();
+		}
+	} close_clipboard;
+
+	const HANDLE handle = GetClipboardData(CF_HDROP);
+	if (handle != nullptr) {
+		const auto drop = static_cast<HDROP>(handle);
+		const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+		paths.reserve(count);
+		for (UINT index = 0; index < count; ++index) {
+			const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+			if (length == 0) {
+				continue;
+			}
+			std::wstring path(length + 1, L'\0');
+			if (DragQueryFileW(drop, index, path.data(), length + 1) == 0) {
+				continue;
+			}
+			path.resize(length);
+			paths.emplace_back(std::move(path));
+		}
+	}
+
+	return paths;
+}
+
 std::vector<std::string> get_utf8_command_line_args() {
 	int argc = 0;
 	LPWSTR* argv_wide = CommandLineToArgvW(GetCommandLineW(), &argc);

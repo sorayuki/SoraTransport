@@ -15,6 +15,7 @@
 #include <FL/fl_ask.H>
 #include <FL/platform.H>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
@@ -226,6 +227,16 @@ public:
 		return accepting_;
 	}
 
+	bool receive_paths(std::vector<std::filesystem::path> paths) {
+		if (!accepting_ || paths.empty() || !on_drop_) {
+			return false;
+		}
+		highlighted_ = false;
+		update_visual_state();
+		on_drop_(std::move(paths));
+		return true;
+	}
+
 	bool contains_point(int px, int py) const {
 		return visible() && px >= x() && px < x() + w() && py >= y() && py < y() + h();
 	}
@@ -377,6 +388,12 @@ public:
 				return 1;
 			}
 			awaiting_drop_paste_ = false;
+			break;
+		case FL_KEYDOWN:
+		case FL_SHORTCUT:
+			if (is_paste_shortcut() && handle_clipboard_file_paste()) {
+				return 1;
+			}
 			break;
 		case FL_DND_LEAVE:
 			awaiting_drop_paste_ = false;
@@ -585,6 +602,31 @@ private:
 			return;
 		}
 		set_transient_status("已开始发送拖放内容");
+	}
+
+	bool is_paste_shortcut() const {
+		return (Fl::event_state() & FL_CTRL) != 0 && (Fl::event_key() == 'v' || Fl::event_key() == 'V');
+	}
+
+	bool can_paste_files_to_drop_target() const {
+		return tabs_->value() == send_group_ && drop_target_ != nullptr && drop_target_->visible() && drop_target_->accepting();
+	}
+
+	bool handle_clipboard_file_paste() {
+		if (!can_paste_files_to_drop_target()) {
+			return false;
+		}
+
+		auto paths = read_clipboard_file_paths();
+		if (paths.empty()) {
+			return false;
+		}
+
+		dnd_over_drop_target_ = false;
+		awaiting_drop_paste_ = false;
+		drop_target_->handle(FL_DND_ENTER);
+		drop_target_->handle(FL_DND_RELEASE);
+		return drop_target_->receive_paths(std::move(paths));
 	}
 
 	void handle_close_request() {

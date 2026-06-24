@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +27,7 @@ struct InterfaceAddress {
 };
 
 std::optional<std::string> read_clipboard_text();
+std::vector<std::filesystem::path> read_clipboard_file_paths();
 void write_clipboard_text(std::string_view text);
 std::vector<std::string> get_utf8_command_line_args();
 std::vector<char*> make_argv_view(std::vector<std::string>& args);

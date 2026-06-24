@@ -178,7 +178,7 @@ add_library(soratransport_dependencies INTERFACE)
 target_link_libraries(soratransport_dependencies
 	INTERFACE
 		${SORATRANSPORT_BOOST_TARGET}
-		ZLIB::ZLIB
+		zlibstatic
 		zstd::libzstd
 		LibArchive::LibArchive
 		nlohmann_json::nlohmann_json
@@ -227,6 +227,7 @@ target_compile_definitions(soratransport_core
 		_WIN32_WINNT=0x0A00
 		WIN32_LEAN_AND_MEAN
 		NOMINMAX
+		LIBARCHIVE_STATIC
 )
 
 add_executable(soratransport
@@ -266,4 +267,20 @@ target_link_libraries(soratransport_app
 		soratransport_core
 		fltk
 )
+
+if(MSVC)
+	set(SORATRANSPORT_MSVC_TARGETS
+		soratransport_core
+		soratransport
+		fasttar
+		fs_benchmark
+		soratransport_app
+	)
+	foreach(target IN LISTS SORATRANSPORT_MSVC_TARGETS)
+		set_target_properties(${target} PROPERTIES
+			VS_GLOBAL_VcpkgAutoLink false
+			VS_GLOBAL_VcpkgApplocalDeps false
+		)
+	endforeach()
+endif()
 
