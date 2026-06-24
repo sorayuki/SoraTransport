@@ -187,99 +187,6 @@ void send_paths_to_socket(
 	std::future<void> prefetch_future;
 	bool traverse_already_consumed = false;
 
-	if (enable_file_comparison) {
-		// ================================================================
-		// 文件比较模式：FileTraverser → 控制通道交换 → FileOpener
-		// ================================================================
-
-		// Phase 1: 遍历目录，收集所有 TraversalEntry
-		traverse_future = asio::co_spawn(
-			executors.executor(),
-			traverser.traverse(source_paths, traversal_queue),
-			asio::use_future);
-		traverse_future.get();
-		traverse_already_consumed = true;
-		traversal_queue.close();
-
-		// Phase 2: 收集遍历结果，并提取 regular file 的比较信息
-		std::vector<detail2::control_msg::FileInfoEntry> file_infos;
-		std::vector<detail2::TraversalEntry> traversed_entries;
-		while (auto entry_opt = traversal_queue.pop()) {
-			auto entry = std::move(*entry_opt);
-			if (entry.regular_file) {
-				if (!entry.meta.last_write_time.has_value()) {
-					detail2::populate_file_metadata(entry.meta);
-				}
-
-				detail2::control_msg::FileInfoEntry info;
-				info.relative_path = entry.meta.relative_path_in_tar;
-				info.size = entry.meta.size;
-				if (entry.meta.last_write_time) {
-					info.mtime_sec = entry.meta.last_write_time->seconds;
-					info.mtime_nsec = entry.meta.last_write_time->nanoseconds;
-				}
-				file_infos.push_back(info);
-			}
-			traversed_entries.push_back(std::move(entry));
-		}
-
-		// Phase 3: 发送文件信息到接收端，按原顺序筛回需要继续打开的条目。
-		std::unordered_set<std::string> diff_paths;
-		if (!file_infos.empty()) {
-			auto batch_json = detail2::control_msg::serialize_file_info_batch(
-				detail2::control_msg::kTypeFileInfoBatch, file_infos);
-			sink.send_control_message(batch_json);
-			sink.flush_control_buffer();
-
-			auto response_json = sink.await_control_response();
-			auto diff_entries = detail2::control_msg::deserialize_file_info_batch(response_json);
-
-			for (auto& diff : diff_entries) {
-				diff_paths.insert(diff.relative_path);
-			}
-		}
-
-		std::size_t next_filtered_sequence = 0;
-		for (auto& entry : traversed_entries) {
-			const bool should_forward = !entry.regular_file
-				|| diff_paths.contains(entry.meta.relative_path_in_tar);
-			if (!should_forward) {
-				continue;
-			}
-
-			entry.sequence = next_filtered_sequence++;
-			filtered_traversal_queue.push(std::move(entry));
-		}
-
-		filtered_traversal_queue.close();
-
-		// Phase 4: 启动下游流水线
-		open_future = asio::co_spawn(
-			executors.executor(),
-			opener.open(filtered_traversal_queue, opened_queue),
-			asio::use_future);
-		prefetch_future = asio::co_spawn(
-			executors.executor(),
-			prefetcher.prefetch(opened_queue, prefetched_queue),
-			asio::use_future);
-	} else {
-		// ================================================================
-		// 直连模式：FileTraverser → FileOpener 直接连接（原有行为）
-		// ================================================================
-		traverse_future = asio::co_spawn(
-			executors.executor(),
-			traverser.traverse(source_paths, traversal_queue),
-			asio::use_future);
-		open_future = asio::co_spawn(
-			executors.executor(),
-			opener.open(traversal_queue, opened_queue),
-			asio::use_future);
-		prefetch_future = asio::co_spawn(
-			executors.executor(),
-			prefetcher.prefetch(opened_queue, prefetched_queue),
-			asio::use_future);
-	}
-
 	std::jthread sender_thread([&] {
 		PipelineGuard guard;
 		guard.watch(traversal_queue);
@@ -328,6 +235,97 @@ void send_paths_to_socket(
 			state.fail(std::current_exception());
 		}
 	});
+
+	if (enable_file_comparison) {
+		// ================================================================
+		// 文件比较模式：FileTraverser → 控制通道交换 → FileOpener
+		// ================================================================
+
+		open_future = asio::co_spawn(
+			executors.executor(),
+			opener.open(filtered_traversal_queue, opened_queue),
+			asio::use_future);
+		prefetch_future = asio::co_spawn(
+			executors.executor(),
+			prefetcher.prefetch(opened_queue, prefetched_queue),
+			asio::use_future);
+
+		// Phase 1: 遍历目录，收集所有 TraversalEntry
+		traverse_future = asio::co_spawn(
+			executors.executor(),
+			traverser.traverse(source_paths, traversal_queue),
+			asio::use_future);
+
+		// Phase 2: 收集遍历结果，并提取 regular file 的比较信息
+		std::vector<detail2::control_msg::FileInfoEntry> file_infos;
+		std::vector<detail2::TraversalEntry> traversed_entries;
+		while (auto entry_opt = traversal_queue.pop()) {
+			auto entry = std::move(*entry_opt);
+			if (entry.regular_file) {
+				if (!entry.meta.last_write_time.has_value()) {
+					detail2::populate_file_metadata(entry.meta);
+				}
+
+				detail2::control_msg::FileInfoEntry info;
+				info.relative_path = entry.meta.relative_path_in_tar;
+				info.size = entry.meta.size;
+				if (entry.meta.last_write_time) {
+					info.mtime_sec = entry.meta.last_write_time->seconds;
+					info.mtime_nsec = entry.meta.last_write_time->nanoseconds;
+				}
+				file_infos.push_back(info);
+			}
+			traversed_entries.push_back(std::move(entry));
+		}
+		traverse_future.get();
+		traverse_already_consumed = true;
+
+		// Phase 3: 发送文件信息到接收端，按原顺序筛回需要继续打开的条目。
+		std::unordered_set<std::string> diff_paths;
+		if (!file_infos.empty()) {
+			auto batch_json = detail2::control_msg::serialize_file_info_batch(
+				detail2::control_msg::kTypeFileInfoBatch, file_infos);
+			sink.send_control_message(batch_json);
+			sink.flush_control_buffer();
+
+			auto response_json = sink.await_control_response();
+			auto diff_entries = detail2::control_msg::deserialize_file_info_batch(response_json);
+
+			for (auto& diff : diff_entries) {
+				diff_paths.insert(diff.relative_path);
+			}
+		}
+
+		std::size_t next_filtered_sequence = 0;
+		for (auto& entry : traversed_entries) {
+			const bool should_forward = !entry.regular_file
+				|| diff_paths.contains(entry.meta.relative_path_in_tar);
+			if (!should_forward) {
+				continue;
+			}
+
+			entry.sequence = next_filtered_sequence++;
+			filtered_traversal_queue.push(std::move(entry));
+		}
+
+		filtered_traversal_queue.close();
+	} else {
+		// ================================================================
+		// 直连模式：FileTraverser → FileOpener 直接连接（原有行为）
+		// ================================================================
+		traverse_future = asio::co_spawn(
+			executors.executor(),
+			traverser.traverse(source_paths, traversal_queue),
+			asio::use_future);
+		open_future = asio::co_spawn(
+			executors.executor(),
+			opener.open(traversal_queue, opened_queue),
+			asio::use_future);
+		prefetch_future = asio::co_spawn(
+			executors.executor(),
+			prefetcher.prefetch(opened_queue, prefetched_queue),
+			asio::use_future);
+	}
 
 	try {
 		if (!traverse_already_consumed) {
@@ -490,6 +488,7 @@ private:
 				bool receiver_connected = true;
 				while (receiver_connected && !stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
 					std::vector<std::filesystem::path> source_paths;
+					bool enable_file_comparison = false;
 					{
 						std::unique_lock lock(mutex_);
 						const bool has_pending_paths = cv_.wait_for(lock, std::chrono::milliseconds(500), [&] {
@@ -502,6 +501,7 @@ private:
 						if (has_pending_paths) {
 							source_paths = std::move(*pending_paths_);
 							pending_paths_.reset();
+							enable_file_comparison = enable_file_comparison_;
 							transfer_in_progress_ = true;
 						}
 					}
@@ -526,7 +526,7 @@ private:
 						if (progress_) {
 							progress_->reset({"sending", "正在发送"});
 						}
-						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_, enable_file_comparison_);
+						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_, enable_file_comparison);
 						if (progress_) {
 							progress_->set_completed({"send completed", "发送完成"});
 							progress_->set_status({"receiver connected, waiting for drop", "接收端已连接，等待拖放"});
