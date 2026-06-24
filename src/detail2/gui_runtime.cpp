@@ -2,6 +2,7 @@
 
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "protocol.hpp"
 #include "stream.hpp"
 #include "tar.hpp"
 #include "zstd.hpp"
@@ -19,6 +20,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <sstream>
+#include <unordered_set>
 
 namespace asio = boost::asio;
 
@@ -144,11 +146,12 @@ void send_paths_to_socket(
 	SocketByteSink& sink,
 	RuntimeOptions options,
 	const std::shared_ptr<TransferProgress>& progress,
-	CancelEvent& cancel_event) {
+	CancelEvent& cancel_event,
+	bool enable_file_comparison = false) {
 	std::atomic<std::uint64_t> uncompressed_bytes_processed{0};
 	std::atomic<std::uint64_t> files_processed{0};
 
-	sink.send_transport_begin();
+	sink.send_transport_begin(enable_file_comparison);
 
 	auto tuning = detail2::make_pipeline_tuning(options);
 	const auto compression_level = options.compression_level.value_or(tuning.default_compression_level);
@@ -159,11 +162,13 @@ void send_paths_to_socket(
 	detail2::SemaphoreCor tar_budget(executors.executor(), tuning.tar_output_budget_bytes);
 	detail2::SemaphoreCor zstd_budget(executors.executor(), tuning.zstd_output_budget_bytes);
 	BoundedQueue<detail2::TraversalEntry> traversal_queue(tuning.opened_queue_capacity, executors.executor());
+	BoundedQueue<detail2::TraversalEntry> filtered_traversal_queue(tuning.opened_queue_capacity, executors.executor());
 	BoundedQueue<detail2::OpenedFile> opened_queue(tuning.opened_queue_capacity, executors.executor());
 	BoundedQueue<detail2::OpenedFile> prefetched_queue(tuning.prefetched_queue_capacity, executors.executor());
 	BoundedQueue<DataChunk> tar_queue(tuning.tar_queue_capacity, executors.executor());
 	BoundedQueue<DataChunk> zstd_queue(tuning.zstd_queue_capacity, executors.executor());
 	traversal_queue.listenCancelSignal(cancel_event);
+	filtered_traversal_queue.listenCancelSignal(cancel_event);
 	opened_queue.listenCancelSignal(cancel_event);
 	prefetched_queue.listenCancelSignal(cancel_event);
 	tar_queue.listenCancelSignal(cancel_event);
@@ -177,13 +182,108 @@ void send_paths_to_socket(
 	std::atomic<int> active_compression_level{compression_level};
 	auto progress_sync_thread = start_progress_sync_thread(progress, uncompressed_bytes_processed, files_processed);
 
-	auto traverse_future = asio::co_spawn(executors.executor(), traverser.traverse(source_paths, traversal_queue), asio::use_future);
-	auto open_future = asio::co_spawn(executors.executor(), opener.open(traversal_queue, opened_queue), asio::use_future);
-	auto prefetch_future = asio::co_spawn(executors.executor(), prefetcher.prefetch(opened_queue, prefetched_queue), asio::use_future);
+	std::future<void> traverse_future;
+	std::future<void> open_future;
+	std::future<void> prefetch_future;
+	bool traverse_already_consumed = false;
+
+	if (enable_file_comparison) {
+		// ================================================================
+		// 文件比较模式：FileTraverser → 控制通道交换 → FileOpener
+		// ================================================================
+
+		// Phase 1: 遍历目录，收集所有 TraversalEntry
+		traverse_future = asio::co_spawn(
+			executors.executor(),
+			traverser.traverse(source_paths, traversal_queue),
+			asio::use_future);
+		traverse_future.get();
+		traverse_already_consumed = true;
+		traversal_queue.close();
+
+		// Phase 2: 收集遍历结果，并提取 regular file 的比较信息
+		std::vector<detail2::control_msg::FileInfoEntry> file_infos;
+		std::vector<detail2::TraversalEntry> traversed_entries;
+		while (auto entry_opt = traversal_queue.pop()) {
+			auto entry = std::move(*entry_opt);
+			if (entry.regular_file) {
+				if (!entry.meta.last_write_time.has_value()) {
+					detail2::populate_file_metadata(entry.meta);
+				}
+
+				detail2::control_msg::FileInfoEntry info;
+				info.relative_path = entry.meta.relative_path_in_tar;
+				info.size = entry.meta.size;
+				if (entry.meta.last_write_time) {
+					info.mtime_sec = entry.meta.last_write_time->seconds;
+					info.mtime_nsec = entry.meta.last_write_time->nanoseconds;
+				}
+				file_infos.push_back(info);
+			}
+			traversed_entries.push_back(std::move(entry));
+		}
+
+		// Phase 3: 发送文件信息到接收端，按原顺序筛回需要继续打开的条目。
+		std::unordered_set<std::string> diff_paths;
+		if (!file_infos.empty()) {
+			auto batch_json = detail2::control_msg::serialize_file_info_batch(
+				detail2::control_msg::kTypeFileInfoBatch, file_infos);
+			sink.send_control_message(batch_json);
+			sink.flush_control_buffer();
+
+			auto response_json = sink.await_control_response();
+			auto diff_entries = detail2::control_msg::deserialize_file_info_batch(response_json);
+
+			for (auto& diff : diff_entries) {
+				diff_paths.insert(diff.relative_path);
+			}
+		}
+
+		std::size_t next_filtered_sequence = 0;
+		for (auto& entry : traversed_entries) {
+			const bool should_forward = !entry.regular_file
+				|| diff_paths.contains(entry.meta.relative_path_in_tar);
+			if (!should_forward) {
+				continue;
+			}
+
+			entry.sequence = next_filtered_sequence++;
+			filtered_traversal_queue.push(std::move(entry));
+		}
+
+		filtered_traversal_queue.close();
+
+		// Phase 4: 启动下游流水线
+		open_future = asio::co_spawn(
+			executors.executor(),
+			opener.open(filtered_traversal_queue, opened_queue),
+			asio::use_future);
+		prefetch_future = asio::co_spawn(
+			executors.executor(),
+			prefetcher.prefetch(opened_queue, prefetched_queue),
+			asio::use_future);
+	} else {
+		// ================================================================
+		// 直连模式：FileTraverser → FileOpener 直接连接（原有行为）
+		// ================================================================
+		traverse_future = asio::co_spawn(
+			executors.executor(),
+			traverser.traverse(source_paths, traversal_queue),
+			asio::use_future);
+		open_future = asio::co_spawn(
+			executors.executor(),
+			opener.open(traversal_queue, opened_queue),
+			asio::use_future);
+		prefetch_future = asio::co_spawn(
+			executors.executor(),
+			prefetcher.prefetch(opened_queue, prefetched_queue),
+			asio::use_future);
+	}
 
 	std::jthread sender_thread([&] {
 		PipelineGuard guard;
 		guard.watch(traversal_queue);
+		guard.watch(filtered_traversal_queue);
 		guard.watch(opened_queue);
 		guard.watch(prefetched_queue);
 		guard.watch(tar_queue);
@@ -230,13 +330,16 @@ void send_paths_to_socket(
 	});
 
 	try {
-		traverse_future.get();
+		if (!traverse_already_consumed) {
+			traverse_future.get();
+		}
 		open_future.get();
 		prefetch_future.get();
 	} catch (...) {
 		state.fail(std::current_exception());
 		PipelineGuard guard;
 		guard.watch(traversal_queue);
+		guard.watch(filtered_traversal_queue);
 		guard.watch(opened_queue);
 		guard.watch(prefetched_queue);
 		guard.watch(tar_queue);
@@ -268,6 +371,16 @@ public:
 
 	~State() {
 		stop();
+	}
+
+	void set_file_comparison(bool enabled) {
+		std::lock_guard lock(mutex_);
+		enable_file_comparison_ = enabled;
+	}
+
+	bool file_comparison() const {
+		std::lock_guard lock(mutex_);
+		return enable_file_comparison_;
 	}
 
 	void start() {
@@ -413,7 +526,7 @@ private:
 						if (progress_) {
 							progress_->reset({"sending", "正在发送"});
 						}
-						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_);
+						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_, enable_file_comparison_);
 						if (progress_) {
 							progress_->set_completed({"send completed", "发送完成"});
 							progress_->set_status({"receiver connected, waiting for drop", "接收端已连接，等待拖放"});
@@ -496,6 +609,7 @@ private:
 	bool receiver_connected_ = false;
 	bool transfer_in_progress_ = false;
 	std::uint16_t bound_port_ = 0;
+	bool enable_file_comparison_ = false;
 };
 
 GuiSendServer::GuiSendServer(const std::shared_ptr<TransferProgress>& progress, RuntimeOptions options, std::function<void()> on_state_changed)
@@ -517,6 +631,14 @@ std::optional<std::string> GuiSendServer::submit_paths(std::vector<std::filesyst
 
 GuiSendServerSnapshot GuiSendServer::snapshot() const {
 	return state_->snapshot();
+}
+
+void GuiSendServer::set_file_comparison(bool enabled) {
+	state_->set_file_comparison(enabled);
+}
+
+bool GuiSendServer::file_comparison() const {
+	return state_->file_comparison();
 }
 
 } // namespace soratransport

@@ -28,6 +28,9 @@ public:
 	std::optional<std::string> submit_paths(std::vector<std::filesystem::path> paths);
 	GuiSendServerSnapshot snapshot() const;
 
+	void set_file_comparison(bool enabled);
+	bool file_comparison() const;
+
 private:
 	class State;
 	std::unique_ptr<State> state_;

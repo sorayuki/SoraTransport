@@ -5,6 +5,7 @@
 #include <FL/Fl.H>
 #include <FL/Fl_Box.H>
 #include <FL/Fl_Button.H>
+#include <FL/Fl_Check_Button.H>
 #include <FL/Fl_Choice.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Group.H>
@@ -399,30 +400,33 @@ public:
 
 private:
 	void build_send_tab() {
-		send_group_ = new Fl_Group(22, 96, 936, 224, "发送");
+		send_group_ = new Fl_Group(22, 96, 936, 250, "发送");
 		send_intro_box_ = new Fl_Box(38, 124, 900, 24, "先选择并复制下方链接给接收端。接收端连入后，这里会切换成拖放框。");
 		send_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 		send_intro_box_->labelsize(15);
-		send_address_title_box_ = new Fl_Box(38, 160, 900, 24, "选择发送链接");
+		file_compare_check_ = new Fl_Check_Button(38, 152, 280, 24, "启用文件比较（仅传输有差异的文件）");
+		file_compare_check_->labelsize(14);
+		file_compare_check_->callback(file_compare_callback, this);
+		send_address_title_box_ = new Fl_Box(38, 184, 900, 24, "选择发送链接");
 		send_address_title_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 		send_address_title_box_->labelfont(FL_HELVETICA_BOLD);
 		send_address_title_box_->labelsize(16);
-		send_address_choice_ = new Fl_Choice(38, 194, 742, 36);
+		send_address_choice_ = new Fl_Choice(38, 216, 742, 36);
 		send_address_choice_->textsize(15);
 		send_address_choice_->down_box(FL_BORDER_BOX);
-		copy_address_button_ = new Fl_Button(796, 194, 142, 36, "复制链接");
+		copy_address_button_ = new Fl_Button(796, 216, 142, 36, "复制链接");
 		copy_address_button_->color(fl_rgb_color(233, 226, 214));
 		copy_address_button_->selection_color(fl_rgb_color(212, 169, 92));
-		send_empty_box_ = new Fl_Box(38, 244, 900, 56, "正在准备发送地址...");
+		send_empty_box_ = new Fl_Box(38, 266, 900, 56, "正在准备发送地址...");
 		send_empty_box_->align(FL_ALIGN_LEFT | FL_ALIGN_WRAP | FL_ALIGN_INSIDE);
 		send_empty_box_->labelsize(14);
-		drop_target_ = new DropTargetBox(38, 194, 900, 106);
+		drop_target_ = new DropTargetBox(38, 216, 900, 106);
 		drop_target_->hide();
 		send_group_->end();
 	}
 
 	void build_receive_tab() {
-		receive_group_ = new Fl_Group(22, 96, 936, 224, "接收");
+		receive_group_ = new Fl_Group(22, 96, 936, 250, "接收");
 		receive_intro_box_ = new Fl_Box(38, 124, 900, 24, "输入发送者链接后连接；接收到的数据会保存到当前工作目录。");
 		receive_intro_box_->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 		receive_intro_box_->labelsize(15);
@@ -475,6 +479,12 @@ private:
 		}
 		write_clipboard_text(*selected_url);
 		self->set_transient_status("链接已复制到剪贴板");
+	}
+
+	static void file_compare_callback(Fl_Widget* widget, void* context) {
+		auto* self = static_cast<AppWindow*>(context);
+		auto* check = static_cast<Fl_Check_Button*>(widget);
+		self->send_server_.set_file_comparison(check->value() != 0);
 	}
 
 	static void connect_callback(Fl_Widget*, void* context) {
@@ -659,6 +669,7 @@ private:
 
 	void update_send_controls(const GuiSendServerSnapshot& snapshot) {
 		if (snapshot.receiver_connected) {
+			file_compare_check_->hide();
 			send_address_title_box_->hide();
 			send_address_choice_->hide();
 			copy_address_button_->hide();
@@ -675,6 +686,7 @@ private:
 		}
 
 		drop_target_->hide();
+		file_compare_check_->show();
 		send_address_title_box_->show();
 		if (snapshot.bound_port == 0) {
 			send_address_choice_->hide();
@@ -838,6 +850,7 @@ private:
 	Fl_Group* send_group_ = nullptr;
 	Fl_Group* receive_group_ = nullptr;
 	Fl_Box* send_intro_box_ = nullptr;
+	Fl_Check_Button* file_compare_check_ = nullptr;
 	Fl_Box* send_address_title_box_ = nullptr;
 	Fl_Choice* send_address_choice_ = nullptr;
 	Fl_Button* copy_address_button_ = nullptr;
