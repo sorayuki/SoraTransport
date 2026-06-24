@@ -505,7 +505,9 @@ private:
 							transfer_in_progress_ = true;
 						}
 					}
-					notify_state_changed();
+					if (!source_paths.empty()) {
+						notify_state_changed();
+					}
 
 					if (!receiver_connected) {
 						break;

@@ -354,7 +354,7 @@ public:
 
 		update_ui();
 		Fl::awake(awake_callback, this);
-		Fl::add_timeout(0.25, timer_callback, this);
+		maybe_start_ui_timer();
 	}
 
 	~AppWindow() override {
@@ -450,24 +450,29 @@ private:
 
 	static void awake_callback(void* context) {
 		auto* self = static_cast<AppWindow*>(context);
+		const bool receive_finished = self->receive_session_finished_.load(std::memory_order_acquire) && self->receive_thread_.joinable();
 		self->cleanup_finished_receive_session();
 		self->maybe_finish_close_request();
-		if (self->send_state_dirty_.exchange(false, std::memory_order_acq_rel)) {
-			self->update_static_ui();
+		if (self->send_state_dirty_.exchange(false, std::memory_order_acq_rel) || receive_finished) {
+			self->update_ui();
 		}
+		self->maybe_start_ui_timer();
 	}
 
 	static void timer_callback(void* context) {
 		auto* self = static_cast<AppWindow*>(context);
+		self->ui_timer_active_ = false;
 		if (self->send_state_dirty_.exchange(false, std::memory_order_acq_rel)) {
 			self->update_static_ui();
 		}
 		self->update_dynamic_ui();
-		Fl::repeat_timeout(0.25, timer_callback, context);
+		self->maybe_start_ui_timer();
 	}
 
 	static void tabs_changed_callback(Fl_Widget*, void* context) {
-		static_cast<AppWindow*>(context)->update_ui();
+		auto* self = static_cast<AppWindow*>(context);
+		self->update_ui();
+		self->maybe_start_ui_timer();
 	}
 
 	static void copy_address_callback(Fl_Widget*, void* context) {
@@ -495,6 +500,7 @@ private:
 		transient_status_ = std::move(status);
 		transient_status_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 		update_ui();
+		maybe_start_ui_timer();
 	}
 
 	void cleanup_finished_receive_session() {
@@ -560,6 +566,7 @@ private:
 				Fl::awake();
 			});
 			update_ui();
+			maybe_start_ui_timer();
 		} catch (const std::exception& error) {
 			receive_progress_->set_failed({error.what(), error.what()});
 			receive_session_finished_.store(true, std::memory_order_release);
@@ -600,6 +607,7 @@ private:
 		close_requested_ = true;
 		stop_receive_session(false);
 		update_static_ui();
+		maybe_start_ui_timer();
 		if (receive_thread_.joinable()) {
 			set_transient_status("正在停止接收，请稍候");
 			return;
@@ -826,6 +834,25 @@ private:
 		update_dynamic_ui();
 	}
 
+	bool should_run_ui_timer() const {
+		const auto send_snapshot = send_server_.snapshot();
+		if (send_snapshot.transfer_in_progress || is_receive_session_active()) {
+			return true;
+		}
+		if (!transient_status_.empty() && std::chrono::steady_clock::now() < transient_status_until_) {
+			return true;
+		}
+		return send_state_dirty_.load(std::memory_order_acquire);
+	}
+
+	void maybe_start_ui_timer() {
+		if (ui_timer_active_ || !should_run_ui_timer()) {
+			return;
+		}
+		ui_timer_active_ = true;
+		Fl::add_timeout(0.25, timer_callback, this);
+	}
+
 	std::filesystem::path current_dir_;
 	std::shared_ptr<TransferProgress> send_progress_;
 	std::shared_ptr<TransferProgress> receive_progress_;
@@ -841,6 +868,7 @@ private:
 	bool close_requested_ = false;
 	bool dnd_over_drop_target_ = false;
 	bool awaiting_drop_paste_ = false;
+	bool ui_timer_active_ = false;
 	std::atomic<bool> send_state_dirty_{false};
 	std::string transient_status_;
 	std::chrono::steady_clock::time_point transient_status_until_{};
