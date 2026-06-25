@@ -315,7 +315,7 @@ public:
 		  receive_progress_(std::make_shared<TransferProgress>()),
 		  send_server_(send_progress_, RuntimeOptions{}, [this] {
 			send_state_dirty_.store(true, std::memory_order_release);
-			Fl::awake();
+			notify_ui_async();
 		  }),
 		  receive_url_(std::move(clipboard_url)) {
 		begin();
@@ -364,7 +364,6 @@ public:
 		}
 
 		update_ui();
-		Fl::awake(awake_callback, this);
 		maybe_start_ui_timer();
 	}
 
@@ -580,7 +579,7 @@ private:
 				} catch (...) {
 				}
 				receive_session_finished_.store(true, std::memory_order_release);
-				Fl::awake();
+				notify_ui_async();
 			});
 			update_ui();
 			maybe_start_ui_timer();
@@ -854,6 +853,8 @@ private:
 
 		const bool receive_selected = tabs_->value() == receive_group_;
 		update_detail_box(send_snapshot, receive_selected);
+		send_group_->redraw();
+		redraw();
 	}
 
 	void update_dynamic_ui() {
@@ -893,6 +894,10 @@ private:
 		}
 		ui_timer_active_ = true;
 		Fl::add_timeout(0.25, timer_callback, this);
+	}
+
+	void notify_ui_async() {
+		Fl::awake(awake_callback, this);
 	}
 
 	std::filesystem::path current_dir_;
