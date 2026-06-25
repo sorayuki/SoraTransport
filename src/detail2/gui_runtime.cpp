@@ -419,11 +419,10 @@ private:
 				startup_complete_ = true;
 			}
 			startup_cv_.notify_all();
-			notify_state_changed();
-
 			if (progress_) {
 				progress_->set_status({"waiting for receiver", "等待接收端连接"});
 			}
+			notify_state_changed();
 
 			while (!stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
 				auto websocket = accept_websocket(io_context, acceptor, cancel_event_);
@@ -434,10 +433,10 @@ private:
 					receiver_connected_ = true;
 					transfer_in_progress_ = false;
 				}
-				notify_state_changed();
 				if (progress_) {
 					progress_->set_status({"receiver connected, waiting for drop", "接收端已连接，等待拖放"});
 				}
+				notify_state_changed();
 
 				bool receiver_connected = true;
 				while (receiver_connected && !stop_token.stop_requested() && !cancel_event_.is_cancelled()) {
@@ -460,6 +459,9 @@ private:
 						}
 					}
 					if (!source_paths.empty()) {
+						if (progress_) {
+							progress_->reset({"sending", "正在发送"});
+						}
 						notify_state_changed();
 					}
 
@@ -479,9 +481,6 @@ private:
 					}
 
 					try {
-						if (progress_) {
-							progress_->reset({"sending", "正在发送"});
-						}
 						send_paths_to_socket(source_paths, sink, options_, progress_, cancel_event_, enable_file_comparison);
 						if (progress_) {
 							progress_->set_completed({"send completed", "发送完成"});
@@ -513,6 +512,9 @@ private:
 				}
 
 				sink.close_socket();
+				if (!stop_token.stop_requested() && !cancel_event_.is_cancelled() && progress_) {
+					progress_->set_status({"waiting for receiver", "等待接收端连接"});
+				}
 				{
 					std::lock_guard lock(mutex_);
 					receiver_connected_ = false;
@@ -520,10 +522,6 @@ private:
 					pending_paths_.reset();
 				}
 				notify_state_changed();
-
-				if (!stop_token.stop_requested() && !cancel_event_.is_cancelled() && progress_) {
-					progress_->set_status({"waiting for receiver", "等待接收端连接"});
-				}
 			}
 		} catch (...) {
 			{
