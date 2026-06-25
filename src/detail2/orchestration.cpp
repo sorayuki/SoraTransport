@@ -1,6 +1,7 @@
 #include "../core.hpp"
 
 #include "config.hpp"
+#include "file_compare_stream.hpp"
 #include "filesystem.hpp"
 #include "protocol.hpp"
 #include "stream.hpp"
@@ -32,7 +33,6 @@
 #include <mutex>
 #include <sstream>
 #include <stop_token>
-#include <unordered_set>
 #include <vector>
 
 namespace asio = boost::asio;
@@ -512,7 +512,7 @@ asio::awaitable<void> listen_directory_task(
 
 		if (enable_file_comparison) {
 			// ================================================================
-			// 文件比较模式：FileTraverser → 控制通道交换 → FileOpener
+			// 文件比较模式：FileTraverser → 流式控制通道交换 → FileOpener
 			// ================================================================
 
 			open_future = asio::co_spawn(
@@ -530,60 +530,13 @@ asio::awaitable<void> listen_directory_task(
 				traverser.traverse(source_dir, traversal_queue),
 				asio::use_future);
 
-			// Phase 2: 收集遍历结果，并提取 regular file 的比较信息
-			std::vector<detail2::control_msg::FileInfoEntry> file_infos;
-			std::vector<detail2::TraversalEntry> traversed_entries;
-			while (auto entry_opt = traversal_queue.pop()) {
-				auto entry = std::move(*entry_opt);
-				if (entry.regular_file) {
-					if (!entry.meta.last_write_time.has_value()) {
-						detail2::populate_file_metadata(entry.meta);
-					}
-
-					detail2::control_msg::FileInfoEntry info;
-					info.relative_path = entry.meta.relative_path_in_tar;
-					info.size = entry.meta.size;
-					if (entry.meta.last_write_time) {
-						info.mtime_sec = entry.meta.last_write_time->seconds;
-						info.mtime_nsec = entry.meta.last_write_time->nanoseconds;
-					}
-					file_infos.push_back(info);
-				}
-				traversed_entries.push_back(std::move(entry));
-			}
+			detail2::stream_file_comparison_to_opener(
+				traversal_queue,
+				filtered_traversal_queue,
+				sink,
+				cancel_event);
 			traverse_future.get();
 			traverse_already_consumed = true;
-
-			// Phase 3: 发送文件信息到接收端，按原顺序筛回需要继续打开的条目。
-			// FileOpener 的顺序重排要求 sequence 连续，因此这里必须重编号。
-			std::unordered_set<std::string> diff_paths;
-			if (!file_infos.empty()) {
-				auto batch_json = detail2::control_msg::serialize_file_info_batch(
-					detail2::control_msg::kTypeFileInfoBatch, file_infos);
-				sink.send_control_message(batch_json);
-				sink.flush_control_buffer();
-
-				auto response_json = sink.await_control_response();
-				auto diff_entries = detail2::control_msg::deserialize_file_info_batch(response_json);
-
-				for (auto& diff : diff_entries) {
-					diff_paths.insert(diff.relative_path);
-				}
-			}
-
-			std::size_t next_filtered_sequence = 0;
-			for (auto& entry : traversed_entries) {
-				const bool should_forward = !entry.regular_file
-					|| diff_paths.contains(entry.meta.relative_path_in_tar);
-				if (!should_forward) {
-					continue;
-				}
-
-				entry.sequence = next_filtered_sequence++;
-				filtered_traversal_queue.push(std::move(entry));
-			}
-
-			filtered_traversal_queue.close();
 		} else {
 			// ================================================================
 			// 直连模式：FileTraverser → FileOpener 直接连接（原有行为）
@@ -681,63 +634,19 @@ asio::awaitable<void> receive_directory_task(
 			// ================================================================
 			// 文件比较交换（如果发送端启用了 file_comparison）
 			// ================================================================
+			std::unique_ptr<detail2::TaskExecutor> compare_executor;
 			if (source.transport_has_file_comparison()) {
-				std::cerr << "file comparison enabled, waiting for file info batch...\n";
-				std::string control_json;
-				if (!source.await_control_message(control_json)) {
-					throw std::runtime_error("connection closed while waiting for file info batch");
-				}
-
-				auto file_infos = detail2::control_msg::deserialize_file_info_batch(control_json);
-				std::cerr << "received file info batch: " << file_infos.size() << " files\n";
-
-				// 使用线程池并发对比本地文件
+				std::cerr << "file comparison enabled, processing streamed file info...\n";
 				auto tuning = detail2::make_pipeline_tuning();
-				detail2::TaskExecutor compare_executor(tuning.worker_threads);
-
-				// 分批提交到线程池（每批最多 64 个文件，控制堆积）
-				constexpr std::size_t kCompareBatchSize = 64;
-				std::vector<std::future<bool>> compare_futures;
-				compare_futures.reserve(file_infos.size());
-
-				for (std::size_t batch_start = 0; batch_start < file_infos.size(); batch_start += kCompareBatchSize) {
-					const auto batch_end = std::min(batch_start + kCompareBatchSize, file_infos.size());
-
-					// 提交当前批次
-					for (std::size_t i = batch_start; i < batch_end; ++i) {
-						const auto info = file_infos[i];
-						compare_futures.push_back(compare_executor.submit(
-							[&dest = destination_dir, info]() -> bool {
-								return detail2::file_differs_from_local(
-									dest,
-									info.relative_path,
-									info.size,
-									info.mtime_sec,
-									info.mtime_nsec);
-							}));
-					}
-
-					// 等待当前批次完成再提交下一批（控制线程池堆积）
-					for (std::size_t i = batch_start; i < batch_end; ++i) {
-						compare_futures[i].wait();
-					}
-				}
-
-				// 收集差异文件（保持原顺序）
-				std::vector<detail2::control_msg::FileInfoEntry> diff_files;
-				for (std::size_t i = 0; i < file_infos.size(); ++i) {
-					if (compare_futures[i].get()) {
-						diff_files.push_back(file_infos[i]);
-					}
-				}
-
-				std::cerr << "file comparison done: " << diff_files.size()
-				          << " / " << file_infos.size() << " files differ\n";
-
-				// 发送差异列表回发送端
-				auto diff_json = detail2::control_msg::serialize_file_info_batch(
-					detail2::control_msg::kTypeFileInfoDiff, diff_files);
-				source.send_control_message(diff_json);
+				compare_executor = std::make_unique<detail2::TaskExecutor>(tuning.worker_threads);
+				source.set_data_control_message_handler(
+					[&source, &destination_dir, executor = compare_executor.get()](std::string_view control_json) {
+						detail2::handle_file_comparison_control_message(
+							control_json,
+							destination_dir,
+							source,
+							*executor);
+					});
 			}
 
 			if (progress) {
@@ -745,6 +654,7 @@ asio::awaitable<void> receive_directory_task(
 			}
 			std::cerr << "transport started, receiving...\n";
 			receive_transport_from_source(source, destination_dir, progress, cancel_event);
+			source.set_data_control_message_handler({});
 			received_any_transport = true;
 			complete_progress(progress, false, false, {"receive completed", "接收完成"});
 			if (!keep_connection_open) {

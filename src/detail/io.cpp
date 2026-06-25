@@ -15,6 +15,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -33,6 +35,7 @@ constexpr auto kSocketKeepaliveIdleInterval = std::chrono::seconds(15);
 constexpr auto kSocketKeepalivePollInterval = std::chrono::seconds(5);
 constexpr std::string_view kTransportBeginEvent = "transport_begin";
 constexpr std::string_view kTransportEndEvent = "transport_end";
+constexpr std::size_t kControlMessageLengthSize = 4;
 
 std::runtime_error make_socket_error(std::string_view action, const boost::system::error_code& error) {
 	if (error.category() == boost::system::system_category()) {
@@ -89,6 +92,48 @@ std::string make_transport_event_payload(std::string_view event_id) {
 		{"event_id", event_id},
 	};
 	return payload.dump();
+}
+
+void append_control_message_record(std::vector<uint8_t>& out, std::string_view json_payload) {
+	if (json_payload.size() > std::numeric_limits<std::uint32_t>::max()) {
+		throw std::runtime_error("control message is too large");
+	}
+	const auto size = static_cast<std::uint32_t>(json_payload.size());
+	out.push_back(static_cast<uint8_t>((size >> 24) & 0xff));
+	out.push_back(static_cast<uint8_t>((size >> 16) & 0xff));
+	out.push_back(static_cast<uint8_t>((size >> 8) & 0xff));
+	out.push_back(static_cast<uint8_t>(size & 0xff));
+	out.insert(out.end(), json_payload.begin(), json_payload.end());
+}
+
+std::vector<std::string> decode_control_messages(std::span<const uint8_t> payload) {
+	if (payload.empty()) {
+		return {};
+	}
+
+	std::vector<std::string> messages;
+	std::size_t offset = 0;
+	while (offset < payload.size()) {
+		if (payload.size() - offset < kControlMessageLengthSize) {
+			return {std::string(reinterpret_cast<const char*>(payload.data()), payload.size())};
+		}
+
+		const auto message_size =
+			(static_cast<std::uint32_t>(payload[offset]) << 24)
+			| (static_cast<std::uint32_t>(payload[offset + 1]) << 16)
+			| (static_cast<std::uint32_t>(payload[offset + 2]) << 8)
+			| static_cast<std::uint32_t>(payload[offset + 3]);
+		offset += kControlMessageLengthSize;
+		if (message_size == 0 || message_size > payload.size() - offset) {
+			return {std::string(reinterpret_cast<const char*>(payload.data()), payload.size())};
+		}
+
+		messages.emplace_back(
+			reinterpret_cast<const char*>(payload.data() + offset),
+			message_size);
+		offset += message_size;
+	}
+	return messages;
 }
 
 std::string parse_transport_event_payload(std::string_view payload_text) {
@@ -772,6 +817,7 @@ struct SocketByteSink::State {
 		if (transport_active) {
 			throw std::runtime_error("transport has already begun");
 		}
+		std::scoped_lock send_lock(send_mutex);
 		flush_data_buffer();
 		control_writer->flush();
 
@@ -795,6 +841,8 @@ struct SocketByteSink::State {
 			throw std::runtime_error("transport has not begun");
 		}
 
+		std::scoped_lock send_lock(send_mutex);
+		control_writer->flush();
 		std::size_t offset = 0;
 		while (offset < bytes.size()) {
 			const auto available = data_buffer.size() - data_buffered_size;
@@ -824,6 +872,7 @@ struct SocketByteSink::State {
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
+		std::scoped_lock send_lock(send_mutex);
 		flush_data_buffer();
 		control_writer->flush();
 	}
@@ -836,6 +885,7 @@ struct SocketByteSink::State {
 		if (!transport_active) {
 			throw std::runtime_error("transport has not begun");
 		}
+		std::scoped_lock send_lock(send_mutex);
 		flush_data_buffer();
 		control_writer->flush();
 		do_send_control_frame(make_string_span(make_transport_event_payload(kTransportEndEvent)));
@@ -847,9 +897,20 @@ struct SocketByteSink::State {
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
+		std::scoped_lock send_lock(send_mutex);
 		flush_data_buffer();
-		control_writer->flush();
-		do_send_control_frame(make_string_span(json_payload));
+		std::vector<uint8_t> record;
+		record.reserve(kControlMessageLengthSize + json_payload.size());
+		append_control_message_record(record, json_payload);
+		if (record.size() > kControlBufferCapacity) {
+			control_writer->flush();
+			do_send_control_frame(record);
+			return;
+		}
+		if (control_writer->buffered_size() + record.size() > kControlBufferCapacity) {
+			control_writer->flush();
+		}
+		control_writer->write(record);
 	}
 
 	void flush_control_buffer() {
@@ -857,6 +918,7 @@ struct SocketByteSink::State {
 		if (cancel_requested.load(std::memory_order_relaxed)) {
 			throw CancelledError("socket send cancelled");
 		}
+		std::scoped_lock send_lock(send_mutex);
 		control_writer->flush();
 	}
 
@@ -1036,9 +1098,11 @@ struct SocketByteSink::State {
 	bool transport_active = false;
 	const bool keepalive_enabled = false;
 	std::unique_ptr<detail2::WriteBuffer> control_writer;
+	std::deque<std::string> pending_control_responses;
 	std::jthread keepalive_thread;
 	mutable std::mutex async_error_mutex;
 	std::exception_ptr async_error;
+	std::mutex send_mutex;
 	std::mutex operation_mutex;
 	std::mutex keepalive_mutex;
 	std::condition_variable keepalive_cv;
@@ -1099,6 +1163,12 @@ std::string SocketByteSink::await_control_response() {
 	if (!state_) {
 		throw std::runtime_error("socket sink is closed");
 	}
+	if (!state_->pending_control_responses.empty()) {
+		auto response = std::move(state_->pending_control_responses.front());
+		state_->pending_control_responses.pop_front();
+		return response;
+	}
+
 	// 复用 SocketByteSource 的帧读取逻辑来读一条控制帧
 	detail2::TransportFrameHeader header;
 	std::vector<uint8_t> payload;
@@ -1106,7 +1176,10 @@ std::string SocketByteSink::await_control_response() {
 	boost::beast::flat_buffer input_buffer;
 	input_buffer.reserve(kSocketIoBufferSize);
 	boost::system::error_code error;
-	state_->websocket.read(input_buffer, error);
+	{
+		std::scoped_lock lock(state_->operation_mutex);
+		state_->websocket.read(input_buffer, error);
+	}
 	if (error == boost::beast::websocket::error::closed) {
 		throw std::runtime_error("websocket closed while awaiting control response");
 	}
@@ -1134,9 +1207,17 @@ std::string SocketByteSink::await_control_response() {
 		throw std::runtime_error("expected control frame but received data frame");
 	}
 
-	return std::string(
-		reinterpret_cast<const char*>(raw_frame.data() + detail2::TransportFrameHeader::kSerializedSize),
-		header.payload_size);
+	payload.assign(
+		raw_frame.begin() + detail2::TransportFrameHeader::kSerializedSize,
+		raw_frame.end());
+	auto messages = decode_control_messages(payload);
+	if (messages.empty()) {
+		return {};
+	}
+	for (std::size_t i = 1; i < messages.size(); ++i) {
+		state_->pending_control_responses.push_back(std::move(messages[i]));
+	}
+	return std::move(messages.front());
 }
 
 void SocketByteSink::check_connection() {
@@ -1222,6 +1303,12 @@ struct SocketByteSource::State {
 		}
 
 		for (;;) {
+			if (!pending_control_messages.empty()) {
+				json_out = std::move(pending_control_messages.front());
+				pending_control_messages.pop_front();
+				return true;
+			}
+
 			detail2::TransportFrameHeader header;
 			std::vector<uint8_t> payload;
 			if (!read_next_frame(header, payload)) {
@@ -1231,7 +1318,17 @@ struct SocketByteSource::State {
 				throw std::runtime_error("received unexpected data frame while awaiting control message");
 			}
 
-			auto payload_text = std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size());
+			auto messages = decode_control_messages(payload);
+			if (messages.empty()) {
+				continue;
+			}
+			if (messages.size() > 1) {
+				for (std::size_t i = 1; i < messages.size(); ++i) {
+					pending_control_messages.push_back(std::move(messages[i]));
+				}
+			}
+
+			auto payload_text = std::string_view(messages.front().data(), messages.front().size());
 
 			// 先检查 type 字段，区分 event 类控制消息和普通控制消息
 			try {
@@ -1249,19 +1346,19 @@ struct SocketByteSource::State {
 					// 标准事件消息
 					auto event_id = parse_transport_event_payload(payload_text);
 					if (event_id == kTransportEndEvent) {
-						json_out = std::string(payload_text);
+						json_out = std::move(messages.front());
 						return true;
 					}
 					if (event_id == kTransportBeginEvent) {
 						throw std::runtime_error("received unexpected transport_begin");
 					}
 					// 其他事件消息也返回原始 JSON
-					json_out = std::string(payload_text);
+					json_out = std::move(messages.front());
 					return true;
 				}
 
 				// 非 event 类型的控制消息（如 file_info_batch, file_info_diff）
-				json_out = std::string(payload_text);
+				json_out = std::move(messages.front());
 				return true;
 			} catch (const std::runtime_error&) {
 				throw;
@@ -1309,14 +1406,45 @@ struct SocketByteSource::State {
 				throw std::runtime_error("websocket connection closed before transport_end");
 			}
 			if (header.channel == detail2::TransportFrameHeader::kControl) {
-				auto event_id = parse_transport_event_payload(
-					std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()));
-				if (event_id != kTransportEndEvent) {
-					throw std::runtime_error("unexpected control event while receiving data: " + event_id);
+				auto messages = decode_control_messages(payload);
+				bool saw_transport_end = false;
+				for (auto& message : messages) {
+					auto payload_text = std::string_view(message.data(), message.size());
+					try {
+						auto json = nlohmann::json::parse(payload_text);
+						if (json.is_object()) {
+							const auto type_it = json.find("type");
+							if (type_it != json.end() && type_it->is_string() && type_it->get<std::string>() == "event") {
+								const auto event_id = parse_transport_event_payload(payload_text);
+								if (event_id == kTransportEndEvent) {
+									saw_transport_end = true;
+									continue;
+								}
+								if (event_id == kTransportBeginEvent) {
+									throw std::runtime_error("received unexpected transport_begin while receiving data");
+								}
+								throw std::runtime_error("unexpected control event while receiving data: " + event_id);
+							}
+						}
+					} catch (const nlohmann::json::exception& error) {
+						throw std::runtime_error(std::string("failed to parse control frame while receiving data: ") + error.what());
+					}
+
+					if (!data_control_handler) {
+						throw std::runtime_error("unexpected control message while receiving data");
+					}
+					data_control_handler(payload_text);
 				}
-				transport_active = false;
-				transport_finished = true;
-				return copied_total;
+
+				if (saw_transport_end) {
+					if (messages.size() > 1) {
+						throw std::runtime_error("transport_end control frame contained additional messages");
+					}
+					transport_active = false;
+					transport_finished = true;
+					return copied_total;
+				}
+				continue;
 			}
 			// 数据帧：直接作为 active_message 供后续 read 消费
 			active_message = std::move(payload);
@@ -1389,6 +1517,8 @@ struct SocketByteSource::State {
 	TransportWebSocket websocket;
 	std::vector<uint8_t> active_message;
 	std::size_t active_offset = 0;
+	std::deque<std::string> pending_control_messages;
+	SocketByteSource::ControlMessageHandler data_control_handler;
 	bool transport_active = false;
 	bool transport_finished = false;
 	bool file_comparison_enabled = false;
@@ -1434,6 +1564,13 @@ bool SocketByteSource::await_control_message(std::string& json_out) {
 	return state_->await_control_message(json_out);
 }
 
+void SocketByteSource::set_data_control_message_handler(ControlMessageHandler handler) {
+	if (!state_) {
+		throw std::runtime_error("socket source is closed");
+	}
+	state_->data_control_handler = std::move(handler);
+}
+
 void SocketByteSource::send_control_message(std::string_view json_payload) {
 	if (!state_) {
 		throw std::runtime_error("socket source is closed");
@@ -1442,17 +1579,17 @@ void SocketByteSource::send_control_message(std::string_view json_payload) {
 		throw CancelledError("socket receive cancelled");
 	}
 
-	// 构建控制帧: [header(kControl)] + [JSON payload]
-	auto payload_bytes = std::span<const uint8_t>(
-		reinterpret_cast<const uint8_t*>(json_payload.data()), json_payload.size());
+	std::vector<uint8_t> control_payload;
+	control_payload.reserve(kControlMessageLengthSize + json_payload.size());
+	append_control_message_record(control_payload, json_payload);
 
 	std::vector<uint8_t> framed;
-	framed.reserve(detail2::TransportFrameHeader::kSerializedSize + payload_bytes.size());
+	framed.reserve(detail2::TransportFrameHeader::kSerializedSize + control_payload.size());
 	detail2::TransportFrameHeader::write_header(
 		framed,
 		detail2::TransportFrameHeader::kControl,
-		payload_bytes.size());
-	framed.insert(framed.end(), payload_bytes.begin(), payload_bytes.end());
+		control_payload.size());
+	framed.insert(framed.end(), control_payload.begin(), control_payload.end());
 
 	boost::system::error_code error;
 	state_->websocket.binary(true);

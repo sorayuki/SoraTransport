@@ -198,6 +198,7 @@ add_library(soratransport_core
 	src/core.hpp
 	src/detail2/buffered_sender.cpp
 	src/detail2/config.cpp
+	src/detail2/file_compare_stream.cpp
 	src/detail2/filesystem.cpp
 	src/detail2/infra.cpp
 	src/detail2/orchestration.cpp

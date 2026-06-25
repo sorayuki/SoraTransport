@@ -5,7 +5,9 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/websocket/stream.hpp>
 
+#include <functional>
 #include <span>
+#include <string_view>
 #include <windows.h>
 
 namespace soratransport {
@@ -130,6 +132,8 @@ private:
 
 class SocketByteSource final : public IByteSource {
 public:
+	using ControlMessageHandler = std::function<void(std::string_view)>;
+
 	explicit SocketByteSource(TransportWebSocket websocket);
 	~SocketByteSource() override;
 	SocketByteSource(const SocketByteSource&) = delete;
@@ -147,6 +151,9 @@ public:
 	// 控制通道消息接收
 	// 返回 false 表示连接关闭，true 表示成功读取一条控制消息
 	bool await_control_message(std::string& json_out);
+
+	// 数据读取期间遇到非 transport_end 的控制消息时调用。
+	void set_data_control_message_handler(ControlMessageHandler handler);
 
 	// 控制通道消息发送（用于接收端回传 file_info_diff 等响应）
 	void send_control_message(std::string_view json_payload);

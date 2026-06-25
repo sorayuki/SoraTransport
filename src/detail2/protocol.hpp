@@ -54,6 +54,7 @@ constexpr std::string_view kTypeTransportEnd   = "transport_end";
 // 新定义：文件信息批量交换
 constexpr std::string_view kTypeFileInfoBatch = "file_info_batch";  // 发送端 → 接收端
 constexpr std::string_view kTypeFileInfoDiff  = "file_info_diff";   // 接收端 → 发送端
+constexpr std::string_view kTypeFileInfoEnd   = "file_info_end";    // 文件信息流结束
 
 // 文件信息条目
 struct FileInfoEntry {
@@ -67,6 +68,12 @@ struct FileInfoEntry {
 std::string serialize_file_info_batch(
 	std::string_view msg_type,
 	const std::vector<FileInfoEntry>& files);
+
+// 序列化文件信息流结束消息
+std::string serialize_file_info_end();
+
+// 读取控制消息 type 字段
+std::string control_message_type(std::string_view json_text);
 
 // 反序列化 JSON 为 FileInfoEntry 列表
 std::vector<FileInfoEntry> deserialize_file_info_batch(std::string_view json_text);

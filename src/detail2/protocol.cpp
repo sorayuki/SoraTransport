@@ -80,6 +80,24 @@ std::string serialize_file_info_batch(
 	return payload.dump();
 }
 
+std::string serialize_file_info_end() {
+	nlohmann::json payload;
+	payload["type"] = kTypeFileInfoEnd;
+	return payload.dump();
+}
+
+std::string control_message_type(std::string_view json_text) {
+	auto payload = nlohmann::json::parse(json_text);
+	if (!payload.is_object()) {
+		throw std::runtime_error("control message must be a JSON object");
+	}
+	const auto type_it = payload.find("type");
+	if (type_it == payload.end() || !type_it->is_string()) {
+		throw std::runtime_error("control message missing 'type' field");
+	}
+	return type_it->get<std::string>();
+}
+
 std::vector<FileInfoEntry> deserialize_file_info_batch(std::string_view json_text) {
 	auto payload = nlohmann::json::parse(json_text);
 	if (!payload.is_object()) {
@@ -92,7 +110,7 @@ std::vector<FileInfoEntry> deserialize_file_info_batch(std::string_view json_tex
 	}
 	const auto msg_type = type_it->get<std::string>();
 	if (msg_type != kTypeFileInfoBatch && msg_type != kTypeFileInfoDiff) {
-		throw std::runtime_error("unknown file info batch type: " + msg_type);
+		throw std::runtime_error("unexpected file info list type: " + msg_type);
 	}
 
 	const auto files_it = payload.find("files");
